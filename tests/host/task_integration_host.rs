@@ -2605,3 +2605,551 @@ fn prephase_revoke_rejects_other_ids_and_sources_and_survives_gc_replay() {
     assert!(!f.workspace().exists());
     assert_eq!(f.origin_tip(), origin);
 }
+
+mod pre_intent_followup {
+    use super::*;
+    use mac_worker::test_support::{
+        core::error::WorkerError,
+        host::process::{ProcessRequest, ProcessResult, ProcessRunner},
+    };
+
+    fn task_path(f: &GitIntegrationFixture) -> std::path::PathBuf {
+        f.store
+            .task_dir(&f.record.policy.project_id, f.record.task_id)
+            .unwrap()
+    }
+
+    fn arm(f: &GitIntegrationFixture) {
+        let mut arm = request(
+            f,
+            HostIntegrationAction::Arm {
+                policy: f.record.policy.clone(),
+            },
+        );
+        arm.integration_id = None;
+        arm.revision = IntegrationRevision(0);
+        execute(f, &arm).unwrap();
+    }
+
+    struct PauseBeforeFirstIntent {
+        inner: ManualIntegrationRuntime,
+        ready: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl IntegrationRuntime for PauseBeforeFirstIntent {
+        fn now_millis(&self) -> u64 {
+            self.inner.now_millis()
+        }
+        fn actor(&self) -> ProcessIdentity {
+            self.inner.actor()
+        }
+        fn actor_verdict(&self, actor: ProcessIdentity) -> RunnerLivenessVerdict {
+            self.inner.actor_verdict(actor)
+        }
+        fn begin_phase(
+            &self,
+            key: &IntegrationPhaseKey,
+        ) -> Result<IntegrationDriveAdmission, WorkerError> {
+            self.inner.begin_phase(key)
+        }
+        fn reach(&self, hook: IntegrationHook) {
+            if hook == IntegrationHook::AfterRunnerRetirement
+                && let Some(ready) = self.ready.lock().unwrap().take()
+            {
+                ready.send(()).unwrap();
+                self.resume
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(15))
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_followup_during_first_intent_staging_must_fence_the_old_host_source() {
+        use mac_worker::test_support::{
+            client_state::ClientStateStore,
+            controller::{ProjectRegistry, drain::set_drained},
+            core::{config::Config, paths::PathLayout},
+            task::{client::TaskClient, model::LocalTaskRecord, turn_runner::InlineRunnerExecutor},
+        };
+        struct LocalGitOnly;
+        impl ProcessRunner for LocalGitOnly {
+            fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+                assert_eq!(
+                    request.program, "/usr/bin/git",
+                    "follow-up must not contact a worker while drained"
+                );
+                SystemProcessRunner.run(request)
+            }
+        }
+        let mut f = GitIntegrationFixture::new();
+        let target = f.commit_base();
+        let head = f.commit_task();
+        arm(&f);
+        let host_tasks = TaskStore::new(&f.store, &SystemProcessRunner);
+        let ordinary = LocalTaskRecord::new(
+            host_tasks
+                .load_meta(&f.record.policy.project_id, f.record.task_id)
+                .unwrap(),
+            host_tasks
+                .load_status(&f.record.policy.project_id, f.record.task_id)
+                .unwrap(),
+            Some(1001),
+            None,
+            Some(head),
+            "c".repeat(64),
+            Some("fixture-worker".into()),
+            true,
+            None,
+        )
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let paths = PathLayout {
+            config: root.join("config.toml"),
+            state: root.join("state"),
+            cache: root.join("cache"),
+            data: root.join("data"),
+        };
+        let client = ClientStateStore::open(&paths.state).unwrap();
+        client.create_task(ordinary.clone()).unwrap();
+        let checkout = root.join("checkout");
+        assert!(
+            std::process::Command::new("/usr/bin/git")
+                .args(["clone", &f.record.policy.origin, checkout.to_str().unwrap()])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        ProjectRegistry::open(&paths.controller_state_root())
+            .unwrap()
+            .register(
+                ordinary.meta().project_id(),
+                ordinary.meta().worktree_id(),
+                &checkout,
+            )
+            .unwrap();
+        client
+            .write_task_project_path(&ordinary, &checkout)
+            .unwrap();
+        set_drained(&paths.controller_state_root(), true).unwrap();
+        let state = RootedIntegrationState::open(
+            &paths,
+            std::sync::Arc::new(ManualIntegrationRuntime::default()),
+        )
+        .unwrap();
+        state
+            .publish_policy(f.record.task_id, &f.record.policy)
+            .unwrap();
+        let turns = FakeIntegrationTurns::default();
+        let observer = FakeIntegrationObserver::default();
+        observer.insert(IntegrationTaskFacts {
+            ordinary: ordinary.clone(),
+            cycle_base: f.record.cycle_base.clone(),
+            result_imported: true,
+            session_import_complete: true,
+            continuation_pending: false,
+            runner_present: false,
+            stop_requested: false,
+            close_pending: false,
+            submission_pending: false,
+            auxiliary_purpose: None,
+        });
+        let host = HostIntegrationService::new(&f.store, &SystemProcessRunner, &f.runtime);
+        let owner = IntegrationCoordinator::new(&state, &host, &turns, &f.runtime, &observer);
+        let config = Config::parse(
+            "version = 1\n[[workers]]\nname = 'fixture-worker'\nssh = 'never-connect'\nslots = 1\n",
+        )
+        .unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let paused = PauseBeforeFirstIntent {
+            inner: ManualIntegrationRuntime::default(),
+            ready: std::sync::Mutex::new(Some(ready_tx)),
+            resume: std::sync::Mutex::new(resume_rx),
+        };
+        std::thread::scope(|scope| {
+            let staged = scope.spawn(|| {
+                IntegrationCoordinator::new(&state, &host, &turns, &paused, &observer)
+                    .on_terminal(f.record.task_id, fixture_source())
+            });
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .unwrap();
+            assert!(state.load(f.record.task_id).unwrap().is_none());
+            let say = TaskClient::new(
+                &LocalGitOnly,
+                &config,
+                &paths,
+                &client,
+                &InlineRunnerExecutor,
+            )
+            .with_integration(&owner)
+            .say(
+                f.record.task_id,
+                "next ordinary work".into(),
+                false,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            );
+            eprintln!("ordinary follow-up while first intent is paused: {say:?}");
+            resume_tx.send(()).unwrap();
+            staged.join().unwrap().unwrap();
+            assert_eq!(say.unwrap_err().public_code(), "TASK_BUSY");
+        });
+        assert_eq!(client.load_task(f.record.task_id).unwrap(), ordinary);
+        assert!(client.queue_snapshot().unwrap().entries().is_empty());
+        assert_eq!(f.origin_tip(), target);
+        let staged = state.load(f.record.task_id).unwrap().unwrap();
+        assert_eq!(staged.snapshot.source_turn_id, fixture_source());
+        assert_eq!(staged.snapshot.state, IntegrationStatus::Pending);
+        // Retire S1 before acknowledging the next ordinary turn. A delayed
+        // finalizer must reuse this stop rather than resurrect S1.
+        owner
+            .revoke(f.record.task_id, staged.snapshot.revision)
+            .unwrap();
+        assert!(
+            state
+                .load(f.record.task_id)
+                .unwrap()
+                .unwrap()
+                .tombstone
+                .unwrap()
+                .acknowledged
+        );
+        TaskClient::new(
+            &LocalGitOnly,
+            &config,
+            &paths,
+            &client,
+            &InlineRunnerExecutor,
+        )
+        .with_integration(&owner)
+        .say(
+            f.record.task_id,
+            "next ordinary work".into(),
+            false,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let current = client.load_task(f.record.task_id).unwrap();
+        assert_eq!(current.status().state(), TaskState::Active);
+        assert_eq!(current.status().turns().len(), 2);
+        assert_eq!(client.queue_snapshot().unwrap().entries().len(), 1);
+        let host_status = f
+            .store
+            .task_status(&f.record.policy.project_id, f.record.task_id)
+            .unwrap();
+        assert_eq!(host_status.state(), TaskState::Open);
+        assert_eq!(host_status.turns().len(), 1);
+        eprintln!(
+            "owner turn count {}; host turn count {}; prephase stop proof present: {}",
+            current.status().turns().len(),
+            host_status.turns().len(),
+            task_path(&f).join("integration/revoke.json").exists()
+        );
+        // The drain only held the new ordinary dispatch. Release it before any integration phase.
+        set_drained(&paths.controller_state_root(), false).unwrap();
+        assert!(
+            !mac_worker::test_support::controller::drain::is_drained(
+                &paths.controller_state_root()
+            )
+            .unwrap()
+        );
+        // Fresh owner facts contain the queued new ordinary turn; the old finalizer read is no longer used.
+        observer.insert(IntegrationTaskFacts {
+            ordinary: current.clone(),
+            cycle_base: f.record.cycle_base.clone(),
+            result_imported: true,
+            session_import_complete: true,
+            continuation_pending: false,
+            runner_present: true,
+            stop_requested: false,
+            close_pending: false,
+            submission_pending: false,
+            auxiliary_purpose: None,
+        });
+        for _ in 0..3 {
+            let result = owner.drive_once(f.record.task_id);
+            eprintln!("old integration after ordinary follow-up was queued: {result:?}");
+            if f.origin_tip() != target {
+                break;
+            }
+            if let Ok(snapshot) = result
+                && matches!(
+                    snapshot.state,
+                    IntegrationStatus::Integrated
+                        | IntegrationStatus::Blocked
+                        | IntegrationStatus::Revoked
+                )
+            {
+                break;
+            }
+        }
+        eprintln!(
+            "origin before queued ordinary turn: {target}; origin afterward: {}",
+            f.origin_tip()
+        );
+        assert_eq!(
+            f.origin_tip(),
+            target,
+            "old integration moved the target while a new ordinary turn existed only on the owner"
+        );
+        let stopped = state.load(f.record.task_id).unwrap().unwrap();
+        assert_eq!(stopped.snapshot.state, IntegrationStatus::Revoked);
+        assert!(stopped.tombstone.unwrap().acknowledged);
+        owner
+            .on_terminal(f.record.task_id, fixture_source())
+            .unwrap();
+        assert_eq!(
+            owner.drive_once(f.record.task_id).unwrap().state,
+            IntegrationStatus::Revoked
+        );
+        assert_eq!(f.origin_tip(), target);
+
+        // Complete S2 in the isolated owner/host stores and integrate its own H2.
+        let turn = current.status().turns().last().unwrap().turn_id();
+        f.write("followup.txt", b"second ordinary result\n");
+        let next_head = f.commit("second ordinary turn");
+        let mut wire = serde_json::to_value(current.status()).unwrap();
+        wire["state"] = "open".into();
+        wire["last_outcome"] = serde_json::json!({"kind":"done"});
+        wire["head_oid"] = serde_json::json!(next_head);
+        wire["updated_at_millis"] = serde_json::json!(current.status().updated_at_millis() + 1);
+        wire["turns"][1] =
+            serde_json::to_value(mac_worker::test_support::task::model::TurnSummary::new(
+                2,
+                turn,
+                Some(mac_worker::test_support::task::model::TurnTerminal::Succeeded),
+                Some(mac_worker::test_support::task::model::TaskOutcome::Done),
+                Some(true),
+                false,
+                Some(current.status().updated_at_millis()),
+                Some(current.status().updated_at_millis() + 1),
+            ))
+            .unwrap();
+        let status: TaskStatus = serde_json::from_value(wire).unwrap();
+        let done = current
+            .with_status(status.clone())
+            .unwrap()
+            .with_fetched_head(Some(next_head.clone()))
+            .unwrap();
+        assert!(
+            client
+                .update_task_if_current(&current, done.clone())
+                .unwrap()
+        );
+        let entry = client.queue_entry(turn).unwrap().unwrap();
+        client
+            .remove_task_turn_after_terminal(
+                turn,
+                entry.owner_opt().copied().unwrap_or(f.runtime.actor()),
+            )
+            .unwrap();
+        std::fs::write(
+            task_path(&f).join("status.json"),
+            serde_json::to_vec(&status).unwrap(),
+        )
+        .unwrap();
+        let mirror = f
+            .store
+            .mirror_if_present(&f.record.policy.project_id)
+            .unwrap()
+            .unwrap();
+        integration_git(
+            mirror.path(),
+            &[
+                "fetch",
+                f.workspace().to_str().unwrap(),
+                &format!("HEAD:refs/heads/task/{}", f.record.task_id),
+            ],
+        );
+        observer.insert(IntegrationTaskFacts {
+            ordinary: done,
+            cycle_base: f.record.cycle_base.clone(),
+            result_imported: true,
+            session_import_complete: true,
+            continuation_pending: false,
+            runner_present: false,
+            stop_requested: false,
+            close_pending: false,
+            submission_pending: false,
+            auxiliary_purpose: None,
+        });
+        owner.on_terminal(f.record.task_id, turn).unwrap();
+        let next = state.load(f.record.task_id).unwrap().unwrap();
+        assert_ne!(next.snapshot.integration_id, staged.snapshot.integration_id);
+        assert_eq!(next.snapshot.source_turn_id, turn);
+        let result = IntegrationRunner::new(owner).run(f.record.task_id).unwrap();
+        assert_eq!(result.state, IntegrationStatus::Integrated);
+        let accepted = state.load(f.record.task_id).unwrap().unwrap();
+        assert!(accepted.receipt.unwrap().imported);
+        assert_eq!(f.parents(&f.origin_tip()), vec![target, next_head]);
+        assert_eq!(turns.imports(f.record.task_id).len(), 1);
+        assert!(client.queue_snapshot().unwrap().entries().is_empty());
+    }
+
+    #[test]
+    fn first_intent_publication_rechecks_a_newer_owner_turn_after_retirement() {
+        let f = IntegrationFixture::new();
+        f.enable(f.task(), "main").unwrap();
+        let mut facts = f.observer().facts(f.task()).unwrap();
+        facts.ordinary = sample_ordinary(f.task(), f.source());
+        facts.result_imported = true;
+        f.observer().insert(facts.clone());
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let paused = PauseBeforeFirstIntent {
+            inner: ManualIntegrationRuntime::default(),
+            ready: std::sync::Mutex::new(Some(ready_tx)),
+            resume: std::sync::Mutex::new(resume_rx),
+        };
+        std::thread::scope(|scope| {
+            let staged = scope.spawn(|| {
+                IntegrationCoordinator::new(f.state(), f.host(), f.turns(), &paused, f.observer())
+                    .on_terminal(f.task(), f.source())
+            });
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .unwrap();
+            facts.ordinary = sample_ordinary_followup(f.task(), f.source(), None);
+            facts.runner_present = true;
+            f.observer().insert(facts);
+            resume_tx.send(()).unwrap();
+            staged.join().unwrap().unwrap();
+        });
+        assert!(
+            f.load(f.task()).unwrap().is_none(),
+            "old source acquired a delayed intent after its owner advanced"
+        );
+        f.coordinator().on_terminal(f.task(), f.source()).unwrap();
+        assert!(f.load(f.task()).unwrap().is_none());
+        assert!(f.host_calls().is_empty());
+    }
+
+    #[test]
+    fn a_source_already_retired_on_the_host_settles_without_repeated_stop_and_s2_integrates() {
+        use mac_worker::test_support::task::model::{
+            LocalTaskRecord, TaskOutcome, TurnId, TurnSummary, TurnTerminal,
+        };
+        struct CountHost<'a>(HostIntegrationService<'a>, std::sync::Mutex<usize>);
+        impl IntegrationHost for CountHost<'_> {
+            fn execute(
+                &self,
+                request: &HostIntegrationRequest,
+            ) -> Result<HostIntegrationResponse, WorkerError> {
+                *self.1.lock().unwrap() += 1;
+                self.0.execute(request)
+            }
+        }
+        struct NoOldProcesses;
+        impl ProcessRunner for NoOldProcesses {
+            fn run(&self, _: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+                panic!("retired source executed a process")
+            }
+        }
+        let mut f = GitIntegrationFixture::new();
+        let target = f.commit_base();
+        let head = f.commit_task();
+        arm(&f);
+        let task = f.record.task_id;
+        let turn = TurnId::new(uuid::Uuid::from_u128(8));
+        let tasks = TaskStore::new(&f.store, &SystemProcessRunner);
+        let mut wire = serde_json::to_value(
+            tasks
+                .load_status(&f.record.policy.project_id, task)
+                .unwrap(),
+        )
+        .unwrap();
+        wire["turns"].as_array_mut().unwrap().push(
+            serde_json::to_value(TurnSummary::new(
+                2,
+                turn,
+                Some(TurnTerminal::Succeeded),
+                Some(TaskOutcome::Done),
+                Some(false),
+                false,
+                Some(1002),
+                Some(1003),
+            ))
+            .unwrap(),
+        );
+        let status: TaskStatus = serde_json::from_value(wire).unwrap();
+        std::fs::write(
+            task_path(&f).join("status.json"),
+            serde_json::to_vec(&status).unwrap(),
+        )
+        .unwrap();
+        let ordinary = LocalTaskRecord::new(
+            tasks.load_meta(&f.record.policy.project_id, task).unwrap(),
+            status,
+            Some(1003),
+            None,
+            Some(head),
+            "c".repeat(64),
+            Some("fixture-worker".into()),
+            true,
+            None,
+        )
+        .unwrap();
+        let state = MemoryIntegrationState::default();
+        state.publish_policy(task, &f.record.policy).unwrap();
+        assert!(
+            state
+                .replace(task, IntegrationRevision(0), &f.record)
+                .unwrap()
+        );
+        let observer = FakeIntegrationObserver::default();
+        observer.insert(IntegrationTaskFacts {
+            ordinary,
+            cycle_base: f.record.cycle_base.clone(),
+            result_imported: true,
+            session_import_complete: true,
+            continuation_pending: false,
+            runner_present: false,
+            stop_requested: false,
+            close_pending: false,
+            submission_pending: false,
+            auxiliary_purpose: None,
+        });
+        let turns = FakeIntegrationTurns::default();
+        let host = CountHost(
+            HostIntegrationService::new(&f.store, &SystemProcessRunner, &f.runtime),
+            std::sync::Mutex::new(0),
+        );
+        let owner = IntegrationCoordinator::new(&state, &host, &turns, &f.runtime, &observer);
+        let stopped = owner.drive_once(task).unwrap();
+        assert_eq!(stopped.state, IntegrationStatus::Revoked);
+        assert_eq!(
+            stopped.blocked_code,
+            Some(IntegrationCode::IntegrationStateInvalid)
+        );
+        assert!(
+            state.load(task).unwrap().unwrap().tombstone.is_none(),
+            "host did not acknowledge this obsolete stop"
+        );
+        assert_eq!(owner.drive_once(task).unwrap(), stopped);
+        assert_eq!(*host.1.lock().unwrap(), 1);
+        assert_eq!(f.origin_tip(), target);
+        assert_eq!(
+            f.execute_with(IntegrationStep::Prepare, &NoOldProcesses)
+                .unwrap_err()
+                .public_code(),
+            "INTEGRATION_STATE_INVALID"
+        );
+        owner.on_terminal(task, turn).unwrap();
+        assert_eq!(
+            state.load(task).unwrap().unwrap().snapshot.source_turn_id,
+            turn
+        );
+        assert_eq!(
+            IntegrationRunner::new(owner).run(task).unwrap().state,
+            IntegrationStatus::Integrated
+        );
+        assert_eq!(turns.imports(task).len(), 1);
+    }
+}

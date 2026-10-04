@@ -461,9 +461,20 @@ pub(crate) fn parent_gate_at(
     state: &std::path::Path,
     ordinary: &LocalTaskRecord,
 ) -> Result<ParentGate, WorkerError> {
-    use crate::integration::{contracts::*, store::RootedIntegrationState};
-    let (policy, integration) =
-        RootedIntegrationState::read_task_at(state, ordinary.meta().task_id())?;
+    use crate::integration::{contracts::*, store::ExistingIntegrationReader};
+    let reader = match ExistingIntegrationReader::open_at(state) {
+        Ok(reader) => reader,
+        Err(_) => return Ok(ParentGate::Waiting),
+    };
+    // Recovery could not decode this parent's optional evidence. Keep its
+    // children waiting through backoff; never infer success from Closed+Done.
+    if reader
+        .recovery()
+        .retains_evidence(ordinary.meta().task_id())
+    {
+        return Ok(ParentGate::Waiting);
+    }
+    let (policy, integration) = reader.read_task(ordinary.meta().task_id())?;
     if policy.is_none() {
         return Ok(parent_gate(ordinary));
     }

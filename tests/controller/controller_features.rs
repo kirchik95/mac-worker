@@ -163,6 +163,7 @@ fn health_features_describe_the_serving_binary_even_without_a_leader() {
         serde_json::to_value(status).unwrap()["features"],
         json!([
             "controller.events",
+            "controller.integration",
             "controller.session-import",
             "controller.task-logs-wait"
         ])
@@ -209,7 +210,7 @@ fn controller_status_prints_features_in_plain_and_json_output() {
     for (reply, expected) in [
         (
             Ok(None),
-            "features: controller.events, controller.session-import, controller.task-logs-wait",
+            "features: controller.events, controller.integration, controller.session-import, controller.task-logs-wait",
         ),
         (Ok(Some(old_health())), "features: unknown"),
         (Err(()), "features: unknown"),
@@ -246,6 +247,7 @@ fn controller_status_prints_features_in_plain_and_json_output() {
                     } else {
                         json!([
                             "controller.events",
+                            "controller.integration",
                             "controller.session-import",
                             "controller.task-logs-wait"
                         ])

@@ -682,6 +682,10 @@ fn hidden_host_probe_outputs_raw_compact_json_without_loading_config() {
         assert_eq!(stdout.lines().count(), 1);
         let value: serde_json::Value = serde_json::from_str(stdout).unwrap();
         assert_eq!(value["protocol_version"], PROTOCOL_VERSION);
+        assert_eq!(
+            value["features"],
+            serde_json::json!(["task.integration", "task.session-import"])
+        );
         assert!(value.get("kind").is_none());
     }
 }

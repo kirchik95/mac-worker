@@ -4217,3 +4217,145 @@ fn parked_root_missing_origin_capability_shows_code_and_reconcile_starts_it() {
             .is_some()
     );
 }
+
+#[test]
+fn corrupt_closed_integration_does_not_skip_index_refresh_or_pending_dag_advance() {
+    use mac_worker::test_support::client_state::ActiveTaskConfig;
+    use mac_worker::test_support::integration::*;
+    let harness = BatchHarness::new(ROOT_FROM_CHILD);
+    let batch = harness.batch();
+    let dag = harness.store.load_run_dag(batch.run_id()).unwrap().unwrap();
+    let root = dag.nodes["root"].task_id;
+    let turn = dag.nodes["root"].turn_id;
+    let child = dag.nodes["child"].task_id;
+    let result = harness.commit_result(b"parent ready with corrupt optional companion\n");
+    plant_closed_done_import(&harness.store, root, turn, result);
+    let state = RootedIntegrationState::open(
+        &harness.paths,
+        Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    let bad = TaskId::generate();
+    let mut closed = sample_ordinary(bad, fixture_source());
+    let mut status = serde_json::to_value(closed.status()).unwrap();
+    status["state"] = "closed".into();
+    closed = closed
+        .with_status(serde_json::from_value(status).unwrap())
+        .unwrap();
+    harness.store.create_task(closed).unwrap();
+    let record = sample_record(bad, fixture_source(), "main");
+    state.publish_policy(bad, &record.policy).unwrap();
+    state.replace(bad, IntegrationRevision(0), &record).unwrap();
+    let corrupt = harness
+        .paths
+        .state
+        .join(format!("integrations/tasks/{bad}/record.json"));
+    fs::write(&corrupt, b"{broken").unwrap();
+    harness.store.bootstrap_active_task_index().unwrap();
+    harness.client().tick_selected_recovery().unwrap();
+    let dag = harness.store.load_run_dag(batch.run_id()).unwrap().unwrap();
+    assert_eq!(dag.nodes["child"].task_id, child);
+    assert_eq!(dag.nodes["child"].state, DagNodeState::Submitted);
+    assert!(
+        harness
+            .store
+            .select_active_task_ids(&ActiveTaskConfig::default())
+            .unwrap()
+            .selected
+            .contains(&bad)
+    );
+    assert!(
+        !harness
+            .store
+            .select_active_task_ids(&ActiveTaskConfig::default())
+            .unwrap()
+            .selected
+            .contains(&root),
+        "the healthy settled parent must retire during index refresh"
+    );
+    assert_eq!(fs::read(corrupt).unwrap(), b"{broken");
+}
+
+#[test]
+fn corrupt_closed_parent_waits_while_an_unrelated_healthy_dag_advances() {
+    use mac_worker::test_support::integration::*;
+    let harness = BatchHarness::new(ROOT_FROM_CHILD);
+    let bad_run = harness.batch();
+    let healthy_run = harness.batch();
+    let bad_dag = harness
+        .store
+        .load_run_dag(bad_run.run_id())
+        .unwrap()
+        .unwrap();
+    let healthy_dag = harness
+        .store
+        .load_run_dag(healthy_run.run_id())
+        .unwrap()
+        .unwrap();
+    let bad = bad_dag.nodes["root"].task_id;
+    let bad_turn = bad_dag.nodes["root"].turn_id;
+    let healthy = healthy_dag.nodes["root"].task_id;
+    let result = harness.commit_result(b"both parents done\n");
+    plant_closed_done_import(&harness.store, bad, bad_turn, result.clone());
+    plant_closed_done_import(
+        &harness.store,
+        healthy,
+        healthy_dag.nodes["root"].turn_id,
+        result,
+    );
+    let state = RootedIntegrationState::open(
+        &harness.paths,
+        Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    let record = sample_record(bad, bad_turn, "main");
+    state.publish_policy(bad, &record.policy).unwrap();
+    state.replace(bad, IntegrationRevision(0), &record).unwrap();
+    let path = harness
+        .paths
+        .state
+        .join(format!("integrations/tasks/{bad}/record.json"));
+    fs::write(&path, b"{broken").unwrap();
+    harness.store.bootstrap_active_task_index().unwrap();
+    let client = harness.client();
+    for _ in 0..3 {
+        client.tick_selected_recovery().unwrap();
+    }
+    assert_eq!(
+        harness
+            .store
+            .load_run_dag(bad_run.run_id())
+            .unwrap()
+            .unwrap()
+            .nodes["child"]
+            .state,
+        DagNodeState::Waiting
+    );
+    assert_eq!(
+        harness
+            .store
+            .load_run_dag(healthy_run.run_id())
+            .unwrap()
+            .unwrap()
+            .nodes["child"]
+            .state,
+        DagNodeState::Submitted
+    );
+    assert_eq!(
+        client
+            .integration_parent_gate(&harness.store.load_task(bad).unwrap())
+            .unwrap(),
+        mac_worker::test_support::client_state::dag::ParentGate::Waiting
+    );
+    assert_eq!(fs::read(path).unwrap(), b"{broken");
+    assert!(
+        harness
+            .store
+            .select_active_task_ids(
+                &mac_worker::test_support::client_state::ActiveTaskConfig::default()
+            )
+            .unwrap()
+            .selected
+            .contains(&bad)
+    );
+}

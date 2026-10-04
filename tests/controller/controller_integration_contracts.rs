@@ -594,7 +594,8 @@ fn exclusive_selector_uses_existing_read_framing_and_validates_reply_identity() 
             .unwrap();
     let reply: ControllerReadReply<IntegrationReadResult> =
         serde_json::from_slice(decode_frame(&bytes).unwrap()).unwrap();
-    let _: baseline::ReadEnvelope = serde_json::from_slice(decode_frame(&bytes).unwrap()).unwrap();
+    let _: baseline::ControllerReadReply<Value> =
+        serde_json::from_slice(decode_frame(&bytes).unwrap()).unwrap();
     reply.verify_envelope(&req).unwrap();
     reply.result().verify_payload(&req).unwrap();
     let wrong = request(
@@ -617,7 +618,7 @@ fn exclusive_selector_uses_existing_read_framing_and_validates_reply_identity() 
 #[test]
 fn unavailable_execution_rejects_safe_selector_with_zero_durable_mutation_rows() {
     use mac_worker::test_support::{
-        controller::{ControllerFault, ControllerStore, encode_json_frame, serve_rpc_with_runtime},
+        controller::{ControllerStore, encode_json_frame, serve_rpc_with_integration_features},
         core::error::WorkerError,
         core::{config::Config, paths::PathLayout},
         host::process::{ProcessRequest, ProcessResult, ProcessRunner},
@@ -638,13 +639,13 @@ fn unavailable_execution_rejects_safe_selector_with_zero_durable_mutation_rows()
     };
     let config: Config = toml::from_str("version = 1").unwrap();
     let frame = encode_json_frame(&json!({"protocol_version":7,"request_id":"00000000000000000000000000000011", "command":"task.list", "body":{"integration":{"task_ids":[fixture_task()]}}})).unwrap();
-    let error = serve_rpc_with_runtime(
+    let error = serve_rpc_with_integration_features(
         &paths,
         &config,
         &NoProcesses,
         &mut std::io::Cursor::new(frame),
         &mut Vec::new(),
-        ControllerFault::None,
+        &[],
     )
     .unwrap_err();
     assert_eq!(error.public_code(), "INTEGRATION_UNAVAILABLE", "{error:?}");
@@ -736,44 +737,33 @@ fn redrive_preparation_preserves_expected_revision_and_durable_request_identity(
     assert!(prepare_integration_redrive(&invalid).is_err());
 }
 
-// Strict top-level key sets copied from 67183a0's DTO/Wire definitions.
-// Values intentionally stay opaque: this checks N-1 shape independently of
-// today's codecs; today's full typed decoder also validates each payload below.
-mod baseline {
-    use serde::Deserialize;
-    use serde_json::Value;
-    macro_rules! decoder {
-        ($name:ident { $($required:ident),* } optional { $($optional:ident),* }) => {
-            #[allow(dead_code)]
-            #[derive(Deserialize)]
-            #[serde(deny_unknown_fields)]
-            pub struct $name {
-                $($required: Value,)*
-                $(#[serde(default)] $optional: Value,)*
-            }
-        };
-    }
-    decoder!(Status { state, last_outcome, worker, session_present, head_oid, summary, questions, files_changed, diff_stat, turns, updated_at_millis } optional { reported_checks });
-    decoder!(StatusResult { task_id, run_id, status, runner, exit_code } optional { warnings, events, delivery, deliveries, stage, residual });
-    decoder!(Result { task_id, status, branch, fetch } optional { stage, residual, delivery, deliveries, warnings });
-    decoder!(HostStatus { protocol_version, status } optional { delivery, deliveries });
-    decoder!(Record { meta, status, status_observed_at_millis, runner, fetched_head, repo_id, pinned_worker, wait_for_capacity, abandon_code } optional { questions_policy, auto_continue_intent, submission_intent_turn_id, submission_rollback_turn_id, close_intent, delivery, deliveries, failure_stage, failure_residual });
-    decoder!(Turn { turn_number, turn_id, terminal, outcome, agent_committed, log_truncated, started_at_millis, ended_at_millis } optional { auto_continue, herdr, result_parse_reason, agent_identity });
-    decoder!(Dag { version, run_id, max_parallel, created_at_millis, nodes } optional { name });
-    decoder!(Followup { expected, turn_id, turn_number, created_at_millis, message, composed_prompt, base_oid, agent, model, worker, max_followups } optional { auto_continue });
-    decoder!(Envelope { request_id, payload_sha256, command, body, created_at_millis } optional { settled_at_millis, outcome });
-    decoder!(ReadEnvelope { protocol_version, command, request_id, payload_sha256, result } optional {});
+#[path = "../support/baseline_ce7f62f.rs"]
+mod baseline;
+
+#[test]
+fn review_copied_baseline_keeps_the_old_task_state_enum() {
+    let mut status =
+        serde_json::to_value(sample_ordinary(fixture_task(), fixture_source()).status()).unwrap();
+    status["state"] = json!("integrating");
+    assert!(
+        serde_json::from_value::<mac_worker::test_support::task::model::TaskStatus>(status.clone())
+            .is_err()
+    );
+    let copy = serde_json::from_value::<baseline::TaskStatus>(status);
+    assert!(
+        copy.is_err(),
+        "the claimed baseline decoder accepts an ordinary state that the real N-1 TaskStatus decoder rejects"
+    );
 }
 
 fn baseline_accepts_current_bytes<
-    Old: serde::de::DeserializeOwned,
-    Current: serde::Serialize + serde::de::DeserializeOwned,
+    Old: serde::Serialize + serde::de::DeserializeOwned,
+    Current: serde::Serialize,
 >(
     value: &Current,
 ) {
     let bytes = serde_json::to_vec(value).unwrap();
-    let _: Old = serde_json::from_slice(&bytes).unwrap();
-    let decoded: Current = serde_json::from_slice(&bytes).unwrap();
+    let decoded: Old = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
     let mut wire: Value = serde_json::from_slice(&bytes).unwrap();
     assert!(wire.get("integration").is_none());
@@ -794,16 +784,21 @@ fn copied_baseline_strict_decoders_prove_disabled_dtos_keep_their_bytes() {
         },
     };
     let record = sample_ordinary(fixture_task(), fixture_source());
-    baseline_accepts_current_bytes::<baseline::Status, TaskStatus>(record.status());
-    baseline_accepts_current_bytes::<baseline::Record, LocalTaskRecord>(&record);
-    baseline_accepts_current_bytes::<baseline::Turn, TurnSummary>(&record.status().turns()[0]);
-    baseline_accepts_current_bytes::<baseline::HostStatus, TaskStatusResponse>(
+    baseline_accepts_current_bytes::<baseline::TaskStatus, TaskStatus>(record.status());
+    baseline_accepts_current_bytes::<baseline::LocalTaskRecord, LocalTaskRecord>(&record);
+    baseline_accepts_current_bytes::<baseline::TurnSummary, TurnSummary>(
+        &record.status().turns()[0],
+    );
+    baseline_accepts_current_bytes::<baseline::TaskStatusResponse, TaskStatusResponse>(
         &TaskStatusResponse::new(record.status().clone()),
     );
     let status: ControllerTaskStatusResult = serde_json::from_value(json!({"task_id":fixture_task(), "run_id":null,"status":record.status(),"warnings":[],"events":[],"runner":null,"exit_code":0})).unwrap();
-    baseline_accepts_current_bytes::<baseline::StatusResult, ControllerTaskStatusResult>(&status);
+    baseline_accepts_current_bytes::<
+        baseline::ControllerTaskStatusResult,
+        ControllerTaskStatusResult,
+    >(&status);
     let result: ControllerTaskResult = serde_json::from_value(json!({"task_id":fixture_task(),"status":record.status(),"branch":"task/fixture","fetch":"worker task fetch fixture"})).unwrap();
-    baseline_accepts_current_bytes::<baseline::Result, ControllerTaskResult>(&result);
+    baseline_accepts_current_bytes::<baseline::ControllerTaskResult, ControllerTaskResult>(&result);
     let followup = PreparedFollowup::prepare(
         &record,
         "follow up".into(),
@@ -811,13 +806,14 @@ fn copied_baseline_strict_decoders_prove_disabled_dtos_keep_their_bytes() {
         2000,
     )
     .unwrap();
-    baseline_accepts_current_bytes::<baseline::Followup, PreparedFollowup>(&followup);
+    baseline_accepts_current_bytes::<baseline::PreparedFollowup, PreparedFollowup>(&followup);
     let frozen_batch = batch();
+    baseline_accepts_current_bytes::<baseline::FrozenBatchBody, FrozenBatchBody>(&frozen_batch);
     let dag = json!({"version":1,"run_id":frozen_batch.run_id,"max_parallel":1,"created_at_millis":1000,"nodes":frozen_batch.nodes});
     let dag: mac_worker::test_support::client_state::dag::DagRecord =
         serde_json::from_value(dag).unwrap();
     baseline_accepts_current_bytes::<
-        baseline::Dag,
+        baseline::DagRecord,
         mac_worker::test_support::client_state::dag::DagRecord,
     >(&dag);
     let body = submit();
@@ -849,9 +845,238 @@ fn copied_baseline_strict_decoders_prove_disabled_dtos_keep_their_bytes() {
     )
     .unwrap();
     baseline_accepts_current_bytes::<
-        baseline::Envelope,
+        baseline::OperationEnvelope,
         mac_worker::test_support::controller::OperationEnvelope,
     >(&envelope);
+}
+
+// Independent protocol-7 bytes, in ce7f62f's serialization order. No current
+// constructor or serializer produces the expectation.
+const ORDINARY_STATUS_GOLDEN: &str = r#"{"state":"open","last_outcome":{"kind":"done"},"worker":"fixture-worker","session_present":true,"head_oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","summary":"Fixture work completed","questions":[],"files_changed":[],"diff_stat":null,"turns":[{"turn_number":1,"turn_id":"00000000000000000000000000000003","terminal":"succeeded","outcome":{"kind":"done"},"agent_committed":true,"log_truncated":false,"started_at_millis":1000,"ended_at_millis":1001}],"updated_at_millis":1001}"#;
+
+fn assert_baseline_golden<Old, Current>(old: &Old, current: &Current)
+where
+    Old: serde::Serialize + serde::de::DeserializeOwned,
+    Current: serde::Serialize,
+{
+    let golden = serde_json::to_vec(old).unwrap();
+    let bytes = serde_json::to_vec(current).unwrap();
+    assert_eq!(bytes, golden);
+    let decoded: Old = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(serde_json::to_vec(&decoded).unwrap(), golden);
+}
+
+#[test]
+fn copied_baseline_status_and_result_serializers_supply_independent_golden_bytes() {
+    use mac_worker::test_support::controller::{ControllerTaskResult, ControllerTaskStatusResult};
+    let old_status: baseline::TaskStatus = serde_json::from_str(ORDINARY_STATUS_GOLDEN).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&old_status).unwrap(),
+        ORDINARY_STATUS_GOLDEN.as_bytes()
+    );
+    let record = sample_ordinary(fixture_task(), fixture_source());
+    assert_baseline_golden(&old_status, record.status());
+    let old: baseline::ControllerTaskStatusResult = serde_json::from_value(json!({
+        "task_id":"00000000000000000000000000000002", "run_id":null,
+        "status":old_status, "warnings":[], "events":[], "runner":"exited", "exit_code":0,
+    }))
+    .unwrap();
+    let current: ControllerTaskStatusResult = serde_json::from_value(json!({
+        "task_id":fixture_task(), "run_id":null, "status":record.status(),
+        "warnings":[], "events":[], "runner":"exited", "exit_code":0,
+    }))
+    .unwrap();
+    assert_baseline_golden(&old, &current);
+    let old: baseline::ControllerTaskResult = serde_json::from_value(json!({
+        "task_id":"00000000000000000000000000000002", "status":old_status,
+        "branch":"task/fixture", "fetch":"worker task fetch fixture",
+    }))
+    .unwrap();
+    let current: ControllerTaskResult = serde_json::from_value(json!({
+        "task_id":fixture_task(), "status":record.status(),
+        "branch":"task/fixture", "fetch":"worker task fetch fixture",
+    }))
+    .unwrap();
+    assert_baseline_golden(&old, &current);
+}
+
+#[test]
+fn copied_baseline_status_checks_questions_and_turn_metadata_keep_golden_bytes() {
+    use mac_worker::test_support::task::model::TaskStatus;
+    let mut wire: Value = serde_json::from_str(ORDINARY_STATUS_GOLDEN).unwrap();
+    wire["questions"] = json!([
+        "An open question",
+        {"text":"Choose a branch", "options":["first", "second"]},
+    ]);
+    wire["reported_checks"] = json!([
+        {"name":"tests", "command":"cargo test", "status":"pass", "detail":"passed"},
+        {"name":"lint", "status":"not_run"},
+    ]);
+    wire["turns"][0]["herdr"] = json!({"state":"attached", "pane_id":"fixture-pane"});
+    wire["turns"][0]["result_parse_reason"] = json!("schema_mismatch:checks");
+    wire["turns"][0]["agent_identity"] = json!({
+        "executable":"agent", "version":"1.2.3", "version_observation":"observed",
+    });
+    let old: baseline::TaskStatus = serde_json::from_value(wire.clone()).unwrap();
+    let current: TaskStatus = serde_json::from_value(wire).unwrap();
+    assert_baseline_golden(&old, &current);
+}
+
+#[test]
+fn copied_baseline_close_and_request_envelopes_supply_independent_golden_bytes() {
+    use mac_worker::test_support::{
+        controller::{ControllerReadReply, ControllerTaskStatusResult, OperationEnvelope},
+        task::{
+            model::TaskStatus,
+            store::{TaskCloseRequest, TaskCloseResponse},
+        },
+    };
+    let mut closed: Value = serde_json::from_str(ORDINARY_STATUS_GOLDEN).unwrap();
+    closed["state"] = json!("closed");
+    closed["session_present"] = json!(false);
+    let old_close: baseline::TaskCloseResponse = serde_json::from_value(json!({
+        "protocol_version":7, "status":closed,
+    }))
+    .unwrap();
+    let current_status: TaskStatus = serde_json::from_value(closed).unwrap();
+    assert_baseline_golden(&old_close, &TaskCloseResponse::new(current_status));
+    let old_request: baseline::TaskCloseRequest = serde_json::from_value(json!({
+        "protocol_version":7, "project_id":"a".repeat(64),
+        "task_id":"00000000000000000000000000000002", "discard":false,
+    }))
+    .unwrap();
+    assert_baseline_golden(
+        &old_request,
+        &TaskCloseRequest::new("a".repeat(64), fixture_task(), false),
+    );
+    let operation = json!({
+        "request_id":"00000000000000000000000000000011", "payload_sha256":"d".repeat(64),
+        "command":"task.close", "body":{"task_id":"00000000000000000000000000000002","discard":false},
+        "created_at_millis":1000, "settled_at_millis":null, "outcome":null,
+    });
+    let old: baseline::OperationEnvelope = serde_json::from_value(operation.clone()).unwrap();
+    let current: OperationEnvelope = serde_json::from_value(operation).unwrap();
+    assert_baseline_golden(&old, &current);
+    let read = json!({
+        "protocol_version":7, "command":"task.status",
+        "request_id":"00000000000000000000000000000011", "payload_sha256":"d".repeat(64),
+        "result":{
+            "task_id":"00000000000000000000000000000002", "run_id":null,
+            "status":serde_json::from_str::<baseline::TaskStatus>(ORDINARY_STATUS_GOLDEN).unwrap(),
+            "warnings":[], "events":[], "runner":null, "exit_code":0,
+        },
+    });
+    let old: baseline::ControllerReadReply<baseline::ControllerTaskStatusResult> =
+        serde_json::from_value(read.clone()).unwrap();
+    let current: ControllerReadReply<ControllerTaskStatusResult> =
+        serde_json::from_value(read).unwrap();
+    assert_baseline_golden(&old, &current);
+}
+
+#[test]
+fn copied_baseline_rejects_unknown_status_enums_bad_nested_records_and_duplicate_keys() {
+    let valid: Value = serde_json::from_str(ORDINARY_STATUS_GOLDEN).unwrap();
+    for (pointer, value) in [
+        ("/state", json!("integrating")),
+        ("/last_outcome/kind", json!("integrated")),
+        ("/turns/0/terminal", json!("resolving")),
+        ("/turns/0/outcome/kind", json!("verifying")),
+        ("/turns/0/turn_id", json!("not-a-turn")),
+        ("/worker", json!("")),
+    ] {
+        let mut changed = valid.clone();
+        *changed.pointer_mut(pointer).unwrap() = value;
+        assert!(
+            serde_json::from_value::<baseline::TaskStatus>(changed).is_err(),
+            "{pointer}"
+        );
+    }
+    let mut changed = valid.clone();
+    changed["reported_checks"] = json!([{"name":"tests","status":"verified"}]);
+    assert!(serde_json::from_value::<baseline::TaskStatus>(changed).is_err());
+    let mut changed = valid.clone();
+    changed["turns"][0]["agent_identity"] = json!({
+        "executable":"agent", "version":null, "version_observation":"made_up",
+    });
+    assert!(serde_json::from_value::<baseline::TaskStatus>(changed).is_err());
+    for (needle, replacement) in [
+        (r#""state":"open""#, r#""state":"open","state":"open""#),
+        (r#""kind":"done""#, r#""kind":"done","kind":"done""#),
+        (r#""turn_number":1"#, r#""turn_number":1,"turn_number":1"#),
+    ] {
+        // Work with raw bytes: Value would erase the duplicate before decoding.
+        let bytes = ORDINARY_STATUS_GOLDEN.replacen(needle, replacement, 1);
+        let error = serde_json::from_str::<baseline::TaskStatus>(&bytes).unwrap_err();
+        assert!(error.to_string().contains("duplicate field"), "{error}");
+    }
+    let mut changed = valid;
+    changed["turns"][0]["integration"] = json!({"state":"integrating"});
+    assert!(serde_json::from_value::<baseline::TaskStatus>(changed).is_err());
+}
+
+#[test]
+fn copied_baseline_enabled_status_keeps_the_ordinary_enum_and_tolerates_value_events() {
+    use mac_worker::test_support::controller::ControllerTaskStatusResult;
+    let current: ControllerTaskStatusResult = serde_json::from_value(json!({
+        "task_id":fixture_task(), "run_id":null,
+        "status":sample_ordinary(fixture_task(), fixture_source()).status(),
+        "warnings":[], "runner":null, "exit_code":0,
+        "events":[{"type":"integration","snapshot":pending()}, {"type":"future_event","data":{}}],
+    }))
+    .unwrap();
+    let bytes = serde_json::to_vec(&current).unwrap();
+    let old: baseline::ControllerTaskStatusResult = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(serde_json::to_vec(&old).unwrap(), bytes);
+    let old = serde_json::to_value(old).unwrap();
+    assert_eq!(old["status"]["state"], "open");
+    assert_eq!(old["events"][0]["snapshot"], pending());
+    assert_eq!(old["events"][1]["type"], "future_event");
+    assert!(old["status"].get("integration").is_none());
+}
+
+#[test]
+fn copied_baseline_facts_supply_golden_bytes_and_preserve_tolerant_old_peer_rules() {
+    use mac_worker::test_support::events::TaskFacts;
+    let wire = json!({
+        "task_id":"00000000000000000000000000000002", "run_id":null,
+        "state":"open", "latest_turn_id":"00000000000000000000000000000003",
+        "outcome":"done", "code":null, "runner_present":false, "close_intent":false,
+        "auto_continue_intent":false, "queue_dispatching":false, "result_imported":true,
+        "busy":false, "quiescent":true, "fact_digest":"a".repeat(64), "title":"Fixture",
+    });
+    let old: baseline::TaskFacts = serde_json::from_value(wire.clone()).unwrap();
+    let current: TaskFacts = serde_json::from_value(wire.clone()).unwrap();
+    assert_baseline_golden(&old, &current);
+    let mut unknown = wire.clone();
+    unknown["outcome"] = json!("integrated");
+    unknown["code"] = json!("INTEGRATION_CONFLICT");
+    let old: baseline::TaskFacts = serde_json::from_value(unknown).unwrap();
+    assert_eq!(old.outcome, None);
+    assert_eq!(old.quiescent, None);
+    assert_eq!(old.code.unwrap().as_str(), "TURN_FAILED");
+    let mut unknown = wire.clone();
+    unknown["state"] = json!("integrating");
+    let old: baseline::TaskFacts = serde_json::from_value(unknown).unwrap();
+    assert_eq!((old.busy, old.quiescent), (None, None));
+    for (field, value) in [
+        ("task_id", json!("bad-id")),
+        ("fact_digest", json!("not-a-digest")),
+        ("title", json!("bad\ntitle")),
+        ("latest_turn_id", Value::Null),
+    ] {
+        let mut changed = wire.clone();
+        changed[field] = value;
+        assert!(
+            serde_json::from_value::<baseline::TaskFacts>(changed).is_err(),
+            "{field}"
+        );
+    }
+    let duplicate = serde_json::to_string(&wire).unwrap().replacen(
+        r#""runner_present":false"#,
+        r#""runner_present":false,"runner_present":false"#,
+        1,
+    );
+    assert!(serde_json::from_str::<baseline::TaskFacts>(&duplicate).is_err());
 }
 
 fn pending() -> Value {
@@ -930,6 +1155,9 @@ fn typed_compact_annotation_is_retained_while_disabled_facts_keep_their_bytes() 
         true,
     );
     let disabled = serde_json::to_value(&facts).unwrap();
+    let old: baseline::TaskFacts =
+        serde_json::from_slice(&serde_json::to_vec(&facts).unwrap()).unwrap();
+    assert_eq!(serde_json::to_value(old).unwrap(), disabled);
     assert!(disabled.get("integration").is_none());
     let mut enabled = disabled.clone();
     let annotation = json!({
@@ -939,9 +1167,17 @@ fn typed_compact_annotation_is_retained_while_disabled_facts_keep_their_bytes() 
     enabled["integration"] = annotation.clone();
     let decoded: TaskFacts = serde_json::from_value(enabled).unwrap();
     assert_eq!(
-        serde_json::to_value(decoded).unwrap()["integration"],
+        serde_json::to_value(&decoded).unwrap()["integration"],
         annotation
     );
+    // ce7f62f facts are tolerant: the typed ordinary proof survives while the
+    // enabled-only annotation is ignored by an old peer.
+    let old: baseline::TaskFacts =
+        serde_json::from_slice(&serde_json::to_vec(&decoded).unwrap()).unwrap();
+    let mut old_enabled = disabled.clone();
+    old_enabled["busy"] = json!(true);
+    old_enabled["quiescent"] = json!(false);
+    assert_eq!(serde_json::to_value(old).unwrap(), old_enabled);
     let decoded: TaskFacts = serde_json::from_value(disabled.clone()).unwrap();
     assert_eq!(serde_json::to_value(decoded).unwrap(), disabled);
 }

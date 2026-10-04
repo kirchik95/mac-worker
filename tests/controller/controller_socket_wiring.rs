@@ -672,6 +672,16 @@ mod t7a {
             panic!("ready service unavailable")
         };
         assert_eq!(identity.service, record.service);
+        assert_eq!(
+            identity.service.features,
+            [
+                "controller.events",
+                "controller.integration",
+                "controller.session-import",
+                "controller.socket",
+                "controller.task-logs-wait",
+            ]
+        );
         let id = fs::read_to_string(fixture.paths.state.join("client-id")).unwrap();
         assert_eq!(identity.service.controller_client_id.to_string(), id.trim());
         assert!(

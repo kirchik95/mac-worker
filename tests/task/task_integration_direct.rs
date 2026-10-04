@@ -1,197 +1,8 @@
-use mac_worker::test_support::{
-    agents::agent::{Question, ReportedCheck},
-    integration::*,
-    task::{model::*, prepared_followup::PreparedFollowup},
-};
+use mac_worker::test_support::{integration::*, task::model::*};
 use serde_json::{Value, json};
 
-// Strict wire decoders copied from T1 base ce7f62f (protocol 7).
-// Opaque private title/session fields use Value; key and enum strictness stays frozen.
-mod baseline {
-    #![allow(dead_code)]
-    use super::*;
-    #[derive(Debug, serde::Deserialize)]
-    #[serde(rename_all = "snake_case")]
-    enum AgentKindWire {
-        Codex,
-        Claude,
-        Cursor,
-        Opencode,
-    }
-    #[derive(Debug, serde::Deserialize)]
-    #[serde(rename_all = "snake_case")]
-    enum PermissionPolicyWire {
-        Workspace,
-        Unattended,
-    }
-    #[derive(Debug, serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub struct TaskMeta {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        session_import: Option<Value>,
-        task_id: TaskId,
-        run_id: Option<RunId>,
-        project_id: String,
-        worktree_id: String,
-        agent: AgentKindWire,
-        model: Option<String>,
-        #[serde(default)]
-        effort: Option<String>,
-        policy: PermissionPolicyWire,
-        #[serde(default)]
-        effective_policy: Option<PermissionPolicyWire>,
-        source: TaskSource,
-        publish: Vec<PublishMode>,
-        publish_branch: Option<BranchName>,
-        base_oid: BaseOid,
-        limits: TaskLimits,
-        close_policy: ClosePolicy,
-        env_profile: Option<String>,
-        git_identity: GitIdentity,
-        title: String,
-        created_at_millis: u64,
-    }
-    #[derive(Debug, serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub struct TaskStatus {
-        state: TaskState,
-        last_outcome: Option<TaskOutcome>,
-        worker: Option<String>,
-        session_present: bool,
-        head_oid: Option<BaseOid>,
-        summary: Option<String>,
-        questions: Vec<Question>,
-        files_changed: Vec<String>,
-        diff_stat: Option<String>,
-        turns: Vec<TurnSummary>,
-        updated_at_millis: u64,
-        #[serde(default)]
-        reported_checks: Vec<ReportedCheck>,
-    }
-    #[derive(Debug, serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub struct PreparedFollowup {
-        #[serde(default, skip_serializing_if = "is_false")]
-        auto_continue: bool,
-        expected: LocalTaskRecord,
-        turn_id: TurnId,
-        turn_number: u32,
-        created_at_millis: u64,
-        message: String,
-        composed_prompt: String,
-        base_oid: BaseOid,
-        agent: String,
-        model: Option<String>,
-        worker: String,
-        max_followups: u32,
-    }
-    #[derive(Debug, serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub struct FrozenSubmitBody {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub session_import: Option<Value>,
-        /// Explicit override only: older controllers reject unknown fields.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub questions: Option<QuestionsPolicy>,
-        pub task_id: TaskId,
-        pub turn_id: TurnId,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub run_id: Option<RunId>,
-        pub created_at_millis: u64,
-        pub prompt: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub title: Option<String>,
-        pub agent: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub model: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub effort: Option<String>,
-        pub source: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub origin_url: Option<String>,
-        pub publish: Vec<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub publish_branch: Option<String>,
-        pub close_on: ClosePolicy,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub env_profile: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub worker: Option<String>,
-        pub wip: bool,
-        pub project_id: String,
-        pub worktree_id: String,
-        pub base_oid: BaseOid,
-        pub timeout_millis: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub max_turns: Option<u32>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub max_budget_usd_cents: Option<u64>,
-        pub max_followups: u32,
-        pub permissions: String,
-        pub requires: Vec<String>,
-        pub include_untracked: Vec<String>,
-        pub include_empty_dirs: Vec<String>,
-        pub allow_sensitive: Vec<String>,
-        pub cli_includes: Vec<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub branch: Option<String>,
-        /// CLI `--no-wait` inverts this. Omitted old bodies default true, preserving
-        /// capacity behavior.
-        #[serde(default = "default_true")]
-        pub wait_for_capacity: bool,
-    }
-    #[derive(Debug, serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    pub struct DagFrozenSpec {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub questions: Option<QuestionsPolicy>,
-        pub prompt: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub title: Option<String>,
-        pub agent: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub model: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub effort: Option<String>,
-        pub source: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub origin_url: Option<String>,
-        pub publish: Vec<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub publish_branch: Option<String>,
-        pub close_on: ClosePolicy,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub env_profile: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub worker: Option<String>,
-        pub wip: bool,
-        pub project_path: String,
-        pub project_id: String,
-        pub worktree_id: String,
-        pub timeout_millis: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub max_turns: Option<u32>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub max_budget_usd_cents: Option<u64>,
-        pub max_followups: u32,
-        /// Resolved `PermissionPolicy` (`workspace` or `unattended`).
-        pub permissions: String,
-        pub requires: Vec<String>,
-        pub include_untracked: Vec<String>,
-        pub include_empty_dirs: Vec<String>,
-        pub allow_sensitive: Vec<String>,
-        pub cli_includes: Vec<String>,
-        /// Branch frozen at initial batch submit for first-turn prompt composition.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub branch: Option<String>,
-    }
-    fn default_true() -> bool {
-        true
-    }
-    fn is_false(value: &bool) -> bool {
-        !value
-    }
-}
+#[path = "../support/baseline_ce7f62f.rs"]
+mod baseline;
 
 #[test]
 fn disabled_ordinary_status_meta_and_followup_keep_baseline_strict_keys_and_bytes() {
@@ -223,19 +34,20 @@ fn disabled_ordinary_status_meta_and_followup_keep_baseline_strict_keys_and_byte
         }
     }
     let bytes = serde_json::to_vec(ordinary.meta()).unwrap();
-    let decoded: TaskMeta = serde_json::from_slice(&bytes).unwrap();
+    let decoded: baseline::TaskMeta = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
     let bytes = serde_json::to_vec(ordinary.status()).unwrap();
-    let decoded: TaskStatus = serde_json::from_slice(&bytes).unwrap();
+    let decoded: baseline::TaskStatus = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
     let bytes = serde_json::to_vec(&prepared.followup).unwrap();
-    let decoded: PreparedFollowup = serde_json::from_slice(&bytes).unwrap();
+    let decoded: baseline::PreparedFollowup = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
 }
 
 fn frozen() -> Value {
     json!({
-        "task_id":fixture_task(),"turn_id":fixture_source(),"created_at_millis":1000,
+        "task_id":"00000000000000000000000000000002",
+        "turn_id":"00000000000000000000000000000003","created_at_millis":1000,
         "prompt":"work","agent":"codex","source":"local","origin_url":"https://example.test/repo.git",
         "publish":["fetch"],"close_on":"never","wip":false,
         "project_id":"a".repeat(64),"worktree_id":"b".repeat(64),"base_oid":"b".repeat(40),
@@ -247,13 +59,11 @@ fn frozen() -> Value {
 
 #[test]
 fn disabled_submit_and_dag_remain_accepted_by_copied_baseline_decoders() {
+    let old_submit: baseline::FrozenSubmitBody = serde_json::from_value(frozen()).unwrap();
     let submit: FrozenSubmitBody = serde_json::from_value(frozen()).unwrap();
     let bytes = serde_json::to_vec(&submit).unwrap();
     serde_json::from_slice::<baseline::FrozenSubmitBody>(&bytes).unwrap();
-    assert_eq!(
-        serde_json::to_vec(&serde_json::from_slice::<FrozenSubmitBody>(&bytes).unwrap()).unwrap(),
-        bytes
-    );
+    assert_eq!(serde_json::to_vec(&old_submit).unwrap(), bytes);
     let mut dag = frozen();
     for key in [
         "task_id",
@@ -265,19 +75,113 @@ fn disabled_submit_and_dag_remain_accepted_by_copied_baseline_decoders() {
         dag.as_object_mut().unwrap().remove(key);
     }
     dag["project_path"] = json!("/fixture/project");
+    let old_dag: baseline::DagFrozenSpec = serde_json::from_value(dag.clone()).unwrap();
     let dag: DagFrozenSpec = serde_json::from_value(dag).unwrap();
     let bytes = serde_json::to_vec(&dag).unwrap();
     serde_json::from_slice::<baseline::DagFrozenSpec>(&bytes).unwrap();
-    assert_eq!(
-        serde_json::to_vec(&serde_json::from_slice::<DagFrozenSpec>(&bytes).unwrap()).unwrap(),
-        bytes
-    );
+    assert_eq!(serde_json::to_vec(&old_dag).unwrap(), bytes);
     let mut wrapped = serde_json::to_value(&submit).unwrap();
     wrapped["integration"] = serde_json::to_value(sample_policy("main")).unwrap();
     assert!(serde_json::from_value::<baseline::FrozenSubmitBody>(wrapped).is_err());
 }
 
+#[test]
+fn copied_baseline_imported_meta_and_submit_freeze_the_nested_session_codec() {
+    let import = json!({
+        "agent":"codex", "format":"codex-rollout-v1",
+        "package_oid":"d".repeat(40), "source_agent_version":"0.160.0",
+    });
+    let mut meta =
+        serde_json::to_value(sample_ordinary(fixture_task(), fixture_source()).meta()).unwrap();
+    meta["session_import"] = import.clone();
+    let old_meta: baseline::TaskMeta = serde_json::from_value(meta.clone()).unwrap();
+    let current_meta: TaskMeta = serde_json::from_value(meta).unwrap();
+    let bytes = serde_json::to_vec(&current_meta).unwrap();
+    assert_eq!(bytes, serde_json::to_vec(&old_meta).unwrap());
+    serde_json::from_slice::<baseline::TaskMeta>(&bytes).unwrap();
+    let mut submit = frozen();
+    submit["session_import"] = import;
+    submit["questions"] = json!("ask");
+    let old: baseline::FrozenSubmitBody = serde_json::from_value(submit.clone()).unwrap();
+    let current: FrozenSubmitBody = serde_json::from_value(submit.clone()).unwrap();
+    let bytes = serde_json::to_vec(&current).unwrap();
+    assert_eq!(bytes, serde_json::to_vec(&old).unwrap());
+    serde_json::from_slice::<baseline::FrozenSubmitBody>(&bytes).unwrap();
+    for (field, value) in [
+        ("agent", json!("cursor")),
+        ("format", json!("claude-jsonl-v1")),
+        ("package_oid", json!("bad-oid")),
+        ("source_agent_version", json!("not-a-version")),
+        ("unknown", json!(true)),
+    ] {
+        let mut changed = submit.clone();
+        changed["session_import"][field] = value;
+        assert!(
+            serde_json::from_value::<baseline::FrozenSubmitBody>(changed).is_err(),
+            "{field}"
+        );
+    }
+    let duplicate = serde_json::to_string(&submit).unwrap().replacen(
+        r#""session_import":{"agent":"codex""#,
+        r#""session_import":{"agent":"codex","agent":"codex""#,
+        1,
+    );
+    assert!(serde_json::from_str::<baseline::FrozenSubmitBody>(&duplicate).is_err());
+}
+
+#[test]
+fn copied_baseline_meta_validates_titles_identities_limits_and_followup_records() {
+    let ordinary = sample_ordinary(fixture_task(), fixture_source());
+    let valid = serde_json::to_value(ordinary.meta()).unwrap();
+    serde_json::from_value::<baseline::TaskMeta>(valid.clone()).unwrap();
+    for (pointer, value) in [
+        ("/title", json!("x".repeat(121))),
+        ("/title", json!("bad\ntitle")),
+        ("/git_identity/name", json!("")),
+        ("/git_identity/email", json!("bad<email>")),
+        ("/limits/turn/timeout_millis", json!(0)),
+        ("/limits/turn/max_turns", json!(0)),
+        ("/limits/max_followups", json!(101)),
+        ("/base_oid", json!("B".repeat(40))),
+        ("/agent", json!("future_agent")),
+        ("/policy", json!("future_policy")),
+        ("/publish", json!(["fetch", "fetch"])),
+    ] {
+        let mut changed = valid.clone();
+        *changed.pointer_mut(pointer).unwrap() = value;
+        assert!(
+            serde_json::from_value::<baseline::TaskMeta>(changed).is_err(),
+            "{pointer}"
+        );
+    }
+    let mut changed = valid;
+    changed["session_import"] = json!({
+        "agent":"claude", "format":"claude-jsonl-v1",
+        "package_oid":"d".repeat(40), "source_agent_version":"2.1.0",
+    });
+    assert!(serde_json::from_value::<baseline::TaskMeta>(changed).is_err());
+    let prepared = sample_prepared_turn(
+        &sample_record(fixture_task(), fixture_source(), "main"),
+        IntegrationTurnPurpose::Resolve,
+        1,
+        1,
+    );
+    let mut changed = serde_json::to_value(prepared.followup).unwrap();
+    serde_json::from_value::<baseline::PreparedFollowup>(changed.clone()).unwrap();
+    changed["expected"]["meta"]["limits"]["turn"]["timeout_millis"] = json!(0);
+    assert!(serde_json::from_value::<baseline::PreparedFollowup>(changed).is_err());
+    let duplicate = serde_json::to_string(ordinary.meta()).unwrap().replacen(
+        r#""name":"mac-worker""#,
+        r#""name":"mac-worker","name":"mac-worker""#,
+        1,
+    );
+    let error = serde_json::from_str::<baseline::TaskMeta>(&duplicate).unwrap_err();
+    assert!(error.to_string().contains("duplicate field"), "{error}");
+}
+
 fn integration_fixture(capable: bool) -> super::session_import_e2e::Fixture {
+    use std::os::unix::fs::PermissionsExt;
+
     let f = super::session_import_e2e::Fixture::new();
     let origin = f.laptop.parent().unwrap().join("origin.git");
     f.project
@@ -291,13 +195,19 @@ fn integration_fixture(capable: bool) -> super::session_import_e2e::Fixture {
     let mut config = std::fs::read_to_string(&f.config).unwrap();
     config.push_str("capabilities = ['origin:file']\n");
     std::fs::write(&f.config, config).unwrap();
-    if capable {
+    // Keep native probes about the fixture's Git host instead of repeatedly
+    // launching unrelated installed tool version commands under gate load.
+    let tools = f.host_root().join("tool-capabilities.json");
+    std::fs::write(&tools, br#"{"tools":["git"]}"#).unwrap();
+    std::fs::set_permissions(&tools, std::fs::Permissions::from_mode(0o600)).unwrap();
+    if !capable {
         let ssh = std::fs::read_to_string(&f.ssh).unwrap().replace(
             "probe.update(memory_pressure",
-            "probe['features'].append('task.integration')\n    probe.update(memory_pressure",
+            "probe['features'] = [feature for feature in probe['features'] if feature != 'task.integration']\n    probe.update(memory_pressure",
         );
         std::fs::write(&f.ssh, ssh).unwrap();
     }
+    super::session_import_e2e::warm_executable(&f.ssh);
     f
 }
 
@@ -553,7 +463,31 @@ fn native_read_surfaces_expose_the_same_parked_companion_without_driving_git() {
 }
 
 #[test]
-fn native_legacy_retention_restore_observes_m_or_h_and_imports_without_resurrecting_closed_work() {
+fn native_legacy_retention_restores_a_retained_merge_without_resurrection() {
+    native_legacy_retention_restore_case("merge", true);
+}
+
+#[test]
+fn native_legacy_retention_restores_a_reachable_source_without_resurrection() {
+    native_legacy_retention_restore_case("source", false);
+}
+
+#[test]
+fn native_legacy_retention_restore_blocks_when_no_retained_result_is_reachable() {
+    native_legacy_retention_restore_case("neither", true);
+}
+
+#[test]
+fn native_legacy_retention_restore_retries_a_failed_observation_then_imports() {
+    native_legacy_retention_restore_case("failed_then_merge", false);
+}
+
+#[test]
+fn native_legacy_retention_restores_a_merge_after_open_repair_exhaustion() {
+    native_legacy_retention_restore_case("open_repair_exhausted", false);
+}
+
+fn native_legacy_retention_restore_case(target: &str, parked: bool) {
     use mac_worker::test_support::{
         client_state::ClientStateStore,
         host::{
@@ -564,175 +498,196 @@ fn native_legacy_retention_restore_observes_m_or_h_and_imports_without_resurrect
         task::store::TaskStore,
     };
     use std::sync::Arc;
-    for (target, parked) in [
-        ("merge", true),
-        ("source", false),
-        ("neither", true),
-        ("failed_then_merge", false),
-    ] {
-        let (f, task) = parked_source_fixture();
-        let paths = owner_paths(&f);
-        let state =
-            RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
-                .unwrap();
-        let original = state.load(task).unwrap().unwrap();
-        let host = HostStore::open(&f.host_root()).unwrap();
-        let mut phase = original.clone();
-        phase.snapshot.state = IntegrationStatus::Pending;
-        phase.snapshot.resume_state = None;
-        phase.snapshot.pause_reason = None;
-        phase.pause = None;
-        let request = HostIntegrationRequest {
-            protocol_version: 7,
-            task_id: task,
-            integration_id: Some(phase.snapshot.integration_id),
-            epoch: phase.snapshot.epoch,
-            revision: phase.snapshot.revision,
-            action: HostIntegrationAction::Step {
-                step: IntegrationStep::Prepare,
-                record: Box::new(phase),
-            },
-        };
-        let runtime = ManualIntegrationRuntime::default();
-        let HostIntegrationResponse::CandidateReady { candidate, .. } =
-            HostIntegrationService::new(&host, &SystemProcessRunner, &runtime)
-                .execute(&request)
-                .unwrap()
-        else {
-            panic!("clean real candidate required")
-        };
-        let merge = candidate.merge_oid.clone().unwrap();
-        let mut retained = HostIntegrationStore::new(&host)
-            .load(&original.policy.project_id, task)
-            .unwrap()
-            .unwrap();
-        retained.snapshot.observed_target_oid = Some(candidate.target_head.clone());
-        retained.snapshot.merge_oid = Some(merge.clone());
-        retained.snapshot.state = if parked {
-            IntegrationStatus::Parked
-        } else {
-            IntegrationStatus::Blocked
-        };
-        retained.snapshot.resume_state = parked.then_some(IntegrationStatus::Pushing);
-        retained.snapshot.pause_reason =
-            parked.then_some(IntegrationPauseReason::ControllerDrained);
-        retained.pause = parked.then_some(IntegrationPauseEvidence {
-            reason: IntegrationPauseReason::ControllerDrained,
-            effective_at_millis: 1001,
-        });
-        retained.snapshot.blocked_code = (!parked).then_some(IntegrationCode::IntegrationNetwork);
-        retained.push_intent = Some(IntegrationPushIntent {
-            candidate: candidate.id,
-            expected_target: candidate.target_head.clone(),
-            merge_oid: merge.clone(),
-            started_at_millis: 1001,
-            uncertain: true,
-        });
-        retained.snapshot.revision = original.snapshot.revision.next().unwrap();
-        let host_task = host.task_dir(&original.policy.project_id, task).unwrap();
-        std::fs::write(
-            host_task.join("integration/record.json"),
-            encode_record(&retained).unwrap(),
-        )
+    let (f, task) = parked_source_fixture();
+    let paths = owner_paths(&f);
+    let state = RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
         .unwrap();
-        state
-            .replace(task, original.snapshot.revision, &retained)
-            .unwrap();
-        let mirror = host
-            .mirror_if_present(&original.policy.project_id)
+    let original = state.load(task).unwrap().unwrap();
+    let host = HostStore::open(&f.host_root()).unwrap();
+    let mut phase = original.clone();
+    phase.snapshot.state = IntegrationStatus::Pending;
+    phase.snapshot.resume_state = None;
+    phase.snapshot.pause_reason = None;
+    phase.pause = None;
+    let request = HostIntegrationRequest {
+        protocol_version: 7,
+        task_id: task,
+        integration_id: Some(phase.snapshot.integration_id),
+        epoch: phase.snapshot.epoch,
+        revision: phase.snapshot.revision,
+        action: HostIntegrationAction::Step {
+            step: IntegrationStep::Prepare,
+            record: Box::new(phase),
+        },
+    };
+    let runtime = ManualIntegrationRuntime::default();
+    let HostIntegrationResponse::CandidateReady { candidate, .. } =
+        HostIntegrationService::new(&host, &SystemProcessRunner, &runtime)
+            .execute(&request)
             .unwrap()
-            .unwrap();
-        let refs = f.project.git(&[
+    else {
+        panic!("clean real candidate required")
+    };
+    let merge = candidate.merge_oid.clone().unwrap();
+    let mut retained = HostIntegrationStore::new(&host)
+        .load(&original.policy.project_id, task)
+        .unwrap()
+        .unwrap();
+    retained.snapshot.observed_target_oid = Some(candidate.target_head.clone());
+    retained.snapshot.merge_oid = Some(merge.clone());
+    retained.snapshot.state = if parked {
+        IntegrationStatus::Parked
+    } else {
+        IntegrationStatus::Blocked
+    };
+    retained.snapshot.resume_state = parked.then_some(IntegrationStatus::Pushing);
+    retained.snapshot.pause_reason = parked.then_some(IntegrationPauseReason::ControllerDrained);
+    retained.pause = parked.then_some(IntegrationPauseEvidence {
+        reason: IntegrationPauseReason::ControllerDrained,
+        effective_at_millis: 1001,
+    });
+    retained.snapshot.blocked_code = (!parked).then_some(IntegrationCode::IntegrationNetwork);
+    retained.push_intent = Some(IntegrationPushIntent {
+        candidate: candidate.id,
+        expected_target: candidate.target_head.clone(),
+        merge_oid: merge.clone(),
+        started_at_millis: 1001,
+        uncertain: true,
+    });
+    if target == "open_repair_exhausted" {
+        // Restore the durable result of an exhausted Open Repair, independently
+        // reproduced with four real-owner calls in the lifecycle review probe.
+        retained.phase_retries.push(IntegrationPhaseRetry {
+            phase: IntegrationPhase::Repair,
+            retries: 3,
+            code: IntegrationCode::IntegrationNetwork,
+            due_at_millis: 1001,
+        });
+        retained.snapshot.retry_exhausted = true;
+        retained.snapshot.disposition = Some(IntegrationDisposition::Merged);
+        retained.receipt = Some(IntegrationReceipt {
+            integration_id: retained.snapshot.integration_id,
+            epoch: retained.snapshot.epoch,
+            source_turn_id: retained.snapshot.source_turn_id,
+            source_head: retained.snapshot.source_head.clone(),
+            target_head: candidate.target_head.clone(),
+            merge_oid: Some(merge.clone()),
+            disposition: IntegrationDisposition::Merged,
+            imported: false,
+            recorded_at_millis: 1001,
+        });
+    }
+    retained.snapshot.revision = original.snapshot.revision.next().unwrap();
+    let host_task = host.task_dir(&original.policy.project_id, task).unwrap();
+    std::fs::write(
+        host_task.join("integration/record.json"),
+        encode_record(&retained).unwrap(),
+    )
+    .unwrap();
+    state
+        .replace(task, original.snapshot.revision, &retained)
+        .unwrap();
+    let mirror = host
+        .mirror_if_present(&original.policy.project_id)
+        .unwrap()
+        .unwrap();
+    let refs = f.project.git(&[
+        "--git-dir",
+        mirror.path().to_str().unwrap(),
+        "for-each-ref",
+        "--format=%(refname) %(objectname)",
+        "refs/heads/task",
+        "refs/mac-worker/bases",
+    ]);
+    if target != "neither" {
+        let accepted = if target == "source" {
+            &retained.snapshot.source_head
+        } else {
+            &merge
+        };
+        f.project.git(&[
+            "--git-dir",
+            mirror.path().to_str().unwrap(),
+            "push",
+            &original.policy.origin,
+            &format!("{accepted}:refs/heads/main"),
+        ]);
+    }
+    let host_status = TaskStore::new(&host, &SystemProcessRunner)
+        .load_status(&original.policy.project_id, task)
+        .unwrap();
+    let expiry = host_status.updated_at_millis() + TASK_RETENTION_MILLIS;
+    assert!(
+        !apply_baseline_retention_close(
+            &host,
+            &SystemProcessRunner,
+            &original.policy.project_id,
+            task,
+            expiry - 1
+        )
+        .unwrap()
+    );
+    assert!(
+        apply_baseline_retention_close(
+            &host,
+            &SystemProcessRunner,
+            &original.policy.project_id,
+            task,
+            expiry + 1
+        )
+        .unwrap()
+    );
+    assert!(!host_task.join("workspace").exists());
+    assert_eq!(
+        f.project.git(&[
             "--git-dir",
             mirror.path().to_str().unwrap(),
             "for-each-ref",
             "--format=%(refname) %(objectname)",
             "refs/heads/task",
-            "refs/mac-worker/bases",
-        ]);
-        if target != "neither" {
-            let accepted = if target == "source" {
-                &retained.snapshot.source_head
-            } else {
-                &merge
-            };
-            f.project.git(&[
-                "--git-dir",
-                mirror.path().to_str().unwrap(),
-                "push",
-                &original.policy.origin,
-                &format!("{accepted}:refs/heads/main"),
-            ]);
-        }
-        let host_status = TaskStore::new(&host, &SystemProcessRunner)
-            .load_status(&original.policy.project_id, task)
-            .unwrap();
-        let expiry = host_status.updated_at_millis() + TASK_RETENTION_MILLIS;
-        assert!(
-            !apply_baseline_retention_close(
-                &host,
-                &SystemProcessRunner,
-                &original.policy.project_id,
-                task,
-                expiry - 1
-            )
-            .unwrap()
-        );
-        assert!(
-            apply_baseline_retention_close(
-                &host,
-                &SystemProcessRunner,
-                &original.policy.project_id,
-                task,
-                expiry + 1
-            )
-            .unwrap()
-        );
-        assert!(!host_task.join("workspace").exists());
-        assert_eq!(
-            f.project.git(&[
-                "--git-dir",
-                mirror.path().to_str().unwrap(),
-                "for-each-ref",
-                "--format=%(refname) %(objectname)",
-                "refs/heads/task",
-                "refs/mac-worker/bases"
-            ]),
-            refs
-        );
-        let local_store = ClientStateStore::open(&paths.state).unwrap();
-        let closed = local_store
-            .load_task(task)
-            .unwrap()
-            .with_status(
-                TaskStore::new(&host, &SystemProcessRunner)
-                    .load_status(&original.policy.project_id, task)
-                    .unwrap(),
-            )
-            .unwrap();
-        assert_eq!(closed.status().state(), TaskState::Closed);
-        assert_eq!(
-            closed.status().last_outcome(),
-            Some(&mac_worker::test_support::task::model::TaskOutcome::Done)
-        );
-        let config = mac_worker::test_support::core::config::Config::parse(
-            &std::fs::read_to_string(&f.config).unwrap(),
+            "refs/mac-worker/bases"
+        ]),
+        refs
+    );
+    let local_store = ClientStateStore::open(&paths.state).unwrap();
+    let before_close = local_store.load_task(task).unwrap();
+    let closed = before_close
+        .clone()
+        .with_status(
+            TaskStore::new(&host, &SystemProcessRunner)
+                .load_status(&original.policy.project_id, task)
+                .unwrap(),
         )
         .unwrap();
-        let client = mac_worker::test_support::task::client::TaskClient::new(
-            &SystemProcessRunner,
-            &config,
-            &paths,
-            &local_store,
-            &mac_worker::test_support::task::turn_runner::InlineRunnerExecutor,
-        );
-        assert_ne!(
-            client.integration_parent_gate(&closed).unwrap(),
-            mac_worker::test_support::client_state::dag::ParentGate::Ready,
-            "Closed+Done alone cannot release a configured child"
-        );
-        let ssh = std::fs::read_to_string(&f.ssh).unwrap();
-        let logging = r#"if command.endswith(' host task-integration'):
+    // Recovery starts after the owner has observed the real legacy close.
+    assert!(
+        local_store
+            .update_task_if_current(&before_close, closed.clone())
+            .unwrap()
+    );
+    assert_eq!(closed.status().state(), TaskState::Closed);
+    assert_eq!(
+        closed.status().last_outcome(),
+        Some(&mac_worker::test_support::task::model::TaskOutcome::Done)
+    );
+    let config = mac_worker::test_support::core::config::Config::parse(
+        &std::fs::read_to_string(&f.config).unwrap(),
+    )
+    .unwrap();
+    let client = mac_worker::test_support::task::client::TaskClient::new(
+        &SystemProcessRunner,
+        &config,
+        &paths,
+        &local_store,
+        &mac_worker::test_support::task::turn_runner::InlineRunnerExecutor,
+    );
+    assert_ne!(
+        client.integration_parent_gate(&closed).unwrap(),
+        mac_worker::test_support::client_state::dag::ParentGate::Ready,
+        "Closed+Done alone cannot release a configured child"
+    );
+    let ssh = std::fs::read_to_string(&f.ssh).unwrap();
+    let logging = r#"if command.endswith(' host task-integration'):
     data = sys.stdin.buffer.read()
     action = json.loads(data)['action']
     with open(os.path.join(os.environ['HOME'], 'restore-steps'), 'a') as log: log.write(action.get('step', 'other') + '\n')
@@ -746,123 +701,122 @@ fn native_legacy_retention_restore_observes_m_or_h_and_imports_without_resurrect
     sys.stderr.buffer.write(result.stderr)
     sys.exit(result.returncode)
 os.execv('/bin/sh', ['/bin/sh', '-c', command])"#;
-        std::fs::write(
-            &f.ssh,
-            ssh.replace("os.execv('/bin/sh', ['/bin/sh', '-c', command])", logging),
-        )
-        .unwrap();
-        assert!(f.worker(&["controller", "drain", "--off"]).status.success());
-        let recovered = if target == "failed_then_merge" {
-            let origin = f.laptop.parent().unwrap().join("origin.git");
-            let hidden = origin.with_extension("offline");
-            std::fs::rename(&origin, &hidden).unwrap();
-            std::fs::write(f.host.join("observe-offline"), b"once").unwrap();
-            let ready = f.host.join("observation-ready");
-            let release = f.host.join("observation-release");
-            fixture_fifo(&ready);
-            fixture_fifo(&release);
-            Some(std::thread::scope(|scope| {
-                let release_on_drop = ReleaseFixtureFifo(release);
-                let waiter = scope.spawn(|| wait_integrated(&f, task));
-                let mut signal = String::new();
-                std::io::BufRead::read_line(
-                    &mut std::io::BufReader::new(std::fs::File::open(ready).unwrap()),
-                    &mut signal,
-                )
-                .unwrap();
-                assert_eq!(signal, "observed\n");
-                let uncertain = state.load(task).unwrap().unwrap();
-                assert!(uncertain.push_intent.as_ref().unwrap().uncertain);
-                assert!(uncertain.receipt.is_none());
-                std::fs::rename(hidden, origin).unwrap();
-                drop(release_on_drop);
-                let done = waiter.join().unwrap();
-                assert!(
-                    done.phase_retries
-                        .iter()
-                        .any(|retry| retry.phase == IntegrationPhase::Repair
-                            && retry.code == IntegrationCode::IntegrationNetwork
-                            && retry.retries > 0)
-                );
-                done
-            }))
-        } else {
-            None
-        };
-        if target == "neither" {
-            let result = f.worker(&[
-                "--json",
-                "task",
-                "wait",
-                "--task-id",
-                &task.to_string(),
-                "--timeout",
-                "30s",
-            ]);
-            assert!(!result.status.success());
-            assert_eq!(
-                state.load(task).unwrap().unwrap().snapshot.state,
-                IntegrationStatus::Blocked
-            );
-            assert_eq!(
-                state.load(task).unwrap().unwrap().snapshot.blocked_code,
-                Some(IntegrationCode::IntegrationWorkspaceMissing)
-            );
-            assert!(state.load(task).unwrap().unwrap().receipt.is_none());
-        } else {
-            let done = recovered.unwrap_or_else(|| wait_integrated(&f, task));
-            let receipt = done.receipt.unwrap();
-            assert!(receipt.imported);
-            let accepted = if target == "source" {
-                &retained.snapshot.source_head
-            } else {
-                &merge
-            };
-            assert_eq!(
-                receipt.merge_oid.as_ref().unwrap_or(&receipt.target_head),
-                accepted
-            );
-            let local = ClientStateStore::open(&paths.state)
-                .unwrap()
-                .load_task(task)
-                .unwrap();
-            assert_eq!(local.status().head_oid(), Some(accepted));
-            assert_eq!(local.fetched_head(), Some(accepted));
-            assert_eq!(local.status().state(), TaskState::Closed);
+    std::fs::write(
+        &f.ssh,
+        ssh.replace("os.execv('/bin/sh', ['/bin/sh', '-c', command])", logging),
+    )
+    .unwrap();
+    assert!(f.worker(&["controller", "drain", "--off"]).status.success());
+    let recovered = if target == "failed_then_merge" {
+        let origin = f.laptop.parent().unwrap().join("origin.git");
+        let hidden = origin.with_extension("offline");
+        std::fs::rename(&origin, &hidden).unwrap();
+        std::fs::write(f.host.join("observe-offline"), b"once").unwrap();
+        let ready = f.host.join("observation-ready");
+        let release = f.host.join("observation-release");
+        fixture_fifo(&ready);
+        fixture_fifo(&release);
+        Some(std::thread::scope(|scope| {
+            let release_on_drop = ReleaseFixtureFifo(release);
+            let waiter = scope.spawn(|| wait_integrated(&f, task));
+            let mut signal = String::new();
+            std::io::BufRead::read_line(
+                &mut std::io::BufReader::new(std::fs::File::open(ready).unwrap()),
+                &mut signal,
+            )
+            .unwrap();
+            assert_eq!(signal, "observed\n");
+            let uncertain = state.load(task).unwrap().unwrap();
+            assert!(uncertain.push_intent.as_ref().unwrap().uncertain);
+            assert!(uncertain.receipt.is_none());
+            std::fs::rename(hidden, origin).unwrap();
+            drop(release_on_drop);
+            let done = waiter.join().unwrap();
             assert!(
-                HostIntegrationStore::new(&host)
-                    .load(&original.policy.project_id, task)
-                    .unwrap()
-                    .unwrap()
-                    .receipt
-                    .unwrap()
-                    .imported
+                done.phase_retries
+                    .iter()
+                    .any(|retry| retry.phase == IntegrationPhase::Drive
+                        && retry.code == IntegrationCode::IntegrationNetwork
+                        && retry.retries > 0)
             );
-        }
+            done
+        }))
+    } else {
+        None
+    };
+    if target == "neither" {
+        let result = f.worker(&[
+            "--json",
+            "task",
+            "wait",
+            "--task-id",
+            &task.to_string(),
+            "--timeout",
+            "30s",
+        ]);
+        assert!(!result.status.success());
         assert_eq!(
-            TaskStore::new(&host, &SystemProcessRunner)
-                .load_status(&original.policy.project_id, task)
-                .unwrap()
-                .state(),
-            TaskState::Closed
+            state.load(task).unwrap().unwrap().snapshot.state,
+            IntegrationStatus::Blocked
         );
-        assert!(!host_task.join("workspace").exists());
-        let steps = std::fs::read_to_string(f.host.join("restore-steps")).unwrap();
+        assert_eq!(
+            state.load(task).unwrap().unwrap().snapshot.blocked_code,
+            Some(IntegrationCode::IntegrationWorkspaceMissing)
+        );
+        assert!(state.load(task).unwrap().unwrap().receipt.is_none());
+    } else {
+        let done = recovered.unwrap_or_else(|| wait_integrated(&f, task));
+        let receipt = done.receipt.unwrap();
+        assert!(receipt.imported);
+        let accepted = if target == "source" {
+            &retained.snapshot.source_head
+        } else {
+            &merge
+        };
+        assert_eq!(
+            receipt.merge_oid.as_ref().unwrap_or(&receipt.target_head),
+            accepted
+        );
+        let local = ClientStateStore::open(&paths.state)
+            .unwrap()
+            .load_task(task)
+            .unwrap();
+        assert_eq!(local.status().head_oid(), Some(accepted));
+        assert_eq!(local.fetched_head(), Some(accepted));
+        assert_eq!(local.status().state(), TaskState::Closed);
         assert!(
-            steps.lines().all(|step| step == "repair"),
-            "{target}: {steps}"
-        );
-        let late = f.worker(&["--json", "task", "integrate", &task.to_string()]);
-        assert!(!late.status.success());
-        assert!(!host_task.join("workspace").exists());
-        assert_eq!(
-            std::fs::read_to_string(f.host.join("ssh-journal"))
+            HostIntegrationStore::new(&host)
+                .load(&original.policy.project_id, task)
                 .unwrap()
-                .matches("host task-prepare\n")
-                .count(),
-            1
+                .unwrap()
+                .receipt
+                .unwrap()
+                .imported
         );
     }
+    assert_eq!(
+        TaskStore::new(&host, &SystemProcessRunner)
+            .load_status(&original.policy.project_id, task)
+            .unwrap()
+            .state(),
+        TaskState::Closed
+    );
+    assert!(!host_task.join("workspace").exists());
+    let steps = std::fs::read_to_string(f.host.join("restore-steps")).unwrap();
+    assert!(
+        steps.lines().all(|step| step == "repair"),
+        "{target}: {steps}"
+    );
+    let late = f.worker(&["--json", "task", "integrate", &task.to_string()]);
+    assert!(!late.status.success());
+    assert!(!host_task.join("workspace").exists());
+    assert_eq!(
+        std::fs::read_to_string(f.host.join("ssh-journal"))
+            .unwrap()
+            .matches("host task-prepare\n")
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -919,91 +873,98 @@ fn native_union_uses_frozen_h_attributes_and_pinned_verification_before_receipt_
 }
 
 #[test]
-fn native_binary_h_attributes_resolve_in_the_same_session_and_verifier_index_tampering_blocks() {
-    for tamper in [false, true] {
-        let attributes = if tamper {
-            "payload.txt merge=union"
-        } else {
-            "payload.txt -merge"
-        };
-        let source =
-            format!("printf '{attributes}\\n' > .gitattributes\nprintf 'ours\\n' > payload.txt");
-        let auxiliary = if tamper {
-            "printf 'changed\\n' > payload.txt\n/usr/bin/git add payload.txt"
-        } else {
-            "printf 'resolved\\n' > payload.txt\n/usr/bin/git add payload.txt"
-        };
-        let (f, task) = configured_parked_source_fixture(
-            if tamper { "moved-target" } else { "never" },
-            |f| {
-                f.project
-                    .write(".gitattributes", b"payload.txt merge=union\n");
-                f.project.write("payload.txt", b"base\n");
-                f.project.commit_all("attribute base");
-                f.project.git(&["push", "origin", "HEAD:main"]);
-            },
-            &source,
-            auxiliary,
+fn native_binary_h_attributes_resolve_in_the_same_session() {
+    native_attribute_resolution_case(false);
+}
+
+#[test]
+fn native_verifier_index_tampering_blocks_before_push() {
+    native_attribute_resolution_case(true);
+}
+
+fn native_attribute_resolution_case(tamper: bool) {
+    let attributes = if tamper {
+        "payload.txt merge=union"
+    } else {
+        "payload.txt -merge"
+    };
+    let source =
+        format!("printf '{attributes}\\n' > .gitattributes\nprintf 'ours\\n' > payload.txt");
+    let auxiliary = if tamper {
+        "printf 'changed\\n' > payload.txt\n/usr/bin/git add payload.txt"
+    } else {
+        "printf 'resolved\\n' > payload.txt\n/usr/bin/git add payload.txt"
+    };
+    let (f, task) = configured_parked_source_fixture(
+        if tamper { "moved-target" } else { "never" },
+        |f| {
+            f.project
+                .write(".gitattributes", b"payload.txt merge=union\n");
+            f.project.write("payload.txt", b"base\n");
+            f.project.commit_all("attribute base");
+            f.project.git(&["push", "origin", "HEAD:main"]);
+        },
+        &source,
+        auxiliary,
+    );
+    f.project.write("payload.txt", b"theirs\n");
+    f.project.commit_all("outside target");
+    f.project.git(&["push", "origin", "HEAD:main"]);
+    let target = f.project.git(&["ls-remote", "origin", "refs/heads/main"]);
+    assert!(f.worker(&["controller", "drain", "--off"]).status.success());
+    if tamper {
+        let wait = f.worker(&[
+            "--json",
+            "task",
+            "wait",
+            "--task-id",
+            &task.to_string(),
+            "--timeout",
+            "60s",
+        ]);
+        assert!(
+            !wait.status.success(),
+            "{}",
+            String::from_utf8_lossy(&wait.stdout)
         );
-        f.project.write("payload.txt", b"theirs\n");
-        f.project.commit_all("outside target");
-        f.project.git(&["push", "origin", "HEAD:main"]);
-        let target = f.project.git(&["ls-remote", "origin", "refs/heads/main"]);
-        assert!(f.worker(&["controller", "drain", "--off"]).status.success());
-        if tamper {
-            let wait = f.worker(&[
-                "--json",
-                "task",
-                "wait",
-                "--task-id",
-                &task.to_string(),
-                "--timeout",
-                "60s",
-            ]);
-            assert!(
-                !wait.status.success(),
-                "{}",
-                String::from_utf8_lossy(&wait.stdout)
-            );
-            let owner = RootedIntegrationState::open(
-                &owner_paths(&f),
-                std::sync::Arc::new(ManualIntegrationRuntime::default()),
-            )
-            .unwrap();
-            let blocked = owner.load(task).unwrap().unwrap();
-            assert_eq!(blocked.snapshot.state, IntegrationStatus::Blocked);
-            assert_eq!(
-                blocked.snapshot.blocked_code,
-                Some(IntegrationCode::IntegrationVerifyTreeMismatch)
-            );
-            assert_eq!(
-                f.project.git(&["ls-remote", "origin", "refs/heads/main"]),
-                target
-            );
-        } else {
-            let done = wait_integrated(&f, task);
-            assert_eq!(done.snapshot.resolve_turns, 1);
-            assert_eq!(done.snapshot.verify_turns, 0);
-            let merge = done.receipt.as_ref().unwrap().merge_oid.as_ref().unwrap();
-            assert_eq!(
-                f.project
-                    .git(&["show", &format!("{merge}:payload.txt")])
-                    .stdout,
-                b"resolved\n"
-            );
-            assert!(done.receipt.as_ref().unwrap().imported);
-        }
-        let journal = std::fs::read_to_string(f.host.join("ssh-journal")).unwrap();
-        assert_eq!(journal.matches("host task-prepare\n").count(), 1);
-        assert_eq!(journal.matches("host task-integration-turn\n").count(), 1);
+        let owner = RootedIntegrationState::open(
+            &owner_paths(&f),
+            std::sync::Arc::new(ManualIntegrationRuntime::default()),
+        )
+        .unwrap();
+        let blocked = owner.load(task).unwrap().unwrap();
+        assert_eq!(blocked.snapshot.state, IntegrationStatus::Blocked);
         assert_eq!(
-            std::fs::read_to_string(f.host.join("placed-files"))
-                .unwrap()
-                .lines()
-                .count(),
-            1
+            blocked.snapshot.blocked_code,
+            Some(IntegrationCode::IntegrationVerifyTreeMismatch)
         );
+        assert_eq!(
+            f.project.git(&["ls-remote", "origin", "refs/heads/main"]),
+            target
+        );
+    } else {
+        let done = wait_integrated(&f, task);
+        assert_eq!(done.snapshot.resolve_turns, 1);
+        assert_eq!(done.snapshot.verify_turns, 0);
+        let merge = done.receipt.as_ref().unwrap().merge_oid.as_ref().unwrap();
+        assert_eq!(
+            f.project
+                .git(&["show", &format!("{merge}:payload.txt")])
+                .stdout,
+            b"resolved\n"
+        );
+        assert!(done.receipt.as_ref().unwrap().imported);
     }
+    let journal = std::fs::read_to_string(f.host.join("ssh-journal")).unwrap();
+    assert_eq!(journal.matches("host task-prepare\n").count(), 1);
+    assert_eq!(journal.matches("host task-integration-turn\n").count(), 1);
+    assert_eq!(
+        std::fs::read_to_string(f.host.join("placed-files"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
 }
 
 struct RunningDashboard(std::process::Child);
@@ -1015,6 +976,17 @@ impl Drop for RunningDashboard {
 }
 
 fn dashboard_request(address: &str, method: &str, path: &str, body: Option<Value>) -> Value {
+    let (status, response) = dashboard_request_result(address, method, path, body);
+    assert!(status.contains("200"), "{status} {response}");
+    response
+}
+
+fn dashboard_request_result(
+    address: &str,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> (String, Value) {
     use std::io::{BufRead, Read, Write};
     let body = body.map(|body| body.to_string()).unwrap_or_default();
     loop {
@@ -1047,12 +1019,7 @@ fn dashboard_request(address: &str, method: &str, path: &str, body: Option<Value
             std::thread::yield_now();
             continue;
         }
-        assert!(
-            status.contains("200"),
-            "{status} {}",
-            String::from_utf8_lossy(&response)
-        );
-        return serde_json::from_slice(&response).unwrap();
+        return (status, serde_json::from_slice(&response).unwrap());
     }
 }
 
@@ -1448,12 +1415,12 @@ fn a_brief_helper_rollback_parks_and_restores_the_same_open_source_cycle() {
     let before = state.load(task).unwrap().unwrap();
     let policy = state.load_policy(task).unwrap().unwrap();
     let ssh = std::fs::read_to_string(&f.ssh).unwrap();
-    assert!(ssh.contains("probe['features'].append('task.integration')"));
+    assert!(ssh.contains("probe.update(memory_pressure"));
     std::fs::write(
         &f.ssh,
         ssh.replace(
-            "probe['features'].append('task.integration')",
-            "pass # previous helper fixture",
+            "probe.update(memory_pressure",
+            "probe['features'] = [feature for feature in probe['features'] if feature != 'task.integration']\n    probe.update(memory_pressure",
         ),
     )
     .unwrap();
@@ -1495,6 +1462,7 @@ fn a_brief_helper_rollback_parks_and_restores_the_same_open_source_cycle() {
         journal_before.matches("host task-integration\n").count()
     );
     std::fs::write(&f.ssh, ssh).unwrap();
+    super::session_import_e2e::warm_executable(&f.ssh);
     let restored = wait_integrated(&f, task);
     assert_eq!(
         restored.snapshot.integration_id,
@@ -1574,13 +1542,14 @@ fn native_dag_uses_the_imported_parent_merge_for_its_configured_child() {
     let f = integration_fixture(true);
     let agent = f.host.join("bin/codex");
     std::fs::write(&agent, r#"#!/bin/sh
-case "$1" in --version) printf '0.160.0\n'; exit 0;; auth|login) printf '{"loggedIn":true}\n'; exit 0;; esac
+case "$1" in --fixture-warm) exit 0;; --version) printf '0.160.0\n'; exit 0;; auth|login) printf '{"loggedIn":true}\n'; exit 0;; esac
 printf '%s\n' "$@" >> "$HOME/dag-agent-argv"
 printf 'fixture task result\n' >> dag-result
 printf '%s\n' '{"type":"thread.started","thread_id":"00000000-0000-0000-0000-000000000031"}' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"status\":\"done\",\"summary\":\"dag work done\",\"questions\":[],\"files_changed\":[],\"checks\":[]}"}}'
 "#).unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    super::session_import_e2e::warm_executable(&agent);
     std::fs::write(
         f.project.root().join(".worker.toml"),
         "[task]\nintegrate = 'main'\n",
@@ -1684,6 +1653,7 @@ fn native_mismatched_from_parent_policy_refuses_before_capture_or_admission() {
 fn refuse_integration_transport(f: &super::session_import_e2e::Fixture) -> String {
     let original = std::fs::read_to_string(&f.ssh).unwrap();
     std::fs::write(&f.ssh, original.replace("os.execv('/bin/sh', ['/bin/sh', '-c', command])", "if command.endswith(' host task-integration'):\n    sys.stdin.buffer.read()\n    sys.exit(255)\nos.execv('/bin/sh', ['/bin/sh', '-c', command])")).unwrap();
+    super::session_import_e2e::warm_executable(&f.ssh);
     original
 }
 
@@ -1728,6 +1698,7 @@ fn native_offline_cancel_close_and_discard_remain_unconfirmed_until_revoke_proof
         );
     }
     std::fs::write(&f.ssh, original_ssh).unwrap();
+    super::session_import_e2e::warm_executable(&f.ssh);
     assert!(
         f.worker(&["--json", "task", "cancel", &task.to_string()])
             .status
@@ -1794,6 +1765,7 @@ fn native_interrupted_say_waits_for_revoke_then_queues_one_ordinary_turn() {
     assert_eq!(tasks.load_task(task).unwrap().status().turns().len(), 1);
     assert!(tasks.queue_snapshot().unwrap().entries().is_empty());
     std::fs::write(&f.ssh, original_ssh).unwrap();
+    super::session_import_e2e::warm_executable(&f.ssh);
     let queued = say();
     assert!(
         queued.status.success(),
@@ -1832,7 +1804,7 @@ impl Drop for ReleaseFixtureFifo {
 fn native_rpc_leader_and_direct_recovery_share_the_detached_git_driver() {
     use mac_worker::test_support::{
         client_state::ClientStateStore,
-        controller::{decode_frame, encode_json_frame, serve_rpc_with_integration_features},
+        controller::{ControllerFault, decode_frame, encode_json_frame, serve_rpc_with_runtime},
         core::config::Config,
         core::error::WorkerError,
         host::process::{ProcessRequest, ProcessResult, ProcessRunner, SystemProcessRunner},
@@ -1903,7 +1875,7 @@ os.execv('/bin/sh', ['/bin/sh', '-c', command])"#;
         let rpc=scope.spawn(|| {
             let wire=serde_json::json!({"protocol_version":7,"request_id":uuid::Uuid::new_v4().simple().to_string(),"command":"task.wait.poll","body":{"task_id":task}});
             let input=encode_json_frame(&wire).unwrap(); let mut out=vec![];
-            serve_rpc_with_integration_features(&paths,&config,&runner,&mut std::io::Cursor::new(input),&mut out,&[CONTROLLER_FEATURE_INTEGRATION.into()]).unwrap();
+            serve_rpc_with_runtime(&paths,&config,&runner,&mut std::io::Cursor::new(input),&mut out,ControllerFault::None).unwrap();
             let reply:Value=serde_json::from_slice(decode_frame(&out).unwrap()).unwrap();
             assert_eq!(reply["result"]["quiescent"],false);
         });
@@ -1979,6 +1951,7 @@ os.execv('/bin/sh', ['/bin/sh', '-c', command])"#,
         &interception,
     );
     std::fs::write(&f.ssh, ssh).unwrap();
+    super::session_import_e2e::warm_executable(&f.ssh);
     let task = submitted_task(&f.worker(&[
         "--json",
         "task",
@@ -2695,4 +2668,136 @@ fn direct_integrating_batch_publishes_policies_and_requirements_before_drained_l
     }
     assert_eq!(configured, 1);
     assert!(!f.host.join("argv").exists());
+}
+
+#[test]
+fn review_native_dashboard_replay_returns_the_durable_request_result() {
+    use mac_worker::test_support::client_state::ClientStateStore;
+    use std::sync::Arc;
+    use std::{
+        io::BufRead,
+        process::{Command, Stdio},
+        sync::mpsc,
+        thread,
+    };
+    let (f, task) = parked_source_fixture();
+    let paths = owner_paths(&f);
+    let state = RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+        .unwrap();
+    let mut record = state.load(task).unwrap().unwrap();
+    let previous = record.snapshot.revision;
+    record.snapshot.revision = previous.next().unwrap();
+    record.snapshot.state = IntegrationStatus::Blocked;
+    record.snapshot.pause_reason = None;
+    record.snapshot.resume_state = None;
+    record.pause = None;
+    record.snapshot.blocked_code = Some(IntegrationCode::IntegrationChecksFailed);
+    state.replace(task, previous, &record).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_worker"));
+    command
+        .env_clear()
+        .env("HOME", &f.laptop)
+        .env("PATH", "/usr/bin:/bin")
+        .env("MAC_WORKER_TEST_SSH", &f.ssh)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .current_dir(f.project.root())
+        .args([
+            "--config",
+            f.config.to_str().unwrap(),
+            "dashboard",
+            "--no-open",
+            "--no-facts-refresh",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    let mut process = RunningDashboard(command.spawn().unwrap());
+    let stdout = process.0.stdout.take().unwrap();
+    let (send, receive) = mpsc::channel();
+    thread::spawn(move || {
+        let mut url = String::new();
+        std::io::BufReader::new(stdout).read_line(&mut url).unwrap();
+        let _ = send.send(url);
+    });
+    let url = receive
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+        .unwrap();
+    let address = url
+        .trim()
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    let ordinary = ClientStateStore::open(&paths.state)
+        .unwrap()
+        .load_task(task)
+        .unwrap();
+    let request = json!({
+        "expected": {"expected_task_id":task,"expected_turn_id":ordinary.status().turns().last().unwrap().turn_id(),
+            "expected_turn_count":ordinary.status().turns().len(),"expected_head_oid":ordinary.status().head_oid(),
+            "expected_updated_at_millis":ordinary.status().updated_at_millis(),"expected_state":"open"},
+        "expected_integration_id":record.snapshot.integration_id,
+        "integration":{"task_id":task,"expected":record.snapshot.revision,"request_id":uuid::Uuid::new_v4().simple().to_string()}
+    });
+    let route = format!("/api/v1/tasks/{task}/integrate");
+    let first = dashboard_request(address, "POST", &route, Some(request.clone()));
+    let after = state.load(task).unwrap().unwrap();
+    assert_eq!(after.snapshot.epoch, record.snapshot.epoch + 1);
+    let second = dashboard_request(address, "POST", &route, Some(request.clone()));
+    assert_eq!(
+        second["integration"]["integration_id"],
+        first["integration"]["integration_id"]
+    );
+    assert_eq!(
+        state.load(task).unwrap().unwrap().snapshot.epoch,
+        after.snapshot.epoch
+    );
+    assert_eq!(
+        second, first,
+        "exact replay returns the saved complete response"
+    );
+    assert_eq!(state.load(task).unwrap().unwrap(), after);
+    let mut changed = request.clone();
+    changed["expected"]["expected_updated_at_millis"] =
+        json!(ordinary.status().updated_at_millis() + 1);
+    let (status, error) = dashboard_request_result(address, "POST", &route, Some(changed));
+    assert!(status.contains("502"), "{status}: {error}");
+    assert_eq!(error["error"]["code"], "INTEGRATION_STATE_INVALID");
+    assert_eq!(state.load(task).unwrap().unwrap(), after);
+    let mut fresh = request.clone();
+    fresh["integration"]["request_id"] = json!(uuid::Uuid::new_v4().simple().to_string());
+    let (status, error) = dashboard_request_result(address, "POST", &route, Some(fresh));
+    assert!(status.contains("409"), "{status}: {error}");
+    assert_eq!(error["error"]["code"], "TASK_REVISION_CONFLICT");
+    // Reopen a normal dashboard after the owner becomes Closed. The old request
+    // remains replayable; first requests keep their Open/revision fences.
+    drop(process);
+    let client = ClientStateStore::open(&paths.state).unwrap();
+    let before = client.load_task(task).unwrap();
+    let mut wire = serde_json::to_value(before.status()).unwrap();
+    wire["state"] = json!("closed");
+    let closed = before
+        .clone()
+        .with_status(serde_json::from_value(wire).unwrap())
+        .unwrap();
+    assert!(client.update_task_if_current(&before, closed).unwrap());
+    let mut process = RunningDashboard(command.spawn().unwrap());
+    let stdout = process.0.stdout.take().unwrap();
+    let (send, receive) = mpsc::channel();
+    thread::spawn(move || {
+        let mut url = String::new();
+        std::io::BufReader::new(stdout).read_line(&mut url).unwrap();
+        let _ = send.send(url);
+    });
+    let url = receive
+        .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+        .unwrap();
+    let address = url
+        .trim()
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    assert_eq!(
+        dashboard_request(address, "POST", &route, Some(request)),
+        first
+    );
+    assert_eq!(state.load(task).unwrap().unwrap(), after);
 }

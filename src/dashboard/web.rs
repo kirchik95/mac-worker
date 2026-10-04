@@ -714,10 +714,22 @@ where
             );
         }
     };
+    #[derive(serde::Serialize)]
+    #[serde(untagged)]
+    enum MutationResponse {
+        Detail(Box<crate::task_view::TaskDetailProjection>),
+        Integration(serde_json::Value),
+    }
     match tokio::task::spawn_blocking(move || match mutation {
-        TaskAction::Reply(mutation) => source.reply(task_id, &mutation),
-        TaskAction::Accept(mutation) => source.accept(task_id, &mutation),
-        TaskAction::Integrate(mutation) => source.integrate(task_id, &mutation),
+        TaskAction::Reply(mutation) => source
+            .reply(task_id, &mutation)
+            .map(|detail| MutationResponse::Detail(Box::new(detail))),
+        TaskAction::Accept(mutation) => source
+            .accept(task_id, &mutation)
+            .map(|detail| MutationResponse::Detail(Box::new(detail))),
+        TaskAction::Integrate(mutation) => source
+            .integrate_response(task_id, &mutation)
+            .map(MutationResponse::Integration),
     })
     .await
     {

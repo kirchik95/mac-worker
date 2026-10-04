@@ -32,7 +32,11 @@ pub(crate) struct OwnerIntegration<'a> {
     state: super::store::RootedIntegrationState,
     runtime: Arc<OwnerRuntime>,
     ports: OwnerPorts<'a>,
+    source: OwnerSource<'a>,
 }
+
+pub(crate) type ReplayRedrive<'a> =
+    dyn Fn(&IntegrationRedriveRequest) -> Result<IntegrationSnapshot, WorkerError> + 'a;
 
 pub(crate) struct OwnerRuntime {
     paths: PathLayout,
@@ -165,6 +169,53 @@ impl IntegrationHost for OwnerPorts<'_> {
         response
     }
 }
+/// Admission witnesses only the current owner record, queue and prepared sidecars.
+/// Remote observation stays at the normal drive/finalizer boundary.
+struct OwnerSource<'a> {
+    paths: &'a PathLayout,
+    client: &'a ClientStateStore,
+}
+impl IntegrationObserver for OwnerSource<'_> {
+    fn facts(&self, task: TaskId) -> Result<IntegrationTaskFacts, WorkerError> {
+        owner_facts(self.paths, self.client, self.client.load_task(task)?)
+    }
+}
+fn owner_facts(
+    paths: &PathLayout,
+    client: &ClientStateStore,
+    ordinary: crate::task::LocalTaskRecord,
+) -> Result<IntegrationTaskFacts, WorkerError> {
+    let task = ordinary.meta().task_id();
+    let last = ordinary.status().turns().last().map(|turn| turn.turn_id());
+    let auxiliary_purpose = last
+        .map(|turn| super::store::RootedIntegrationState::read_auxiliary(paths, task, turn))
+        .transpose()?
+        .flatten()
+        .map(|p| p.purpose);
+    let queue = client.queue_entry_for_task_turn(task)?;
+    let cycle_base = last
+        .map(|turn| read_source_base(paths, task, turn))
+        .transpose()?
+        .flatten()
+        .unwrap_or_else(|| ordinary.meta().base_oid().clone());
+    Ok(IntegrationTaskFacts {
+        cycle_base,
+        result_imported: ordinary.fetched_head().is_some()
+            && ordinary.fetched_head() == ordinary.status().head_oid(),
+        session_import_complete: ordinary.meta().session_import().is_none()
+            || (ordinary.status().session_present() && !ordinary.status().turns().is_empty()),
+        continuation_pending: ordinary.auto_continue_intent().is_some(),
+        runner_present: queue.is_some() || ordinary.runner().is_some(),
+        stop_requested: queue
+            .as_ref()
+            .is_some_and(|entry| entry.is_cancel_requested()),
+        close_pending: ordinary.close_intent().is_some(),
+        submission_pending: ordinary.submission_intent_turn_id().is_some()
+            || ordinary.submission_rollback_turn_id().is_some(),
+        auxiliary_purpose,
+        ordinary,
+    })
+}
 impl IntegrationObserver for OwnerPorts<'_> {
     fn facts(&self, task: TaskId) -> Result<IntegrationTaskFacts, WorkerError> {
         let mut ordinary = self.client.load_task(task)?;
@@ -196,37 +247,7 @@ impl IntegrationObserver for OwnerPorts<'_> {
                 }
             }
         }
-        let last = ordinary.status().turns().last().map(|turn| turn.turn_id());
-        let auxiliary_purpose = last
-            .map(|turn| {
-                super::store::RootedIntegrationState::read_auxiliary(self.paths, task, turn)
-            })
-            .transpose()?
-            .flatten()
-            .map(|p| p.purpose);
-        let queue = self.client.queue_entry_for_task_turn(task)?;
-        let cycle_base = last
-            .map(|turn| read_source_base(self.paths, task, turn))
-            .transpose()?
-            .flatten()
-            .unwrap_or_else(|| ordinary.meta().base_oid().clone());
-        Ok(IntegrationTaskFacts {
-            cycle_base,
-            result_imported: ordinary.fetched_head().is_some()
-                && ordinary.fetched_head() == ordinary.status().head_oid(),
-            session_import_complete: ordinary.meta().session_import().is_none()
-                || (ordinary.status().session_present() && !ordinary.status().turns().is_empty()),
-            continuation_pending: ordinary.auto_continue_intent().is_some(),
-            runner_present: queue.is_some() || ordinary.runner().is_some(),
-            stop_requested: queue
-                .as_ref()
-                .is_some_and(|entry| entry.is_cancel_requested()),
-            close_pending: ordinary.close_intent().is_some(),
-            submission_pending: ordinary.submission_intent_turn_id().is_some()
-                || ordinary.submission_rollback_turn_id().is_some(),
-            auxiliary_purpose,
-            ordinary,
-        })
+        owner_facts(self.paths, self.client, ordinary)
     }
 }
 impl IntegrationTurns for OwnerPorts<'_> {
@@ -400,6 +421,7 @@ impl<'a> OwnerIntegration<'a> {
         Ok(Self {
             state,
             runtime: runtime.clone(),
+            source: OwnerSource { paths, client },
             ports: OwnerPorts {
                 runner,
                 config,
@@ -418,6 +440,7 @@ impl<'a> OwnerIntegration<'a> {
             self.runtime.as_ref(),
             &self.ports,
         )
+        .with_source_observer(&self.source)
         .with_owner_gate(self.ports.paths)
     }
     pub(crate) fn stage(&self, task: TaskId) -> Result<(), WorkerError> {
@@ -476,19 +499,126 @@ impl<'a> OwnerIntegration<'a> {
         }
         Ok(())
     }
+    /// Save the complete dashboard body before the native re-drive binding can
+    /// advance an epoch. A completed replay performs no checks or scheduling.
+    /// Validation returns whether execution needs a native binding; execution
+    /// uses the supplied port to keep that pair under the same replay fences.
+    pub(crate) fn dashboard_redrive(
+        &self,
+        request: &IntegrationRedriveRequest,
+        body: &serde_json::Value,
+        validate: &mut dyn FnMut() -> Result<bool, WorkerError>,
+        execute: &mut dyn FnMut(&ReplayRedrive<'_>) -> Result<serde_json::Value, WorkerError>,
+    ) -> Result<serde_json::Value, WorkerError> {
+        request.validate()?;
+        let root = task_root(self.ports.paths, request.task_id)?;
+        let _replay = replay_locks(&root)?;
+        let name = format!("dashboard-redrive-{}.json", request.request_id);
+        let old = match root.read_private_regular(&name, MAX_INTEGRATION_RPC_BYTES as u64) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let (mut binding, previous, fresh, native_required) = if let Some(bytes) = old {
+            let binding: DashboardRedriveBinding =
+                serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+            if binding.request != *request
+                || binding.body != *body
+                || serde_json::to_vec(&binding).map_err(|_| invalid())? != bytes
+            {
+                return Err(invalid());
+            }
+            if let Some(result) = &binding.result {
+                return Ok(result.clone());
+            }
+            (binding, bytes, false, true)
+        } else {
+            let native_required = validate()?;
+            let binding = DashboardRedriveBinding {
+                request: request.clone(),
+                body: body.clone(),
+                result: None,
+                completed_at_millis: None,
+            };
+            let bytes = serde_json::to_vec(&binding).map_err(|_| invalid())?;
+            if bytes.len() > MAX_INTEGRATION_RPC_BYTES {
+                return Err(invalid());
+            }
+            (binding, bytes, true, native_required)
+        };
+        let native_name = format!("redrive-{}.json", request.request_id);
+        let native_bytes = if native_required && read(&root, &native_name)?.is_none() {
+            let record = self
+                .state
+                .load(request.task_id)?
+                .ok_or_else(integration_unavailable)?;
+            let result = (record.snapshot.state == IntegrationStatus::Integrated)
+                .then_some(record.snapshot.clone());
+            Some(
+                serde_json::to_vec(&RedriveBinding {
+                    request: request.clone(),
+                    intent: record.snapshot.integration_id,
+                    epoch: record.snapshot.epoch,
+                    completed_at_millis: result.as_ref().map(|_| self.runtime.now_millis()),
+                    result,
+                })
+                .map_err(|_| invalid())?,
+            )
+        } else {
+            None
+        };
+        let mut publications = vec![(name.as_str(), previous.len())];
+        if let Some(bytes) = &native_bytes {
+            publications.push((native_name.as_str(), bytes.len()));
+        }
+        replay_capacity(&root, request, &publications, self.runtime.now_millis())?;
+        if fresh {
+            root.write_private_atomic_no_replace(&name, &previous)?;
+        }
+        // An interrupted pending response resumes/replays the underlying owner
+        // request, whose saved epoch/result prevents another epoch advance.
+        let redrive = |nested: &IntegrationRedriveRequest| {
+            if nested != request {
+                return Err(invalid());
+            }
+            self.redrive_under_quota(nested, &root)
+        };
+        let result = execute(&redrive)?;
+        binding.result = Some(result.clone());
+        binding.completed_at_millis = Some(self.runtime.now_millis());
+        let bytes = serde_json::to_vec(&binding).map_err(|_| invalid())?;
+        if bytes.len() > MAX_INTEGRATION_RPC_BYTES {
+            return Err(invalid());
+        }
+        replay_capacity(
+            &root,
+            request,
+            &[(name.as_str(), bytes.len())],
+            self.runtime.now_millis(),
+        )?;
+        root.replace_private_regular_exact(&name, &previous, &bytes)?;
+        Ok(result)
+    }
+
     pub(crate) fn redrive(
         &self,
         request: &IntegrationRedriveRequest,
     ) -> Result<IntegrationSnapshot, WorkerError> {
-        let _hints = self.ports.client.event_scope();
         request.validate()?;
+        let root = task_root(self.ports.paths, request.task_id)?;
+        let _replay = replay_locks(&root)?;
+        self.redrive_under_quota(request, &root)
+    }
+    fn redrive_under_quota(
+        &self,
+        request: &IntegrationRedriveRequest,
+        root: &RootedDir,
+    ) -> Result<IntegrationSnapshot, WorkerError> {
+        let _hints = self.ports.client.event_scope();
         let task = request.task_id;
-        let root = task_root(self.ports.paths, task)?;
-        let _request = private_lock(&root, "redrive.lock", true)?
-            .ok_or_else(|| WorkerError::task("TASK_BUSY", "integration redrive is in progress"))?;
         let name = format!("redrive-{}.json", request.request_id);
         let mut record = self.state.load(task)?.ok_or_else(integration_unavailable)?;
-        let mut binding: RedriveBinding = match read(&root, &name)? {
+        let mut binding: RedriveBinding = match read(root, &name)? {
             Some(bytes) => {
                 let saved: RedriveBinding =
                     serde_json::from_slice(&bytes).map_err(|_| invalid())?;
@@ -547,14 +677,17 @@ impl<'a> OwnerIntegration<'a> {
                     request: request.clone(),
                     intent: record.snapshot.integration_id,
                     epoch: record.snapshot.epoch,
+                    completed_at_millis: result.as_ref().map(|_| self.runtime.now_millis()),
                     result,
                 };
-                write(
-                    &root,
-                    &name,
-                    &serde_json::to_vec(&saved).map_err(|_| invalid())?,
-                    true,
+                let bytes = serde_json::to_vec(&saved).map_err(|_| invalid())?;
+                replay_capacity(
+                    root,
+                    request,
+                    &[(name.as_str(), bytes.len())],
+                    self.runtime.now_millis(),
                 )?;
+                write(root, &name, &bytes, true)?;
                 saved
             }
         };
@@ -594,13 +727,15 @@ impl<'a> OwnerIntegration<'a> {
             ));
         };
         binding.result = Some(result.clone());
-        write(
-            &root,
-            &name,
-            &serde_json::to_vec(&binding).map_err(|_| invalid())?,
-            false,
+        binding.completed_at_millis = Some(self.runtime.now_millis());
+        let bytes = serde_json::to_vec(&binding).map_err(|_| invalid())?;
+        replay_capacity(
+            root,
+            request,
+            &[(name.as_str(), bytes.len())],
+            self.runtime.now_millis(),
         )?;
-        drop(_request);
+        write(root, &name, &bytes, false)?;
         self.schedule(task)?;
         Ok(result)
     }
@@ -610,12 +745,7 @@ impl<'a> OwnerIntegration<'a> {
             return Ok(());
         };
         let closed = self.ports.client.load_task(task)?.status().state() == TaskState::Closed;
-        let closed_observation = closed
-            && record.snapshot.state == IntegrationStatus::Blocked
-            && !record
-                .phase_retries
-                .iter()
-                .any(|retry| retry.phase == IntegrationPhase::Repair);
+        let closed_observation = closed && super::coordinator::closed_observation_pending(&record);
         if matches!(
             record.snapshot.state,
             IntegrationStatus::Integrated | IntegrationStatus::Blocked | IntegrationStatus::Revoked
@@ -739,11 +869,180 @@ struct DriverBinding {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+struct DashboardRedriveBinding {
+    request: IntegrationRedriveRequest,
+    body: serde_json::Value,
+    result: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completed_at_millis: Option<u64>,
+}
+
+const MAX_REPLAY_BINDINGS: usize = 32;
+const MAX_REPLAY_BYTES: usize = 256 * 1024;
+const REPLAY_LIFETIME_MILLIS: u64 = 24 * 60 * 60 * 1000;
+
+fn replay_busy() -> WorkerError {
+    WorkerError::task("TASK_BUSY", "integration redrive is in progress")
+}
+
+fn replay_locks(root: &RootedDir) -> Result<[File; 3], WorkerError> {
+    // Every writer uses quota -> dashboard -> native, with no lock waits.
+    Ok([
+        private_lock(root, "replay-quota.lock", true)?.ok_or_else(replay_busy)?,
+        private_lock(root, "dashboard-redrive.lock", true)?.ok_or_else(replay_busy)?,
+        private_lock(root, "redrive.lock", true)?.ok_or_else(replay_busy)?,
+    ])
+}
+
+/// Called under quota and both request locks. Planned rows substitute their current size;
+/// paired admission includes both rows before publishing either one.
+fn replay_capacity(
+    root: &RootedDir,
+    request: &IntegrationRedriveRequest,
+    publications: &[(&str, usize)],
+    now: u64,
+) -> Result<(), WorkerError> {
+    let mut count = publications.len();
+    let mut total = publications
+        .iter()
+        .fold(0usize, |total, (_, bytes)| total.saturating_add(*bytes));
+    if total > MAX_REPLAY_BYTES {
+        return Err(replay_busy());
+    }
+    let mut protected = std::collections::HashSet::from([request.request_id.clone()]);
+    let mut completed = Vec::new();
+    for raw in root.list_names()? {
+        if !redrive_binding_name(&raw) {
+            continue;
+        }
+        let name = std::str::from_utf8(&raw).map_err(|_| invalid())?;
+        if publications
+            .iter()
+            .any(|(replacement, _)| *replacement == name)
+        {
+            continue;
+        }
+        let identity = root.private_entry_identity(name)?;
+        let (saved_request, saved, completed_at) = if dashboard_replay_name(&raw).is_some() {
+            let saved = root.read_private_regular(name, MAX_INTEGRATION_RPC_BYTES as u64)?;
+            let binding: DashboardRedriveBinding =
+                serde_json::from_slice(&saved).map_err(|_| invalid())?;
+            if name != format!("dashboard-redrive-{}.json", binding.request.request_id)
+                || serde_json::to_vec(&binding).map_err(|_| invalid())? != saved
+            {
+                return Err(invalid());
+            }
+            let completed_at = binding
+                .result
+                .as_ref()
+                .map(|_| binding.completed_at_millis.unwrap_or(0));
+            (binding.request, saved, completed_at)
+        } else {
+            let saved = root.read_private_regular(name, MAX_PRIVATE_RECORD_BYTES as u64)?;
+            let binding: RedriveBinding = serde_json::from_slice(&saved).map_err(|_| invalid())?;
+            if name != format!("redrive-{}.json", binding.request.request_id)
+                || serde_json::to_vec(&binding).map_err(|_| invalid())? != saved
+            {
+                return Err(invalid());
+            }
+            let completed_at = binding
+                .result
+                .as_ref()
+                .map(|_| binding.completed_at_millis.unwrap_or(0));
+            (binding.request, saved, completed_at)
+        };
+        saved_request.validate()?;
+        if saved_request.task_id != request.task_id
+            || root.private_entry_identity(name)? != identity
+        {
+            return Err(invalid());
+        }
+        count = count.saturating_add(1);
+        total = total.saturating_add(saved.len());
+        if let Some(completed_at) = completed_at {
+            completed.push((
+                completed_at,
+                name.to_owned(),
+                identity,
+                saved.len(),
+                saved_request.request_id,
+            ));
+        } else {
+            // A completed native receipt can still be needed by its pending
+            // dashboard partner after a crash, and vice versa.
+            protected.insert(saved_request.request_id);
+        }
+    }
+    completed.retain(|row| !protected.contains(&row.4));
+    completed.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    let mut evict = Vec::new();
+    for row in completed {
+        let expired = now.saturating_sub(row.0) > REPLAY_LIFETIME_MILLIS;
+        if expired || count > MAX_REPLAY_BINDINGS || total > MAX_REPLAY_BYTES {
+            count -= 1;
+            total -= row.3;
+            evict.push(row);
+        }
+    }
+    if count > MAX_REPLAY_BINDINGS || total > MAX_REPLAY_BYTES {
+        return Err(replay_busy());
+    }
+    for (_, name, identity, _, _) in evict {
+        root.channel_unlink_exact(&name, identity)?;
+    }
+    Ok(())
+}
+
+fn dashboard_replay_name(raw: &[u8]) -> Option<&str> {
+    let name = std::str::from_utf8(raw).ok()?;
+    (name.starts_with("dashboard-redrive-") && name.ends_with(".json")).then_some(name)
+}
+
+fn redrive_binding_name(raw: &[u8]) -> bool {
+    dashboard_replay_name(raw).is_some()
+        || std::str::from_utf8(raw)
+            .is_ok_and(|name| name.starts_with("redrive-") && name.ends_with(".json"))
+}
+
+/// The caller holds StateLock. Nonblocking request locks refuse a live writer;
+/// every binding is gone before the caller can delete the owner record.
+pub(crate) fn remove_redrive_bindings(
+    state: &std::path::Path,
+    task: TaskId,
+) -> Result<(), WorkerError> {
+    let reader = super::store::ExistingIntegrationReader::open_at(state)?;
+    if !reader.present() {
+        return Ok(());
+    }
+    let root = match RootedDir::open_anchored_absolute(state)?
+        .open_child_directory(&relative(&format!("integrations/tasks/{task}"))?, false)
+    {
+        Ok(root) => root,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let _dashboard =
+        private_lock(&root, "dashboard-redrive.lock", true)?.ok_or_else(replay_busy)?;
+    let _native = private_lock(&root, "redrive.lock", true)?.ok_or_else(replay_busy)?;
+    root.retry_pending_owned_regulars_matching(|name, _| redrive_binding_name(name))?;
+    for raw in root.list_names()? {
+        if redrive_binding_name(&raw) {
+            let name = std::str::from_utf8(&raw).map_err(|_| invalid())?;
+            root.remove_owned_regular(name)?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RedriveBinding {
     request: IntegrationRedriveRequest,
     intent: IntegrationId,
     epoch: u32,
     result: Option<IntegrationSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completed_at_millis: Option<u64>,
 }
 fn invalid() -> WorkerError {
     IntegrationCode::IntegrationStateInvalid.error()
@@ -992,20 +1291,39 @@ pub(crate) fn recover_selected(
     executor: &dyn RunnerExecutor,
     tasks: &[TaskId],
 ) -> Result<(), WorkerError> {
-    let configured = tasks
-        .iter()
-        .map(|task| {
-            super::store::RootedIntegrationState::read_task(paths, *task)
-                .map(|(policy, _)| (*task, policy.is_some()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if !configured.iter().any(|(_, configured)| *configured) {
+    let reader = match super::store::ExistingIntegrationReader::open_at(&paths.state) {
+        Ok(reader) => reader,
+        // Optional state cannot abort ordinary recovery or erase evidence.
+        Err(_) => return Ok(()),
+    };
+    if !reader.present() {
         return Ok(());
     }
-    let owner = OwnerIntegration::new(runner, config, paths, client, executor)?;
-    for (task, configured) in configured {
-        if configured {
-            owner.stage(task)?;
+    let recovery = reader.recovery();
+    let now = client.admission_time(crate::controller::leader::now_millis)?;
+    let mut owner = None;
+    for task in tasks {
+        if !recovery.ready(*task, now) {
+            continue;
+        }
+        let result = (|| {
+            if reader.read_task(*task)?.0.is_some() {
+                if owner.is_none() {
+                    owner = Some(OwnerIntegration::new(
+                        runner, config, paths, client, executor,
+                    )?);
+                }
+                owner.as_ref().ok_or_else(invalid)?.stage(*task)?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                let _ = recovery.succeeded(*task);
+            }
+            Err(error) => {
+                let _ = recovery.failed(*task, now, &error);
+            }
         }
     }
     Ok(())
@@ -1262,6 +1580,7 @@ pub(crate) mod native_launch_tests {
             intent: record.snapshot.integration_id,
             epoch: 0,
             result: None,
+            completed_at_millis: None,
         };
         let task_root = task_root(&paths, record.task_id).unwrap();
         write(

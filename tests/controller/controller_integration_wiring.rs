@@ -265,7 +265,7 @@ fn native_notifier_repairs_dropped_hints_confirms_revisions_and_deduplicates_acr
 fn capable_companion_and_event_rpc_read_saved_state_without_request_rows_or_processes() {
     use mac_worker::test_support::{
         client_state::ClientStateStore,
-        controller::{decode_frame, encode_json_frame, serve_rpc_with_integration_features},
+        controller::{ControllerFault, decode_frame, encode_json_frame, serve_rpc_with_runtime},
     };
     let temp = tempfile::tempdir().unwrap();
     let paths = isolated_paths(&temp.path().canonicalize().unwrap());
@@ -296,13 +296,13 @@ fn capable_companion_and_event_rpc_read_saved_state_without_request_rows_or_proc
         let payload = json!({"protocol_version":7,"request_id":"00000000000000000000000000000043",
             "command":"task.list", "body":body});
         let mut out = Vec::new();
-        serve_rpc_with_integration_features(
+        serve_rpc_with_runtime(
             &paths,
             &config,
             &NoProcesses,
             &mut std::io::Cursor::new(encode_json_frame(&payload).unwrap()),
             &mut out,
-            &[CONTROLLER_FEATURE_INTEGRATION.into()],
+            ControllerFault::None,
         )
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(decode_frame(&out).unwrap()).unwrap();
@@ -327,7 +327,7 @@ fn capable_companion_and_event_rpc_read_saved_state_without_request_rows_or_proc
 fn capable_rpc_redrive_uses_the_native_imported_receipt_idempotently() {
     use mac_worker::test_support::{
         client_state::ClientStateStore,
-        controller::{decode_frame, encode_json_frame, serve_rpc_with_integration_features},
+        controller::{ControllerFault, decode_frame, encode_json_frame, serve_rpc_with_runtime},
     };
     let temp = tempfile::tempdir().unwrap();
     let paths = isolated_paths(&temp.path().canonicalize().unwrap());
@@ -367,13 +367,13 @@ fn capable_rpc_redrive_uses_the_native_imported_receipt_idempotently() {
     let request = json!({"protocol_version":7,"request_id":request_id,"command":"task.integrate",
         "body":{"task_id":record.task_id,"expected":record.snapshot.revision,"request_id":request_id}});
     let mut output = vec![];
-    serve_rpc_with_integration_features(
+    serve_rpc_with_runtime(
         &paths,
         &config,
         &NoProcesses,
         &mut std::io::Cursor::new(encode_json_frame(&request).unwrap()),
         &mut output,
-        &[CONTROLLER_FEATURE_INTEGRATION.into()],
+        ControllerFault::None,
     )
     .unwrap();
     let reply: serde_json::Value = serde_json::from_slice(decode_frame(&output).unwrap()).unwrap();
@@ -456,6 +456,98 @@ fn fixture_config(paths: &PathLayout) -> mac_worker::test_support::core::config:
     )
     .unwrap();
     mac_worker::test_support::core::config::Config::load(&paths.config).unwrap()
+}
+
+#[test]
+fn advertised_features_keep_disabled_submit_status_and_result_compatible_with_old_peers() {
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        controller::{
+            ControllerFault, ControllerStore, TaskSubmitHandler, decode_frame, encode_json_frame,
+            serve_rpc_with_integration_features, serve_rpc_with_runtime,
+        },
+    };
+    // Catches accidentally requiring integration on an ordinary request or
+    // adding integration fields to its saved submit or read replies.
+    let temp = tempfile::tempdir().unwrap();
+    let paths = isolated_paths(&temp.path().canonicalize().unwrap());
+    let config = fixture_config(&paths);
+    let tasks = ClientStateStore::open(&paths.state).unwrap();
+    let ordinary = sample_ordinary(fixture_task(), fixture_source());
+    tasks.create_task(ordinary.clone()).unwrap();
+    let record_path = paths.state.join(format!("tasks/{}.json", fixture_task()));
+    let original = std::fs::read(&record_path).unwrap();
+    let mut body = wrapped_request(&"b".repeat(40), &"d".repeat(40)).body()["submit"].clone();
+    body.as_object_mut().unwrap().remove("session_import");
+    assert_eq!(body["requires"], json!([]));
+    let request = parse_request(
+        &serde_json::to_vec(&json!({
+            "protocol_version": 7, "request_id": "00000000000000000000000000000044",
+            "command": "task.submit", "body": body,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let handler = TaskSubmitHandler::new(&NoProcesses, &config, &paths, &tasks);
+    let old = TaskSubmitHandler::new(&NoProcesses, &config, &paths, &tasks)
+        .with_integration_features(vec![]);
+    let store = ControllerStore::open(&paths.controller_state_root()).unwrap();
+    let native_ack = store
+        .handle_with(&request, &handler, ControllerFault::StopAfterPublish)
+        .unwrap();
+    let old_store = ControllerStore::open(&paths.controller_state_root().join("old-peer")).unwrap();
+    let old_ack = old_store
+        .handle_with(&request, &old, ControllerFault::StopAfterPublish)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&native_ack).unwrap(),
+        serde_json::to_vec(&old_ack).unwrap()
+    );
+    let saved = store.load(request.request_id()).unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_vec(saved.body()).unwrap(),
+        serde_json::to_vec(&body).unwrap()
+    );
+    assert!(saved.prepared().is_null());
+    for command in ["task.status", "task.result"] {
+        let payload = json!({"protocol_version": 7,
+            "request_id": "00000000000000000000000000000045",
+            "command": command, "body": {"task_id": fixture_task()}});
+        let frame = encode_json_frame(&payload).unwrap();
+        let mut native = Vec::new();
+        serve_rpc_with_runtime(
+            &paths,
+            &config,
+            &NoProcesses,
+            &mut std::io::Cursor::new(&frame),
+            &mut native,
+            ControllerFault::None,
+        )
+        .unwrap();
+        let mut old = Vec::new();
+        serve_rpc_with_integration_features(
+            &paths,
+            &config,
+            &NoProcesses,
+            &mut std::io::Cursor::new(&frame),
+            &mut old,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(native, old, "{command}");
+        let reply: serde_json::Value =
+            serde_json::from_slice(decode_frame(&native).unwrap()).unwrap();
+        assert_eq!(
+            reply["result"]["status"],
+            json!(ordinary.status()),
+            "{command}"
+        );
+        assert!(reply["result"].get("integration").is_none(), "{command}");
+        assert!(reply["result"].get("workflow_state").is_none(), "{command}");
+    }
+    assert_eq!(std::fs::read(record_path).unwrap(), original);
+    assert!(!paths.state.join("integrations").exists());
+    assert!(tasks.queue_snapshot().unwrap().entries().is_empty());
 }
 
 #[test]
@@ -757,8 +849,7 @@ fn controller_redrive_freezes_the_request_without_running_an_owner_phase() {
     state
         .replace(fixture_task(), IntegrationRevision(0), &integration)
         .unwrap();
-    let handler = TaskSubmitHandler::new(&NoProcesses, &config, &paths, &tasks)
-        .with_integration_features(vec![CONTROLLER_FEATURE_INTEGRATION.into()]);
+    let handler = TaskSubmitHandler::new(&NoProcesses, &config, &paths, &tasks);
     let store = ControllerStore::open(&paths.controller_state_root()).unwrap();
     let request_id = "00000000000000000000000000000063";
     let request = parse_request(&serde_json::to_vec(&json!({"protocol_version": 7, "request_id": request_id, "command": "task.integrate", "body": {"task_id": fixture_task(), "expected": integration.snapshot.revision, "request_id": request_id}})).unwrap()).unwrap();
@@ -770,7 +861,8 @@ fn controller_redrive_freezes_the_request_without_running_an_owner_phase() {
     assert_eq!(saved.body(), request.body());
     assert_eq!(state.load(fixture_task()).unwrap().unwrap(), integration);
     assert!(tasks.queue_snapshot().unwrap().entries().is_empty());
-    let old = TaskSubmitHandler::new(&NoProcesses, &config, &paths, &tasks);
+    let old = TaskSubmitHandler::new(&NoProcesses, &config, &paths, &tasks)
+        .with_integration_features(vec![]);
     let unavailable = store
         .handle_with(&request, &old, ControllerFault::None)
         .unwrap_err();
@@ -816,8 +908,7 @@ fn controller_redrive_binds_integrated_success_without_an_epoch_or_process() {
     state
         .replace(record.task_id, IntegrationRevision(0), &record)
         .unwrap();
-    let handler = TaskSubmitHandler::new(&NoProcesses, &config, &paths, &tasks)
-        .with_integration_features(vec![CONTROLLER_FEATURE_INTEGRATION.into()]);
+    let handler = TaskSubmitHandler::new(&NoProcesses, &config, &paths, &tasks);
     let store = ControllerStore::open(&paths.controller_state_root()).unwrap();
     for ordinal in 0..2 {
         let request_id = format!("{:032x}", 100 + ordinal);
@@ -862,8 +953,7 @@ fn capable_controller_publishes_the_policy_before_ordinary_preparation() {
     let paths = isolated_paths(&temp.path().canonicalize().unwrap());
     let config = fixture_config(&paths);
     let tasks = ClientStateStore::open(&paths.state).unwrap();
-    let handler = TaskSubmitHandler::new(&SystemProcessRunner, &config, &paths, &tasks)
-        .with_integration_features(vec![CONTROLLER_FEATURE_INTEGRATION.into()]);
+    let handler = TaskSubmitHandler::new(&SystemProcessRunner, &config, &paths, &tasks);
     let request = valid_wrapper();
     let prepared = handler.prepare(&request).unwrap();
     assert_eq!(prepared.task_id, Some(fixture_task().to_string()));
@@ -891,7 +981,7 @@ fn capable_controller_publishes_the_policy_before_ordinary_preparation() {
 #[test]
 fn old_controller_rejects_wrappers_and_companion_selectors_without_mutation_rows() {
     use mac_worker::test_support::controller::{
-        ControllerFault, encode_json_frame, serve_rpc_with_runtime,
+        encode_json_frame, serve_rpc_with_integration_features,
     };
     let temp = tempfile::tempdir().unwrap();
     let paths = isolated_paths(&temp.path().canonicalize().unwrap());
@@ -908,13 +998,13 @@ fn old_controller_rejects_wrappers_and_companion_selectors_without_mutation_rows
         let mut out = Vec::new();
         let payload = json!({"protocol_version": 7, "request_id": request.request_id(),
             "command": request.command(), "body": request.body()});
-        let error = serve_rpc_with_runtime(
+        let error = serve_rpc_with_integration_features(
             &paths,
             &config,
             &SystemProcessRunner,
             &mut std::io::Cursor::new(encode_json_frame(&payload).unwrap()),
             &mut out,
-            ControllerFault::None,
+            &[],
         )
         .unwrap_err();
         assert_eq!(error.public_code(), "INTEGRATION_UNAVAILABLE");
@@ -968,8 +1058,7 @@ fn verified_nested_source_keeps_request_pins_and_retires_the_unadopted_task_pin(
         "version = 1\n[[workers]]\nname = 'fixture'\nssh = 'fixture.invalid'\nslots = 1\n",
     )
     .unwrap();
-    let handler = TaskSubmitHandler::new(&GitOnly, &config, &f.paths, &tasks)
-        .with_integration_features(vec![CONTROLLER_FEATURE_INTEGRATION.into()]);
+    let handler = TaskSubmitHandler::new(&GitOnly, &config, &f.paths, &tasks);
     let store = ControllerStore::open(&f.paths.controller_state_root()).unwrap();
     let error = store
         .handle_with(&f.request, &handler, ControllerFault::None)
