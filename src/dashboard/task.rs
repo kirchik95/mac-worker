@@ -53,6 +53,41 @@ pub trait DashboardIntegrationSource: Send + Sync + 'static {
         &self,
         task_id: TaskId,
     ) -> Result<Option<crate::integration::contracts::IntegrationSnapshot>, WorkerError>;
+    /// Project a read page; concrete rooted sources reuse one companion handle.
+    fn views(
+        &self,
+        records: &[(&LocalTaskRecord, bool)],
+    ) -> Result<HashMap<TaskId, crate::integration::contracts::IntegrationView>, WorkerError> {
+        let mut views = HashMap::new();
+        for (record, runner) in records {
+            let task = record.meta().task_id();
+            let snapshot = self.snapshot(task)?;
+            let current = snapshot
+                .as_ref()
+                .map(|snapshot| {
+                    crate::integration::view::snapshot_covers_latest_work(
+                        snapshot,
+                        record,
+                        |turn| self.is_auxiliary_turn(task, turn),
+                    )
+                })
+                .transpose()?
+                .unwrap_or(false);
+            let facts =
+                crate::integration::contracts::IntegrationTaskFacts::from_record(record, *runner);
+            let mut view = crate::integration::view::project_integration_for_current_work(
+                snapshot.as_ref(),
+                &facts,
+                current,
+            )?;
+            view.integration = snapshot;
+            if let Some(close) = self.requested_close(task)? {
+                view.requested_close = close;
+            }
+            views.insert(task, view);
+        }
+        Ok(views)
+    }
     fn dashboard_redrive(
         &self,
         _request: &crate::integration::contracts::IntegrationRedriveRequest,
@@ -175,6 +210,34 @@ impl DashboardIntegrationSource for NativeDashboardIntegrations {
         crate::integration::store::RootedIntegrationState::read_task(&self.paths, task)
             .map(|(_, record)| record.map(|record| record.snapshot))
     }
+    fn views(
+        &self,
+        records: &[(&LocalTaskRecord, bool)],
+    ) -> Result<HashMap<TaskId, crate::integration::contracts::IntegrationView>, WorkerError> {
+        let reader =
+            crate::integration::store::ExistingIntegrationReader::open_at(&self.paths.state)?;
+        let mut views = HashMap::new();
+        if !reader.present() {
+            return Ok(views);
+        }
+        for (ordinary, runner) in records {
+            let task = ordinary.meta().task_id();
+            let (policy, record) = reader.read_task(task)?;
+            if policy.is_some() || record.is_some() {
+                views.insert(
+                    task,
+                    crate::integration::view::project_owner_view(
+                        &reader,
+                        ordinary,
+                        *runner,
+                        policy.as_ref(),
+                        record.as_ref(),
+                    )?,
+                );
+            }
+        }
+        Ok(views)
+    }
     fn dashboard_redrive(
         &self,
         request: &crate::integration::contracts::IntegrationRedriveRequest,
@@ -219,30 +282,22 @@ fn attach_detail_integration(
     let Some(source) = source else {
         return Ok(detail);
     };
-    let snapshot = source
-        .snapshot(record.meta().task_id())
+    let views = source
+        .views(&[(record, runner)])
         .map_err(map_mutation_error)?;
+    let Some(view) = views.get(&record.meta().task_id()) else {
+        return Ok(detail);
+    };
     let facts = crate::integration::contracts::IntegrationTaskFacts::from_record(record, runner);
-    let current = snapshot
-        .as_ref()
-        .map(|snapshot| {
-            crate::integration::view::snapshot_covers_latest_work(snapshot, record, |turn| {
-                source.is_auxiliary_turn(record.meta().task_id(), turn)
-            })
-        })
-        .transpose()
-        .map_err(map_mutation_error)?
-        .unwrap_or(false);
     let mut detail = detail
-        .with_current_integration(snapshot.as_ref(), &facts, current)
+        .with_current_integration(
+            view.integration.as_ref(),
+            &facts,
+            view.workflow_state.is_some(),
+        )
         .map_err(map_mutation_error)?;
-    if let Some(close) = source
-        .requested_close(record.meta().task_id())
-        .map_err(map_mutation_error)?
-    {
-        detail.close_policy = close;
-        detail.task.close_policy = close;
-    }
+    detail.close_policy = view.requested_close;
+    detail.task.close_policy = view.requested_close;
     Ok(detail)
 }
 
@@ -254,38 +309,38 @@ fn attach_list_integrations(
     let Some(source) = source else {
         return Ok(());
     };
+    let records = records
+        .iter()
+        .map(|record| (record.meta().task_id(), record))
+        .collect::<HashMap<_, _>>();
+    let page = projection
+        .tasks
+        .iter()
+        .filter_map(|row| {
+            records
+                .get(&row.task_id)
+                .map(|record| (*record, row.runner.is_some()))
+        })
+        .collect::<Vec<_>>();
+    let views = source.views(&page).map_err(map_local_error)?;
     for row in &mut projection.tasks {
-        let Some(record) = records
-            .iter()
-            .find(|record| record.meta().task_id() == row.task_id)
+        let (Some(record), Some(view)) = (records.get(&row.task_id), views.get(&row.task_id))
         else {
             continue;
         };
-        let snapshot = source.snapshot(row.task_id).map_err(map_local_error)?;
         let facts = crate::integration::contracts::IntegrationTaskFacts::from_record(
             record,
             row.runner.is_some(),
         );
-        let current = snapshot
-            .as_ref()
-            .map(|snapshot| {
-                crate::integration::view::snapshot_covers_latest_work(snapshot, record, |turn| {
-                    source.is_auxiliary_turn(record.meta().task_id(), turn)
-                })
-            })
-            .transpose()
-            .map_err(map_local_error)?
-            .unwrap_or(false);
         *row = row
             .clone()
-            .with_current_integration(snapshot.as_ref(), &facts, current)
+            .with_current_integration(
+                view.integration.as_ref(),
+                &facts,
+                view.workflow_state.is_some(),
+            )
             .map_err(map_local_error)?;
-        if let Some(close) = source
-            .requested_close(row.task_id)
-            .map_err(map_local_error)?
-        {
-            row.close_policy = close;
-        }
+        row.close_policy = view.requested_close;
     }
     Ok(())
 }
@@ -1034,4 +1089,123 @@ fn map_mutation_error(error: WorkerError) -> ApiError {
     let code = error.public_code();
     let message = error.public_message();
     ApiError::new(code, message)
+}
+
+#[cfg(test)]
+mod read_cost_tests {
+    use super::*;
+    use crate::integration::{contracts::*, store::RootedIntegrationState, testing::*};
+
+    struct NoProcesses;
+    impl ProcessRunner for NoProcesses {
+        fn run(
+            &self,
+            _: &crate::process::ProcessRequest,
+        ) -> Result<crate::process::ProcessResult, WorkerError> {
+            panic!("projection must not execute a process");
+        }
+    }
+    fn counts_since(before: [u64; 3]) -> [u64; 3] {
+        let after = crate::rooted_fs::read_open_counts();
+        std::array::from_fn(|i| after[i] - before[i])
+    }
+    #[test]
+    fn disabled_dashboard_poll_keeps_baseline_locks_opens_and_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let paths = PathLayout {
+            state: root.join("state"),
+            config: root.join("config"),
+            cache: root.join("cache"),
+            data: root.join("data"),
+        };
+        let client = Arc::new(ClientStateStore::open(&paths.state).unwrap());
+        for i in 1..=8 {
+            client
+                .create_task(sample_ordinary(
+                    TaskId::new(uuid::Uuid::from_u128(i)),
+                    fixture_source(),
+                ))
+                .unwrap();
+        }
+        let config = Arc::new(Config::parse("version = 1\n").unwrap());
+        let source = NativeDashboardIntegrations {
+            paths: paths.clone(),
+            client: client.clone(),
+            config: config.clone(),
+            runner: Arc::new(NoProcesses),
+        };
+        let before = crate::rooted_fs::read_open_counts();
+        let locks = client.state_lock_count();
+        let baseline = project_local_tasks(&config, &client, None).unwrap();
+        let baseline_opens = counts_since(before);
+        let baseline_locks = client.state_lock_count() - locks;
+        let before = crate::rooted_fs::read_open_counts();
+        let locks = client.state_lock_count();
+        let current = project_local_tasks(&config, &client, Some(&source)).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&current.projection).unwrap(),
+            serde_json::to_vec(&baseline.projection).unwrap()
+        );
+        assert_eq!(client.state_lock_count() - locks, baseline_locks);
+        assert_eq!(
+            counts_since(before),
+            baseline_opens,
+            "absent integration root must stop every per-row companion open"
+        );
+        assert!(!paths.state.join("integrations").exists());
+    }
+    #[test]
+    fn enabled_dashboard_poll_reads_companions_as_one_batch() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let paths = PathLayout {
+            state: root.join("state"),
+            config: root.join("config"),
+            cache: root.join("cache"),
+            data: root.join("data"),
+        };
+        let client = Arc::new(ClientStateStore::open(&paths.state).unwrap());
+        let state =
+            RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+                .unwrap();
+        for i in 1..=8 {
+            let task = TaskId::new(uuid::Uuid::from_u128(i));
+            client
+                .create_task(sample_ordinary(task, fixture_source()))
+                .unwrap();
+            let record = sample_record(task, fixture_source(), "main");
+            state.publish_policy(task, &record.policy).unwrap();
+            state
+                .replace(task, IntegrationRevision(0), &record)
+                .unwrap();
+        }
+        let config = Arc::new(Config::parse("version = 1\n").unwrap());
+        let source = NativeDashboardIntegrations {
+            paths: paths.clone(),
+            client: client.clone(),
+            config: config.clone(),
+            runner: Arc::new(NoProcesses),
+        };
+        let before = crate::rooted_fs::read_open_counts();
+        let baseline = project_local_tasks(&config, &client, None).unwrap();
+        assert_eq!(baseline.projection.tasks.len(), 8);
+        let baseline_opens = counts_since(before);
+        let before = crate::rooted_fs::read_open_counts();
+        let projection = project_local_tasks(&config, &client, Some(&source))
+            .unwrap()
+            .projection;
+        let opens = counts_since(before);
+        assert_eq!(
+            opens[0] - baseline_opens[0],
+            1,
+            "one anchored companion root per batch"
+        );
+        assert_eq!(
+            opens[2] - baseline_opens[2],
+            16,
+            "one policy and record read per task"
+        );
+        assert!(projection.tasks.iter().all(|row| row.integration.is_some()));
+    }
 }

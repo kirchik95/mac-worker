@@ -7,23 +7,49 @@ use crate::task_view::{ReviewState, review_state};
 pub(crate) fn read_owner_view(
     paths: &crate::paths::PathLayout,
     ordinary: &LocalTaskRecord,
-    runner: bool,
+    runner: impl FnOnce() -> Result<bool, WorkerError>,
 ) -> Result<Option<IntegrationView>, WorkerError> {
-    let task = ordinary.meta().task_id();
-    let (_, record) = super::store::RootedIntegrationState::read_task(paths, task)?;
-    let Some(record) = record else {
+    let reader = super::store::ExistingIntegrationReader::open_at(&paths.state)?;
+    let (policy, record) = reader.read_task(ordinary.meta().task_id())?;
+    if record.is_none() {
         return Ok(None);
-    };
-    let current = snapshot_covers_latest_work(&record.snapshot, ordinary, |turn| {
-        super::store::RootedIntegrationState::read_auxiliary(paths, task, turn)
-            .map(|prepared| prepared.is_some())
-    })?;
+    }
+    project_owner_view(
+        &reader,
+        ordinary,
+        runner()?,
+        policy.as_ref(),
+        record.as_ref(),
+    )
+    .map(Some)
+}
+
+pub(crate) fn project_owner_view(
+    reader: &super::store::ExistingIntegrationReader,
+    ordinary: &LocalTaskRecord,
+    runner: bool,
+    policy: Option<&FrozenIntegrationPolicy>,
+    record: Option<&IntegrationRecord>,
+) -> Result<IntegrationView, WorkerError> {
+    let task = ordinary.meta().task_id();
+    let current = record
+        .map(|record| {
+            snapshot_covers_latest_work(&record.snapshot, ordinary, |turn| {
+                reader
+                    .read_auxiliary(task, turn, Some(record))
+                    .map(|prepared| prepared.is_some())
+            })
+        })
+        .transpose()?
+        .unwrap_or(false);
     let facts = IntegrationTaskFacts::from_record(ordinary, runner);
-    let mut view = project_integration_for_current_work(Some(&record.snapshot), &facts, current)?;
-    view.requested_close = record.policy.requested_close;
-    // Keep the receipt visible as history once newer ordinary work exists.
-    view.integration = Some(record.snapshot);
-    Ok(Some(view))
+    let snapshot = record.map(|record| &record.snapshot);
+    let mut view = project_integration_for_current_work(snapshot, &facts, current)?;
+    if let Some(policy) = policy {
+        view.requested_close = policy.requested_close;
+    }
+    view.integration = snapshot.cloned();
+    Ok(view)
 }
 
 impl IntegrationTaskFacts {

@@ -2741,16 +2741,21 @@ impl<'a> TaskClient<'a> {
             &blocking_codes,
         )
         .map_err(task_view_error)?;
+        let integration_reader =
+            crate::integration::store::ExistingIntegrationReader::open_at(&self.paths.state)?;
         for row in &mut projection.tasks {
             if let Some(record) = projected
                 .iter()
                 .find(|record| record.meta().task_id() == row.task_id)
-                && let Some(view) = crate::integration::view::read_owner_view(
-                    self.paths,
+                && let (policy, Some(integration)) = integration_reader.read_task(row.task_id)?
+            {
+                let view = crate::integration::view::project_owner_view(
+                    &integration_reader,
                     record,
                     row.runner.is_some(),
-                )?
-            {
+                    policy.as_ref(),
+                    Some(&integration),
+                )?;
                 let facts = IntegrationTaskFacts::from_record(record, row.runner.is_some());
                 let snapshot = view.integration.as_ref();
                 *row = row.clone().with_current_integration(
@@ -3062,7 +3067,11 @@ impl<'a> TaskClient<'a> {
             integration_view: crate::integration::view::read_owner_view(
                 self.paths,
                 &observed.record,
-                self.client_state.runner_liveness(task_id)?.is_some(),
+                || {
+                    self.client_state
+                        .runner_liveness(task_id)
+                        .map(|runner| runner.is_some())
+                },
             )?,
             task_id,
             status: observed.record.status().clone(),
@@ -5178,13 +5187,12 @@ impl<'a> TaskClient<'a> {
     }
 
     fn report_from_record(&self, record: &LocalTaskRecord) -> Result<TaskReport, WorkerError> {
+        let runner = self.client_state.runner_liveness(record.meta().task_id())?;
         Ok(TaskReport {
             integration_view: crate::integration::view::read_owner_view(
                 self.paths,
                 record,
-                self.client_state
-                    .runner_liveness(record.meta().task_id())?
-                    .is_some(),
+                || Ok(runner.is_some()),
             )?,
             session_submission: None,
             questions_policy: record.questions_policy(),
@@ -5193,7 +5201,7 @@ impl<'a> TaskClient<'a> {
             status: record.status().clone(),
             warnings: permission_warnings(record.meta()),
             events: Vec::new(),
-            runner: self.client_state.runner_liveness(record.meta().task_id())?,
+            runner,
             exit_code: None,
             delivery: record.delivery().cloned(),
             deliveries: record.deliveries().to_vec(),
@@ -6840,13 +6848,12 @@ impl<'a> TaskClient<'a> {
 
     fn report_for(&self, task_id: TaskId) -> Result<TaskReport, WorkerError> {
         let record = self.client_state.load_task(task_id)?;
+        let runner = self.client_state.runner_liveness(task_id)?;
         Ok(TaskReport {
             integration_view: crate::integration::view::read_owner_view(
                 self.paths,
                 &record,
-                self.client_state
-                    .runner_liveness(record.meta().task_id())?
-                    .is_some(),
+                || Ok(runner.is_some()),
             )?,
             session_submission: None,
             questions_policy: record.questions_policy(),
@@ -6855,7 +6862,7 @@ impl<'a> TaskClient<'a> {
             status: record.status().clone(),
             warnings: permission_warnings(record.meta()),
             events: Vec::new(),
-            runner: self.client_state.runner_liveness(task_id)?,
+            runner,
             exit_code: None,
             delivery: record.delivery().cloned(),
             deliveries: record.deliveries().to_vec(),
@@ -6867,13 +6874,12 @@ impl<'a> TaskClient<'a> {
 
     fn report_for_readonly(&self, record: &LocalTaskRecord) -> Result<TaskReport, WorkerError> {
         let observed = self.observe_task(record)?;
+        let runner = self.client_state.runner_liveness(record.meta().task_id())?;
         Ok(TaskReport {
             integration_view: crate::integration::view::read_owner_view(
                 self.paths,
                 &observed.record,
-                self.client_state
-                    .runner_liveness(record.meta().task_id())?
-                    .is_some(),
+                || Ok(runner.is_some()),
             )?,
             session_submission: None,
             questions_policy: observed.record.questions_policy(),
@@ -6882,9 +6888,7 @@ impl<'a> TaskClient<'a> {
             status: observed.record.status().clone(),
             warnings: permission_warnings(observed.record.meta()),
             events: Vec::new(),
-            runner: self
-                .client_state
-                .runner_liveness(observed.record.meta().task_id())?,
+            runner,
             exit_code: None,
             delivery: observed.record.delivery().cloned(),
             deliveries: observed.record.deliveries().to_vec(),
@@ -10501,5 +10505,81 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, NewEvent::TaskClosed(_)))
         );
+    }
+}
+
+#[cfg(test)]
+mod read_cost_tests {
+    use super::*;
+    use crate::integration::testing::*;
+    use crate::turn_runner::InlineRunnerExecutor;
+    struct NoProcesses;
+    impl ProcessRunner for NoProcesses {
+        fn run(
+            &self,
+            _: &crate::process::ProcessRequest,
+        ) -> Result<crate::process::ProcessResult, WorkerError> {
+            panic!("disabled reads must not execute a process")
+        }
+    }
+    #[test]
+    fn disabled_status_and_result_keep_baseline_locks_opens_and_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let paths = PathLayout {
+            state: root.join("state"),
+            config: root.join("config"),
+            cache: root.join("cache"),
+            data: root.join("data"),
+        };
+        let state = ClientStateStore::open(&paths.state).unwrap();
+        let ordinary = sample_ordinary(fixture_task(), fixture_source());
+        state.create_task(ordinary.clone()).unwrap();
+        let record_path = paths.state.join(format!("tasks/{}.json", fixture_task()));
+        let original = std::fs::read(&record_path).unwrap();
+        let config = Config::parse("version = 1\n").unwrap();
+        let client = TaskClient::new(&NoProcesses, &config, &paths, &state, &InlineRunnerExecutor);
+        let locks = state.state_lock_count();
+        let opens = crate::rooted_fs::read_open_counts();
+        let report = client.status(fixture_task()).unwrap();
+        assert_eq!(state.state_lock_count() - locks, 2);
+        let after = crate::rooted_fs::read_open_counts();
+        assert_eq!(after[0] - opens[0], 0);
+        assert_eq!(after[2] - opens[2], 2);
+        assert_eq!(
+            serde_json::to_vec(report.status()).unwrap(),
+            serde_json::to_vec(ordinary.status()).unwrap()
+        );
+        assert!(report.integration_view.is_none());
+        let wire = serde_json::to_vec(
+            &crate::controller::read::ControllerTaskStatusResult::from_report(&report),
+        )
+        .unwrap();
+        let again = client.status(fixture_task()).unwrap();
+        assert_eq!(
+            serde_json::to_vec(
+                &crate::controller::read::ControllerTaskStatusResult::from_report(&again)
+            )
+            .unwrap(),
+            wire
+        );
+        let locks = state.state_lock_count();
+        let opens = crate::rooted_fs::read_open_counts();
+        let result = client.result(fixture_task()).unwrap();
+        assert_eq!(
+            state.state_lock_count() - locks,
+            1,
+            "disabled result had no baseline runner-liveness reload"
+        );
+        let after = crate::rooted_fs::read_open_counts();
+        assert_eq!(after[0] - opens[0], 0);
+        assert_eq!(after[2] - opens[2], 1);
+        assert_eq!(
+            serde_json::to_vec(result.status()).unwrap(),
+            serde_json::to_vec(ordinary.status()).unwrap()
+        );
+        assert!(result.integration_view.is_none());
+        assert_eq!(std::fs::read(record_path).unwrap(), original);
+        assert!(!paths.state.join("integrations").exists());
     }
 }

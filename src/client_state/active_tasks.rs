@@ -113,6 +113,8 @@ impl ClientStateStore {
         let names = tasks.list_names().map_err(WorkerError::Io)?;
         self.recover_task_replacement_residue(&tasks, &names)?;
         let queued_turns = self.load_queue_task_turn_ids_locked()?;
+        let integrations =
+            crate::integration::store::ExistingIntegrationReader::open_at(&self.inner.state_root);
         let mut rebuilt = Vec::new();
         let mut corrupt = Vec::new();
         for name in tasks.list_names().map_err(WorkerError::Io)? {
@@ -140,7 +142,7 @@ impl ClientStateStore {
             match read_task_from_dir(&tasks, text, task_id) {
                 Ok(record) => {
                     if !should_keep_active_index(&record, &queued_turns)
-                        && !self.closed_integration_needs_active_index(&record)
+                        && !self.closed_integration_needs_active_index(&record, &integrations)
                     {
                         continue;
                     }
@@ -272,6 +274,8 @@ impl ClientStateStore {
         let page: Vec<TaskId> = unique.into_iter().take(bound).collect();
         let queued_turns = self.load_queue_task_turn_ids_locked()?;
         let tasks = self.tasks_dir()?;
+        let integrations =
+            crate::integration::store::ExistingIntegrationReader::open_at(&self.inner.state_root);
         let mut report = ActiveTaskRefreshReport {
             retired: Vec::new(),
             retained: Vec::new(),
@@ -289,7 +293,7 @@ impl ClientStateStore {
             match read_task_from_dir(&tasks, &name, task_id) {
                 Ok(record) => {
                     if should_keep_active_index(&record, &queued_turns)
-                        || self.closed_integration_needs_active_index(&record)
+                        || self.closed_integration_needs_active_index(&record, &integrations)
                     {
                         if let Err(error) = self.ensure_active_task_index_locked(task_id) {
                             report.failed.push((task_id.to_string(), error.to_string()));
@@ -348,9 +352,12 @@ impl ClientStateStore {
         &self,
         record: &LocalTaskRecord,
     ) -> Result<bool, WorkerError> {
-        if task_record_needs_active_index(record)
-            || self.closed_integration_needs_active_index(record)
-        {
+        if task_record_needs_active_index(record) {
+            return Ok(true);
+        }
+        let integrations =
+            crate::integration::store::ExistingIntegrationReader::open_at(&self.inner.state_root);
+        if self.closed_integration_needs_active_index(record, &integrations) {
             return Ok(true);
         }
         match self.load_queue_task_turn_ids_locked() {
@@ -359,25 +366,16 @@ impl ClientStateStore {
         }
     }
 
-    fn closed_integration_needs_active_index(&self, record: &LocalTaskRecord) -> bool {
-        if record.status().state() != TaskState::Closed {
-            return false;
-        }
-        match crate::integration::store::IntegrationRecovery::open_at(&self.inner.state_root) {
-            Ok(recovery) if !recovery.retains_evidence(record.meta().task_id()) => {}
-            _ => return true,
-        }
-        match crate::integration::store::RootedIntegrationState::read_task_at(
-            &self.inner.state_root,
-            record.meta().task_id(),
-        ) {
-            Ok((_, Some(integration))) => {
-                crate::integration::coordinator::closed_observation_pending(&integration)
+    fn closed_integration_needs_active_index(
+        &self,
+        record: &LocalTaskRecord,
+        integrations: &Result<crate::integration::store::ExistingIntegrationReader, WorkerError>,
+    ) -> bool {
+        record.status().state() == TaskState::Closed
+            && match integrations {
+                Ok(reader) => reader.closed_pending(record.meta().task_id()),
+                Err(_) => true,
             }
-            Ok((_, None)) => false,
-            // Unreadable optional evidence cannot prove a repair is finished.
-            Err(_) => true,
-        }
     }
 
     fn load_queue_task_turn_ids_locked(&self) -> Result<HashSet<JobId>, WorkerError> {
@@ -640,4 +638,95 @@ fn record_has_relevant_queue_turn(record: &LocalTaskRecord, queued: &HashSet<Job
 
 fn should_keep_active_index(record: &LocalTaskRecord, queued: &HashSet<JobId>) -> bool {
     task_record_needs_active_index(record) || record_has_relevant_queue_turn(record, queued)
+}
+
+#[cfg(test)]
+mod read_cost_tests {
+    use super::*;
+    use crate::integration::{contracts::*, store::RootedIntegrationState, testing::*};
+    fn closed(task: TaskId) -> LocalTaskRecord {
+        let ordinary = sample_ordinary(task, fixture_source());
+        let mut status = serde_json::to_value(ordinary.status()).unwrap();
+        status["state"] = "closed".into();
+        ordinary
+            .with_status(serde_json::from_value(status).unwrap())
+            .unwrap()
+    }
+    #[test]
+    fn disabled_closed_index_uses_one_lock_and_no_companion_opens() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().canonicalize().unwrap().join("state");
+        let client = ClientStateStore::open(&path).unwrap();
+        let ids = (1..=8)
+            .map(|i| TaskId::new(uuid::Uuid::from_u128(i)))
+            .collect::<Vec<_>>();
+        for task in &ids {
+            client.create_task(closed(*task)).unwrap();
+        }
+        let before_bytes = ids
+            .iter()
+            .map(|task| std::fs::read(path.join(format!("tasks/{task}.json"))).unwrap())
+            .collect::<Vec<_>>();
+        let opens = crate::rooted_fs::read_open_counts();
+        let locks = client.state_lock_count();
+        let bootstrap = client.bootstrap_active_task_index().unwrap();
+        assert!(bootstrap.rebuilt.is_empty());
+        assert_eq!(client.state_lock_count() - locks, 1);
+        assert_eq!(
+            crate::rooted_fs::read_open_counts()[0] - opens[0],
+            0,
+            "absence check cannot reopen the rooted companion path per Closed row"
+        );
+        let opens = crate::rooted_fs::read_open_counts();
+        let locks = client.state_lock_count();
+        let refreshed = client
+            .refresh_active_task_index(&ids, &ActiveTaskConfig::default())
+            .unwrap();
+        assert_eq!(refreshed.retired.len(), 8);
+        assert_eq!(client.state_lock_count() - locks, 1);
+        assert_eq!(crate::rooted_fs::read_open_counts()[0] - opens[0], 0);
+        assert!(!path.join("integrations").exists());
+        for (task, bytes) in ids.iter().zip(before_bytes) {
+            assert_eq!(
+                std::fs::read(path.join(format!("tasks/{task}.json"))).unwrap(),
+                bytes
+            );
+        }
+    }
+    #[test]
+    fn enabled_closed_index_batches_the_companion_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let paths = crate::paths::PathLayout {
+            state: root.join("state"),
+            config: root.join("config"),
+            cache: root.join("cache"),
+            data: root.join("data"),
+        };
+        let client = ClientStateStore::open(&paths.state).unwrap();
+        let state =
+            RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+                .unwrap();
+        let ids = (1..=8)
+            .map(|i| TaskId::new(uuid::Uuid::from_u128(i)))
+            .collect::<Vec<_>>();
+        for task in &ids {
+            let record = sample_record(*task, fixture_source(), "main");
+            state.publish_policy(*task, &record.policy).unwrap();
+            state
+                .replace(*task, IntegrationRevision(0), &record)
+                .unwrap();
+            client.create_task(closed(*task)).unwrap();
+        }
+        let before = crate::rooted_fs::read_open_counts();
+        let report = client
+            .refresh_active_task_index(&ids, &ActiveTaskConfig::default())
+            .unwrap();
+        assert_eq!(report.retained, ids);
+        assert_eq!(
+            crate::rooted_fs::read_open_counts()[0] - before[0],
+            1,
+            "one optional root open for the whole Closed page"
+        );
+    }
 }

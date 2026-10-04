@@ -4086,4 +4086,76 @@ mod review_fixes {
         assert!(!diagnostic.exists());
         assert_eq!(std::fs::read(&pin).unwrap(), b"retain this evidence");
     }
+    #[derive(Clone)]
+    struct CountingInspector(Arc<AtomicUsize>);
+    impl mac_worker::test_support::host::supervisor::ProcessInspector for CountingInspector {
+        fn identity_for_pid(&self, pid: u32) -> Result<ProcessIdentity, WorkerError> {
+            ProcessIdentity::new(pid, 1)
+        }
+        fn observe(
+            &self,
+            _: ProcessIdentity,
+        ) -> mac_worker::test_support::host::supervisor::ProcessObservation {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            mac_worker::test_support::host::supervisor::ProcessObservation::Matching {
+                process_group: 5_000_123,
+            }
+        }
+        fn observe_group(
+            &self,
+            _: u32,
+        ) -> mac_worker::test_support::host::supervisor::ProcessGroupObservation {
+            mac_worker::test_support::host::supervisor::ProcessGroupObservation::Ambiguous
+        }
+        fn observe_group_members(
+            &self,
+            _: u32,
+        ) -> mac_worker::test_support::host::supervisor::ProcessGroupMembership {
+            mac_worker::test_support::host::supervisor::ProcessGroupMembership::Ambiguous
+        }
+    }
+
+    #[test]
+    fn review_disabled_status_keeps_one_baseline_runner_observation() {
+        use mac_worker::test_support::{
+            core::config::Config,
+            task::{client::TaskClient, model::RunnerIdentity, turn_runner::InlineRunnerExecutor},
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let paths = probe_paths(&temp.path().canonicalize().unwrap());
+        let count = Arc::new(AtomicUsize::new(0));
+        let client = ClientStateStore::open_with_owner_inspector(
+            &paths.state,
+            CountingInspector(count.clone()),
+        )
+        .unwrap();
+        let ordinary = sample_ordinary(fixture_task(), fixture_source())
+            .with_runner(Some(RunnerIdentity::new(
+                ProcessIdentity::new(5_000_123, 1).unwrap(),
+            )))
+            .unwrap();
+        client.create_task(ordinary).unwrap();
+        let config = Config::parse("version = 1\n").unwrap();
+        let locks = client.state_lock_count();
+        TaskClient::new(
+            &NoProbeProcesses,
+            &config,
+            &paths,
+            &client,
+            &InlineRunnerExecutor,
+        )
+        .status(fixture_task())
+        .unwrap();
+        assert!(!paths.state.join("integrations").exists());
+        assert_eq!(
+            client.state_lock_count() - locks,
+            2,
+            "one addressed read plus one baseline runner-liveness read"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "disabled status must retain the baseline single StateLock/read/liveness pass"
+        );
+    }
 }

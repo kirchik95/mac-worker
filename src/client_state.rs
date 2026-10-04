@@ -596,6 +596,7 @@ impl ClientStateLockContentionProbe {
 #[derive(Default)]
 #[cfg(any(test, feature = "test-support"))]
 struct SyncCounters {
+    state_locks: std::sync::atomic::AtomicU64,
     parent_directories: std::sync::atomic::AtomicU64,
     root: std::sync::atomic::AtomicU64,
     jobs: std::sync::atomic::AtomicU64,
@@ -5454,6 +5455,12 @@ impl ClientStateStore {
         }
     }
 
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn state_lock_count(&self) -> u64 {
+        self.inner.sync_counts.state_locks.load(Ordering::SeqCst)
+    }
+
     fn require_local_client(&self, record: &LocalJobRecord) -> Result<(), WorkerError> {
         if record.meta().client_id() != self.inner.client_id {
             return Err(WorkerError::Protocol(
@@ -7269,6 +7276,8 @@ impl StateLock {
                 .fetch_add(1, Ordering::SeqCst);
         }
         deadline.lock(marker.as_raw_fd(), operation)?;
+        #[cfg(any(test, feature = "test-support"))]
+        sync_counts.state_locks.fetch_add(1, Ordering::SeqCst);
         Ok(Self {
             authoritative,
             marker,
