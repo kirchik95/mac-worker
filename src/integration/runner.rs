@@ -35,6 +35,9 @@ pub(crate) struct OwnerIntegration<'a> {
     source: OwnerSource<'a>,
 }
 
+pub(crate) type ReplayRedrive<'a> =
+    dyn Fn(&IntegrationRedriveRequest) -> Result<IntegrationSnapshot, WorkerError> + 'a;
+
 pub(crate) struct OwnerRuntime {
     paths: PathLayout,
     client: ClientStateStore,
@@ -498,24 +501,25 @@ impl<'a> OwnerIntegration<'a> {
     }
     /// Save the complete dashboard body before the native re-drive binding can
     /// advance an epoch. A completed replay performs no checks or scheduling.
+    /// Validation returns whether execution needs a native binding; execution
+    /// uses the supplied port to keep that pair under the same replay fences.
     pub(crate) fn dashboard_redrive(
         &self,
         request: &IntegrationRedriveRequest,
         body: &serde_json::Value,
-        validate: &mut dyn FnMut() -> Result<(), WorkerError>,
-        execute: &mut dyn FnMut() -> Result<serde_json::Value, WorkerError>,
+        validate: &mut dyn FnMut() -> Result<bool, WorkerError>,
+        execute: &mut dyn FnMut(&ReplayRedrive<'_>) -> Result<serde_json::Value, WorkerError>,
     ) -> Result<serde_json::Value, WorkerError> {
         request.validate()?;
         let root = task_root(self.ports.paths, request.task_id)?;
-        let _request = private_lock(&root, "dashboard-redrive.lock", true)?
-            .ok_or_else(|| WorkerError::task("TASK_BUSY", "integration redrive is in progress"))?;
+        let _replay = replay_locks(&root)?;
         let name = format!("dashboard-redrive-{}.json", request.request_id);
         let old = match root.read_private_regular(&name, MAX_INTEGRATION_RPC_BYTES as u64) {
             Ok(bytes) => Some(bytes),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(error.into()),
         };
-        let (mut binding, previous) = if let Some(bytes) = old {
+        let (mut binding, previous, fresh, native_required) = if let Some(bytes) = old {
             let binding: DashboardRedriveBinding =
                 serde_json::from_slice(&bytes).map_err(|_| invalid())?;
             if binding.request != *request
@@ -527,9 +531,9 @@ impl<'a> OwnerIntegration<'a> {
             if let Some(result) = &binding.result {
                 return Ok(result.clone());
             }
-            (binding, bytes)
+            (binding, bytes, false, true)
         } else {
-            validate()?;
+            let native_required = validate()?;
             let binding = DashboardRedriveBinding {
                 request: request.clone(),
                 body: body.clone(),
@@ -540,30 +544,56 @@ impl<'a> OwnerIntegration<'a> {
             if bytes.len() > MAX_INTEGRATION_RPC_BYTES {
                 return Err(invalid());
             }
-            dashboard_replay_capacity(
-                &root,
-                request.task_id,
-                &name,
-                bytes.len(),
-                self.runtime.now_millis(),
-            )?;
-            root.write_private_atomic_no_replace(&name, &bytes)?;
-            (binding, bytes)
+            (binding, bytes, true, native_required)
         };
+        let native_name = format!("redrive-{}.json", request.request_id);
+        let native_bytes = if native_required && read(&root, &native_name)?.is_none() {
+            let record = self
+                .state
+                .load(request.task_id)?
+                .ok_or_else(integration_unavailable)?;
+            let result = (record.snapshot.state == IntegrationStatus::Integrated)
+                .then_some(record.snapshot.clone());
+            Some(
+                serde_json::to_vec(&RedriveBinding {
+                    request: request.clone(),
+                    intent: record.snapshot.integration_id,
+                    epoch: record.snapshot.epoch,
+                    completed_at_millis: result.as_ref().map(|_| self.runtime.now_millis()),
+                    result,
+                })
+                .map_err(|_| invalid())?,
+            )
+        } else {
+            None
+        };
+        let mut publications = vec![(name.as_str(), previous.len())];
+        if let Some(bytes) = &native_bytes {
+            publications.push((native_name.as_str(), bytes.len()));
+        }
+        replay_capacity(&root, request, &publications, self.runtime.now_millis())?;
+        if fresh {
+            root.write_private_atomic_no_replace(&name, &previous)?;
+        }
         // An interrupted pending response resumes/replays the underlying owner
         // request, whose saved epoch/result prevents another epoch advance.
-        let result = execute()?;
+        let redrive = |nested: &IntegrationRedriveRequest| {
+            if nested != request {
+                return Err(invalid());
+            }
+            self.redrive_under_quota(nested, &root)
+        };
+        let result = execute(&redrive)?;
         binding.result = Some(result.clone());
         binding.completed_at_millis = Some(self.runtime.now_millis());
         let bytes = serde_json::to_vec(&binding).map_err(|_| invalid())?;
         if bytes.len() > MAX_INTEGRATION_RPC_BYTES {
             return Err(invalid());
         }
-        dashboard_replay_capacity(
+        replay_capacity(
             &root,
-            request.task_id,
-            &name,
-            bytes.len(),
+            request,
+            &[(name.as_str(), bytes.len())],
             self.runtime.now_millis(),
         )?;
         root.replace_private_regular_exact(&name, &previous, &bytes)?;
@@ -574,15 +604,21 @@ impl<'a> OwnerIntegration<'a> {
         &self,
         request: &IntegrationRedriveRequest,
     ) -> Result<IntegrationSnapshot, WorkerError> {
-        let _hints = self.ports.client.event_scope();
         request.validate()?;
+        let root = task_root(self.ports.paths, request.task_id)?;
+        let _replay = replay_locks(&root)?;
+        self.redrive_under_quota(request, &root)
+    }
+    fn redrive_under_quota(
+        &self,
+        request: &IntegrationRedriveRequest,
+        root: &RootedDir,
+    ) -> Result<IntegrationSnapshot, WorkerError> {
+        let _hints = self.ports.client.event_scope();
         let task = request.task_id;
-        let root = task_root(self.ports.paths, task)?;
-        let _request = private_lock(&root, "redrive.lock", true)?
-            .ok_or_else(|| WorkerError::task("TASK_BUSY", "integration redrive is in progress"))?;
         let name = format!("redrive-{}.json", request.request_id);
         let mut record = self.state.load(task)?.ok_or_else(integration_unavailable)?;
-        let mut binding: RedriveBinding = match read(&root, &name)? {
+        let mut binding: RedriveBinding = match read(root, &name)? {
             Some(bytes) => {
                 let saved: RedriveBinding =
                     serde_json::from_slice(&bytes).map_err(|_| invalid())?;
@@ -641,14 +677,17 @@ impl<'a> OwnerIntegration<'a> {
                     request: request.clone(),
                     intent: record.snapshot.integration_id,
                     epoch: record.snapshot.epoch,
+                    completed_at_millis: result.as_ref().map(|_| self.runtime.now_millis()),
                     result,
                 };
-                write(
-                    &root,
-                    &name,
-                    &serde_json::to_vec(&saved).map_err(|_| invalid())?,
-                    true,
+                let bytes = serde_json::to_vec(&saved).map_err(|_| invalid())?;
+                replay_capacity(
+                    root,
+                    request,
+                    &[(name.as_str(), bytes.len())],
+                    self.runtime.now_millis(),
                 )?;
+                write(root, &name, &bytes, true)?;
                 saved
             }
         };
@@ -688,13 +727,15 @@ impl<'a> OwnerIntegration<'a> {
             ));
         };
         binding.result = Some(result.clone());
-        write(
-            &root,
-            &name,
-            &serde_json::to_vec(&binding).map_err(|_| invalid())?,
-            false,
+        binding.completed_at_millis = Some(self.runtime.now_millis());
+        let bytes = serde_json::to_vec(&binding).map_err(|_| invalid())?;
+        replay_capacity(
+            root,
+            request,
+            &[(name.as_str(), bytes.len())],
+            self.runtime.now_millis(),
         )?;
-        drop(_request);
+        write(root, &name, &bytes, false)?;
         self.schedule(task)?;
         Ok(result)
     }
@@ -836,90 +877,118 @@ struct DashboardRedriveBinding {
     completed_at_millis: Option<u64>,
 }
 
-const MAX_DASHBOARD_REPLAY_BINDINGS: usize = 32;
-const MAX_DASHBOARD_REPLAY_BYTES: usize = 256 * 1024;
-const DASHBOARD_REPLAY_LIFETIME_MILLIS: u64 = 24 * 60 * 60 * 1000;
+const MAX_REPLAY_BINDINGS: usize = 32;
+const MAX_REPLAY_BYTES: usize = 256 * 1024;
+const REPLAY_LIFETIME_MILLIS: u64 = 24 * 60 * 60 * 1000;
 
 fn replay_busy() -> WorkerError {
     WorkerError::task("TASK_BUSY", "integration redrive is in progress")
 }
 
-/// Called under dashboard-redrive.lock before either durable publication.
-/// Pending accepted requests are never candidates for quota or age eviction.
-fn dashboard_replay_capacity(
+fn replay_locks(root: &RootedDir) -> Result<[File; 3], WorkerError> {
+    // Every writer uses quota -> dashboard -> native, with no lock waits.
+    Ok([
+        private_lock(root, "replay-quota.lock", true)?.ok_or_else(replay_busy)?,
+        private_lock(root, "dashboard-redrive.lock", true)?.ok_or_else(replay_busy)?,
+        private_lock(root, "redrive.lock", true)?.ok_or_else(replay_busy)?,
+    ])
+}
+
+/// Called under quota and both request locks. Planned rows substitute their current size;
+/// paired admission includes both rows before publishing either one.
+fn replay_capacity(
     root: &RootedDir,
-    task: TaskId,
-    replacement: &str,
-    bytes: usize,
+    request: &IntegrationRedriveRequest,
+    publications: &[(&str, usize)],
     now: u64,
 ) -> Result<(), WorkerError> {
-    if bytes > MAX_DASHBOARD_REPLAY_BYTES {
+    let mut count = publications.len();
+    let mut total = publications
+        .iter()
+        .fold(0usize, |total, (_, bytes)| total.saturating_add(*bytes));
+    if total > MAX_REPLAY_BYTES {
         return Err(replay_busy());
     }
-    let mut count = 1usize;
-    let mut total = bytes;
+    let mut protected = std::collections::HashSet::from([request.request_id.clone()]);
     let mut completed = Vec::new();
     for raw in root.list_names()? {
-        let Some(name) = dashboard_replay_name(&raw) else {
+        if !redrive_binding_name(&raw) {
             continue;
-        };
-        if name == replacement {
+        }
+        let name = std::str::from_utf8(&raw).map_err(|_| invalid())?;
+        if publications
+            .iter()
+            .any(|(replacement, _)| *replacement == name)
+        {
             continue;
         }
         let identity = root.private_entry_identity(name)?;
-        let saved = root.read_private_regular(name, MAX_INTEGRATION_RPC_BYTES as u64)?;
-        let binding: DashboardRedriveBinding =
-            serde_json::from_slice(&saved).map_err(|_| invalid())?;
-        binding.request.validate()?;
-        if binding.request.task_id != task
-            || name != format!("dashboard-redrive-{}.json", binding.request.request_id)
-            || serde_json::to_vec(&binding).map_err(|_| invalid())? != saved
+        let (saved_request, saved, completed_at) = if dashboard_replay_name(&raw).is_some() {
+            let saved = root.read_private_regular(name, MAX_INTEGRATION_RPC_BYTES as u64)?;
+            let binding: DashboardRedriveBinding =
+                serde_json::from_slice(&saved).map_err(|_| invalid())?;
+            if name != format!("dashboard-redrive-{}.json", binding.request.request_id)
+                || serde_json::to_vec(&binding).map_err(|_| invalid())? != saved
+            {
+                return Err(invalid());
+            }
+            let completed_at = binding
+                .result
+                .as_ref()
+                .map(|_| binding.completed_at_millis.unwrap_or(0));
+            (binding.request, saved, completed_at)
+        } else {
+            let saved = root.read_private_regular(name, MAX_PRIVATE_RECORD_BYTES as u64)?;
+            let binding: RedriveBinding = serde_json::from_slice(&saved).map_err(|_| invalid())?;
+            if name != format!("redrive-{}.json", binding.request.request_id)
+                || serde_json::to_vec(&binding).map_err(|_| invalid())? != saved
+            {
+                return Err(invalid());
+            }
+            let completed_at = binding
+                .result
+                .as_ref()
+                .map(|_| binding.completed_at_millis.unwrap_or(0));
+            (binding.request, saved, completed_at)
+        };
+        saved_request.validate()?;
+        if saved_request.task_id != request.task_id
             || root.private_entry_identity(name)? != identity
         {
             return Err(invalid());
         }
         count = count.saturating_add(1);
         total = total.saturating_add(saved.len());
-        if binding.result.is_some() {
-            // Completed pre-quota rows have no saved clock; treat them as the
-            // oldest cache entries rather than giving them an infinite life.
+        if let Some(completed_at) = completed_at {
             completed.push((
-                binding.completed_at_millis.unwrap_or(0),
+                completed_at,
                 name.to_owned(),
                 identity,
                 saved.len(),
-                binding.request.request_id,
+                saved_request.request_id,
             ));
+        } else {
+            // A completed native receipt can still be needed by its pending
+            // dashboard partner after a crash, and vice versa.
+            protected.insert(saved_request.request_id);
         }
     }
+    completed.retain(|row| !protected.contains(&row.4));
     completed.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
     let mut evict = Vec::new();
     for row in completed {
-        let expired = now.saturating_sub(row.0) > DASHBOARD_REPLAY_LIFETIME_MILLIS;
-        if expired || count > MAX_DASHBOARD_REPLAY_BINDINGS || total > MAX_DASHBOARD_REPLAY_BYTES {
+        let expired = now.saturating_sub(row.0) > REPLAY_LIFETIME_MILLIS;
+        if expired || count > MAX_REPLAY_BINDINGS || total > MAX_REPLAY_BYTES {
             count -= 1;
             total -= row.3;
             evict.push(row);
         }
     }
-    if count > MAX_DASHBOARD_REPLAY_BINDINGS || total > MAX_DASHBOARD_REPLAY_BYTES {
+    if count > MAX_REPLAY_BINDINGS || total > MAX_REPLAY_BYTES {
         return Err(replay_busy());
     }
-    if !evict.is_empty() {
-        let _native = private_lock(root, "redrive.lock", true)?.ok_or_else(replay_busy)?;
-        for (_, name, identity, _, request_id) in evict {
-            // Retire a paired completed native result too, so expired or
-            // evicted dashboard requests cannot accumulate hidden receipts.
-            let native_name = format!("redrive-{request_id}.json");
-            if let Some(bytes) = read(root, &native_name)? {
-                let native: RedriveBinding =
-                    serde_json::from_slice(&bytes).map_err(|_| invalid())?;
-                if native.result.is_some() {
-                    root.remove_owned_regular(&native_name)?;
-                }
-            }
-            root.channel_unlink_exact(&name, identity)?;
-        }
+    for (_, name, identity, _, _) in evict {
+        root.channel_unlink_exact(&name, identity)?;
     }
     Ok(())
 }
@@ -972,6 +1041,8 @@ struct RedriveBinding {
     intent: IntegrationId,
     epoch: u32,
     result: Option<IntegrationSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completed_at_millis: Option<u64>,
 }
 fn invalid() -> WorkerError {
     IntegrationCode::IntegrationStateInvalid.error()
@@ -1509,6 +1580,7 @@ pub(crate) mod native_launch_tests {
             intent: record.snapshot.integration_id,
             epoch: 0,
             result: None,
+            completed_at_millis: None,
         };
         let task_root = task_root(&paths, record.task_id).unwrap();
         write(

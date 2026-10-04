@@ -92,11 +92,13 @@ pub trait DashboardIntegrationSource: Send + Sync + 'static {
         &self,
         _request: &crate::integration::contracts::IntegrationRedriveRequest,
         _body: &serde_json::Value,
-        validate: &mut dyn FnMut() -> Result<(), WorkerError>,
-        execute: &mut dyn FnMut() -> Result<serde_json::Value, WorkerError>,
+        validate: &mut dyn FnMut() -> Result<bool, WorkerError>,
+        execute: &mut dyn FnMut(
+            &crate::integration::runner::ReplayRedrive<'_>,
+        ) -> Result<serde_json::Value, WorkerError>,
     ) -> Result<serde_json::Value, WorkerError> {
         validate()?;
-        execute()
+        execute(&|request| self.redrive(request))
     }
     fn redrive(
         &self,
@@ -242,8 +244,10 @@ impl DashboardIntegrationSource for NativeDashboardIntegrations {
         &self,
         request: &crate::integration::contracts::IntegrationRedriveRequest,
         body: &serde_json::Value,
-        validate: &mut dyn FnMut() -> Result<(), WorkerError>,
-        execute: &mut dyn FnMut() -> Result<serde_json::Value, WorkerError>,
+        validate: &mut dyn FnMut() -> Result<bool, WorkerError>,
+        execute: &mut dyn FnMut(
+            &crate::integration::runner::ReplayRedrive<'_>,
+        ) -> Result<serde_json::Value, WorkerError>,
     ) -> Result<serde_json::Value, WorkerError> {
         if crate::integration::store::RootedIntegrationState::read_task(
             &self.paths,
@@ -931,6 +935,7 @@ impl MacWorkerTaskMutationSource {
         task_id: TaskId,
         request: &TaskIntegrationRequest,
         previous: Option<&crate::integration::contracts::IntegrationSnapshot>,
+        redrive: Option<&crate::integration::runner::ReplayRedrive<'_>>,
     ) -> Result<TaskDetailProjection, ApiError> {
         use crate::integration::contracts::{IntegrationStatus, ValidateIntegration};
         let source = self.integrations.as_ref().ok_or_else(|| {
@@ -940,9 +945,11 @@ impl MacWorkerTaskMutationSource {
             )
         })?;
         if previous.is_none_or(|snapshot| snapshot.state != IntegrationStatus::Integrated) {
-            let next = source
-                .redrive(&request.integration)
-                .map_err(map_mutation_error)?;
+            let next = match redrive {
+                Some(redrive) => redrive(&request.integration),
+                None => source.redrive(&request.integration),
+            }
+            .map_err(map_mutation_error)?;
             next.validate().map_err(map_mutation_error)?;
             // A pending native replay can recover an already-Integrated no-op
             // whose validated receipt/result was saved at the same revision.
@@ -970,7 +977,7 @@ impl DashboardTaskMutationSource for MacWorkerTaskMutationSource {
         request: &TaskIntegrationRequest,
     ) -> Result<TaskDetailProjection, ApiError> {
         let snapshot = self.validate_integration_request(task_id, request)?;
-        self.drive_integration_request(task_id, request, Some(&snapshot))
+        self.drive_integration_request(task_id, request, Some(&snapshot), None)
     }
 
     fn integrate_response(
@@ -1005,11 +1012,18 @@ impl DashboardTaskMutationSource for MacWorkerTaskMutationSource {
                             .error()
                     })?,
             );
-            Ok(())
+            Ok(checked.borrow().as_ref().is_some_and(|snapshot| {
+                snapshot.state != crate::integration::contracts::IntegrationStatus::Integrated
+            }))
         };
-        let mut execute = || {
+        let mut execute = |redrive: &crate::integration::runner::ReplayRedrive<'_>| {
             let detail = self
-                .drive_integration_request(task_id, request, checked.borrow().as_ref())
+                .drive_integration_request(
+                    task_id,
+                    request,
+                    checked.borrow().as_ref(),
+                    Some(redrive),
+                )
                 .map_err(|error| {
                     *api_failure.borrow_mut() = Some(error);
                     crate::integration::contracts::IntegrationCode::IntegrationStateInvalid.error()
@@ -1425,8 +1439,8 @@ mod replay_tests {
     ) -> Result<serde_json::Value, WorkerError> {
         let source = f.native();
         let owner = source.owner().unwrap();
-        let mut validate = || Ok(());
-        let mut execute = || {
+        let mut validate = || Ok(false);
+        let mut execute = |_: &crate::integration::runner::ReplayRedrive<'_>| {
             if pending {
                 Err(IntegrationCode::IntegrationNetwork.error())
             } else {
@@ -1678,5 +1692,334 @@ mod replay_tests {
             .remove_task_submission_record(fixture_task())
             .unwrap();
         assert!(storage_rows(&f).is_empty());
+    }
+
+    fn native_storage_name(ordinal: u128) -> String {
+        format!("redrive-{}.json", uuid::Uuid::from_u128(ordinal).simple())
+    }
+
+    fn combined_storage_rows(f: &Fixture) -> std::collections::BTreeMap<String, Vec<u8>> {
+        let root = f
+            .paths
+            .state
+            .join(format!("integrations/tasks/{}", fixture_task()));
+        std::fs::read_dir(root)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.ends_with(".json")
+                    && (name.starts_with("dashboard-redrive-") || name.starts_with("redrive-"))
+            })
+            .map(|entry| {
+                (
+                    entry.file_name().into_string().unwrap(),
+                    std::fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn seed_native_pending(f: &Fixture, ordinal: u128) {
+        #[derive(serde::Serialize)]
+        struct Pending {
+            request: IntegrationRedriveRequest,
+            intent: IntegrationId,
+            epoch: u32,
+            result: Option<IntegrationSnapshot>,
+        }
+        let snapshot = f.state.load(fixture_task()).unwrap().unwrap().snapshot;
+        let bytes = serde_json::to_vec(&Pending {
+            request: storage_request(f, ordinal),
+            intent: snapshot.integration_id,
+            epoch: snapshot.epoch,
+            result: None,
+        })
+        .unwrap();
+        let path = f
+            .paths
+            .state
+            .join(format!("integrations/tasks/{}", fixture_task()));
+        crate::rooted_fs::RootedDir::open_anchored_absolute(&path)
+            .unwrap()
+            .write_private_atomic_no_replace(&native_storage_name(ordinal), &bytes)
+            .unwrap();
+    }
+
+    #[test]
+    fn review_r2_measure_both_replay_binding_families() {
+        let f = Fixture::new();
+        let mutation = f.mutation();
+        let original = f.state.load(fixture_task()).unwrap();
+        let root = f
+            .paths
+            .state
+            .join(format!("integrations/tasks/{}", fixture_task()));
+        for ordinal in 1..=32 {
+            let mut request = f.request.clone();
+            request.integration = storage_request(&f, ordinal);
+            let first = mutation
+                .integrate_response(fixture_task(), &request)
+                .unwrap();
+            let path = root.join(storage_name(ordinal));
+            let mut binding: ProbeBinding =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            binding.result = None;
+            std::fs::write(&path, serde_json::to_vec(&binding).unwrap()).unwrap();
+            assert_eq!(
+                mutation
+                    .integrate_response(fixture_task(), &request)
+                    .unwrap(),
+                first
+            );
+            let rows = combined_storage_rows(&f);
+            assert!(
+                rows.len() <= 32,
+                "the replay budget covers both families together"
+            );
+            assert!(rows.values().map(Vec::len).sum::<usize>() <= 262_144);
+            assert!(rows.contains_key(&storage_name(ordinal)));
+            assert!(rows.contains_key(&native_storage_name(ordinal)));
+        }
+        assert_eq!(f.state.load(fixture_task()).unwrap(), original);
+    }
+
+    #[test]
+    fn review_r2_native_only_replays_obey_the_shared_file_budget() {
+        let f = Fixture::new();
+        let original = f.state.load(fixture_task()).unwrap();
+        for ordinal in 1..=64 {
+            let result = f.native().redrive(&storage_request(&f, ordinal)).unwrap();
+            assert_eq!(
+                f.native().redrive(&storage_request(&f, ordinal)).unwrap(),
+                result
+            );
+            let rows = combined_storage_rows(&f);
+            assert!(
+                rows.len() <= 32,
+                "native requests share the per-task replay budget"
+            );
+            assert!(rows.values().map(Vec::len).sum::<usize>() <= 262_144);
+        }
+        assert_eq!(f.state.load(fixture_task()).unwrap(), original);
+    }
+
+    #[test]
+    fn shared_replay_native_only_expiry_uses_injected_completion_time() {
+        let f = Fixture::new();
+        f.native().redrive(&storage_request(&f, 1)).unwrap();
+        seed_native_pending(&f, 2);
+        let before = combined_storage_rows(&f);
+        let saved: serde_json::Value =
+            serde_json::from_slice(&before[&native_storage_name(1)]).unwrap();
+        assert_eq!(saved["completed_at_millis"], 1_000);
+        f.now.store(86_401_000, std::sync::atomic::Ordering::SeqCst);
+        f.native().redrive(&storage_request(&f, 3)).unwrap();
+        assert!(combined_storage_rows(&f).contains_key(&native_storage_name(1)));
+        f.now.store(86_401_001, std::sync::atomic::Ordering::SeqCst);
+        storage_write(&f, 4, false, 0).unwrap();
+        let rows = combined_storage_rows(&f);
+        assert!(!rows.contains_key(&native_storage_name(1)));
+        assert_eq!(
+            rows[&native_storage_name(2)],
+            before[&native_storage_name(2)]
+        );
+        assert!(rows.contains_key(&native_storage_name(3)));
+    }
+
+    #[test]
+    fn shared_replay_pending_count_refuses_both_writers_without_publication() {
+        let f = Fixture::new();
+        for ordinal in 1..=16 {
+            seed_native_pending(&f, ordinal);
+        }
+        for ordinal in 17..=32 {
+            assert!(storage_write(&f, ordinal, true, 0).is_err());
+        }
+        let before = combined_storage_rows(&f);
+        assert_eq!(before.len(), 32);
+        let original = f.state.load(fixture_task()).unwrap();
+        assert_eq!(
+            f.native()
+                .redrive(&storage_request(&f, 33))
+                .unwrap_err()
+                .public_code(),
+            "TASK_BUSY"
+        );
+        assert_eq!(
+            storage_write(&f, 34, false, 0).unwrap_err().public_code(),
+            "TASK_BUSY"
+        );
+        assert_eq!(combined_storage_rows(&f), before);
+        assert_eq!(f.state.load(fixture_task()).unwrap(), original);
+    }
+
+    #[test]
+    fn shared_replay_pending_bytes_refuse_native_publication() {
+        let f = Fixture::new();
+        seed_native_pending(&f, 1);
+        let native = combined_storage_rows(&f)[&native_storage_name(1)].len();
+        let calibration = Fixture::new();
+        assert!(storage_write(&calibration, 2, true, 0).is_err());
+        let overhead = storage_rows(&calibration)[&storage_name(2)].len();
+        assert!(storage_write(&f, 2, true, 262_144 - native - overhead).is_err());
+        let before = combined_storage_rows(&f);
+        assert_eq!(before.values().map(Vec::len).sum::<usize>(), 262_144);
+        let original = f.state.load(fixture_task()).unwrap();
+        assert_eq!(
+            f.native()
+                .redrive(&storage_request(&f, 3))
+                .unwrap_err()
+                .public_code(),
+            "TASK_BUSY"
+        );
+        assert_eq!(combined_storage_rows(&f), before);
+        assert_eq!(f.state.load(fixture_task()).unwrap(), original);
+    }
+
+    #[test]
+    fn shared_replay_byte_eviction_can_retire_an_old_completed_native_row() {
+        let f = Fixture::new();
+        f.native().redrive(&storage_request(&f, 1)).unwrap();
+        let native = combined_storage_rows(&f)[&native_storage_name(1)].len();
+        let calibration = Fixture::new();
+        assert!(storage_write(&calibration, 2, true, 0).is_err());
+        let overhead = storage_rows(&calibration)[&storage_name(2)].len();
+        assert!(storage_write(&f, 2, true, 262_144 - native - overhead).is_err());
+        let before = combined_storage_rows(&f);
+        assert_eq!(before.values().map(Vec::len).sum::<usize>(), 262_144);
+        storage_write(&f, 3, false, 0).unwrap();
+        let rows = combined_storage_rows(&f);
+        assert!(!rows.contains_key(&native_storage_name(1)));
+        assert_eq!(rows[&storage_name(2)], before[&storage_name(2)]);
+        assert!(rows.values().map(Vec::len).sum::<usize>() <= 262_144);
+    }
+
+    #[test]
+    fn shared_replay_paired_admission_refuses_before_either_publication() {
+        let f = Fixture::new();
+        for ordinal in 1..=16 {
+            seed_native_pending(&f, ordinal);
+        }
+        for ordinal in 17..=31 {
+            assert!(storage_write(&f, ordinal, true, 0).is_err());
+        }
+        let before = combined_storage_rows(&f);
+        assert_eq!(before.len(), 31);
+        let original = f.state.load(fixture_task()).unwrap();
+        let request = storage_request(&f, 32);
+        let owner = f.native();
+        let owner = owner.owner().unwrap();
+        let mut executions = 0;
+        let mut validate = || Ok(true);
+        let mut execute = |redrive: &crate::integration::runner::ReplayRedrive<'_>| {
+            executions += 1;
+            redrive(&request)?;
+            Ok(serde_json::json!({"accepted": true}))
+        };
+        let error = owner
+            .dashboard_redrive(
+                &request,
+                &serde_json::json!({}),
+                &mut validate,
+                &mut execute,
+            )
+            .unwrap_err();
+        assert_eq!(error.public_code(), "TASK_BUSY");
+        assert_eq!(executions, 0);
+        assert_eq!(combined_storage_rows(&f), before);
+        assert_eq!(f.state.load(fixture_task()).unwrap(), original);
+    }
+
+    #[test]
+    fn shared_replay_concurrent_native_and_dashboard_publication_refuses_without_waiting() {
+        let f = Fixture::new();
+        for ordinal in 1..=15 {
+            seed_native_pending(&f, ordinal);
+        }
+        for ordinal in 16..=30 {
+            assert!(storage_write(&f, ordinal, true, 0).is_err());
+        }
+        let before = combined_storage_rows(&f);
+        let original = f.state.load(fixture_task()).unwrap();
+        std::thread::scope(|scope| {
+            let f = &f;
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let dashboard = scope.spawn(move || {
+                let source = f.native();
+                let owner = source.owner().unwrap();
+                let mut validate = || Ok(false);
+                let mut execute = |_: &crate::integration::runner::ReplayRedrive<'_>| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(serde_json::json!({"accepted": true}))
+                };
+                owner.dashboard_redrive(
+                    &storage_request(f, 31),
+                    &serde_json::json!({}),
+                    &mut validate,
+                    &mut execute,
+                )
+            });
+            entered_rx.recv().unwrap();
+            let native = f.native().redrive(&storage_request(f, 32));
+            release_tx.send(()).unwrap();
+            dashboard.join().unwrap().unwrap();
+            assert_eq!(native.unwrap_err().public_code(), "TASK_BUSY");
+        });
+        let rows = combined_storage_rows(&f);
+        assert!(rows.len() <= 32);
+        for (name, bytes) in before {
+            assert_eq!(rows[&name], bytes);
+        }
+        assert_eq!(f.state.load(fixture_task()).unwrap(), original);
+    }
+
+    #[test]
+    fn shared_replay_both_writers_refuse_either_live_family_lock() {
+        use std::os::fd::AsRawFd;
+        for name in ["dashboard-redrive.lock", "redrive.lock"] {
+            let f = Fixture::new();
+            let path = f
+                .paths
+                .state
+                .join(format!("integrations/tasks/{}", fixture_task()));
+            let root = crate::rooted_fs::RootedDir::open_anchored_absolute(&path).unwrap();
+            let lock = root.open_private_lock(name).unwrap();
+            assert_eq!(
+                unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            let before = combined_storage_rows(&f);
+            let original = f.state.load(fixture_task()).unwrap();
+            let native = f.native().redrive(&storage_request(&f, 1));
+            let dashboard = storage_write(&f, 2, false, 0);
+            assert_eq!(native.unwrap_err().public_code(), "TASK_BUSY", "{name}");
+            assert_eq!(dashboard.unwrap_err().public_code(), "TASK_BUSY", "{name}");
+            assert_eq!(combined_storage_rows(&f), before);
+            assert_eq!(f.state.load(fixture_task()).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn shared_replay_pending_partners_protect_completed_rows_in_both_families() {
+        let f = Fixture::new();
+        assert!(storage_write(&f, 1, true, 0).is_err());
+        f.native().redrive(&storage_request(&f, 1)).unwrap();
+        seed_native_pending(&f, 2);
+        storage_write(&f, 2, false, 0).unwrap();
+        let before = combined_storage_rows(&f);
+        assert_eq!(before.len(), 4);
+        f.now.store(86_401_001, std::sync::atomic::Ordering::SeqCst);
+        f.native().redrive(&storage_request(&f, 3)).unwrap();
+        storage_write(&f, 4, false, 0).unwrap();
+        let rows = combined_storage_rows(&f);
+        for (name, bytes) in before {
+            assert_eq!(rows[&name], bytes);
+        }
+        assert!(rows.len() <= 32);
+        assert!(rows.values().map(Vec::len).sum::<usize>() <= 262_144);
     }
 }
