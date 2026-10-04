@@ -510,6 +510,8 @@ impl<'a> OwnerIntegration<'a> {
         validate: &mut dyn FnMut() -> Result<bool, WorkerError>,
         execute: &mut dyn FnMut(&ReplayRedrive<'_>) -> Result<serde_json::Value, WorkerError>,
     ) -> Result<serde_json::Value, WorkerError> {
+        // Nested hints must flush after the replay file descriptors drop.
+        let _hints = self.ports.client.event_scope();
         request.validate()?;
         let root = task_root(self.ports.paths, request.task_id)?;
         let _replay = replay_locks(&root)?;
@@ -604,6 +606,8 @@ impl<'a> OwnerIntegration<'a> {
         &self,
         request: &IntegrationRedriveRequest,
     ) -> Result<IntegrationSnapshot, WorkerError> {
+        // Nested hints must flush after the replay file descriptors drop.
+        let _hints = self.ports.client.event_scope();
         request.validate()?;
         let root = task_root(self.ports.paths, request.task_id)?;
         let _replay = replay_locks(&root)?;
@@ -1397,12 +1401,38 @@ impl<'a> IntegrationRunner<'a> {
 pub(crate) mod native_launch_tests {
     use super::*;
     use crate::{
+        controller::events::{EventBatch, EventSink, NewEvent, PublishAttempt},
         integration::testing::*,
         job::{CommandSpec, QueueEntry, QueueEntryKind},
         scheduler::WorkerPreference,
         task::RunnerIdentity,
     };
-    use std::sync::atomic::AtomicU64;
+    use std::sync::{Mutex, atomic::AtomicU64};
+
+    struct ReplayFenceSink {
+        path: std::path::PathBuf,
+        observations: Mutex<Vec<(EventBatch, Vec<&'static str>)>>,
+    }
+
+    impl EventSink for ReplayFenceSink {
+        fn try_publish(&self, batch: EventBatch) -> PublishAttempt {
+            let mut held = Vec::new();
+            if self.path.exists() {
+                let root = RootedDir::open_anchored_absolute(&self.path).unwrap();
+                for name in [
+                    "replay-quota.lock",
+                    "dashboard-redrive.lock",
+                    "redrive.lock",
+                ] {
+                    if private_lock(&root, name, true).unwrap().is_none() {
+                        held.push(name);
+                    }
+                }
+            }
+            self.observations.lock().unwrap().push((batch, held));
+            PublishAttempt::Queued
+        }
+    }
 
     struct NeverSpawn;
     impl RunnerExecutor for NeverSpawn {
@@ -1528,9 +1558,26 @@ pub(crate) mod native_launch_tests {
 
     #[test]
     fn native_redrive_recovers_the_published_epoch_without_advancing_again() {
+        redrive_crash_recovery_case(false);
+    }
+
+    #[test]
+    fn dashboard_redrive_recovers_the_published_epoch_and_releases_hints_after_replay_fences() {
+        redrive_crash_recovery_case(true);
+    }
+
+    fn redrive_crash_recovery_case(dashboard: bool) {
         let root = tempfile::tempdir().unwrap();
         let paths = paths(&root.path().canonicalize().unwrap());
-        let client = ClientStateStore::open(&paths.state).unwrap();
+        let sink = Arc::new(ReplayFenceSink {
+            path: paths
+                .state
+                .join(format!("integrations/tasks/{}", fixture_task())),
+            observations: Mutex::new(Vec::new()),
+        });
+        let client = ClientStateStore::open(&paths.state)
+            .unwrap()
+            .with_event_sink(sink.clone());
         client
             .create_task(sample_ordinary(fixture_task(), fixture_source()))
             .unwrap();
@@ -1590,7 +1637,21 @@ pub(crate) mod native_launch_tests {
             true,
         )
         .unwrap();
-        let recovered = owner.redrive(&request).unwrap();
+        let recover = || -> Result<IntegrationSnapshot, WorkerError> {
+            if dashboard {
+                let result = owner.dashboard_redrive(
+                    &request,
+                    &serde_json::json!({"integration": &request}),
+                    &mut || Ok(true),
+                    &mut |native| Ok(serde_json::to_value(native(&request)?).unwrap()),
+                )?;
+                Ok(serde_json::from_value(result).unwrap())
+            } else {
+                owner.redrive(&request)
+            }
+        };
+        sink.observations.lock().unwrap().clear();
+        let recovered = recover().unwrap();
         assert_eq!(recovered.epoch, 1);
         assert_eq!(recovered.integration_id, record.snapshot.integration_id);
         assert_eq!(
@@ -1603,7 +1664,7 @@ pub(crate) mod native_launch_tests {
                 .state,
             IntegrationStatus::Parked
         );
-        assert_eq!(owner.redrive(&request).unwrap(), recovered);
+        assert_eq!(recover().unwrap(), recovered);
         assert_eq!(
             owner
                 .state
@@ -1615,6 +1676,25 @@ pub(crate) mod native_launch_tests {
             1
         );
         assert!(client.queue_snapshot().unwrap().entries().is_empty());
+        let observations = sink.observations.lock().unwrap();
+        assert!(
+            !observations.is_empty(),
+            "the real native transition must produce a hint"
+        );
+        assert!(observations.iter().any(|(batch, _)| {
+            batch
+                .events()
+                .iter()
+                .any(|event| matches!(event, NewEvent::IntegrationChanged { .. }))
+        }));
+        let held: Vec<_> = observations
+            .iter()
+            .flat_map(|(_, held)| held.iter())
+            .collect();
+        assert!(
+            held.is_empty(),
+            "hint publication must occur after replay fences are released: {held:?}"
+        );
     }
 
     #[test]
