@@ -199,6 +199,7 @@ fn integration_fixture(capable: bool) -> super::session_import_e2e::Fixture {
             "probe['features'].append('task.integration')\n    probe.update(memory_pressure",
         );
         std::fs::write(&f.ssh, ssh).unwrap();
+        super::session_import_e2e::warm_executable(&f.ssh);
     }
     f
 }
@@ -1454,6 +1455,7 @@ fn a_brief_helper_rollback_parks_and_restores_the_same_open_source_cycle() {
         journal_before.matches("host task-integration\n").count()
     );
     std::fs::write(&f.ssh, ssh).unwrap();
+    super::session_import_e2e::warm_executable(&f.ssh);
     let restored = wait_integrated(&f, task);
     assert_eq!(
         restored.snapshot.integration_id,
@@ -1533,13 +1535,14 @@ fn native_dag_uses_the_imported_parent_merge_for_its_configured_child() {
     let f = integration_fixture(true);
     let agent = f.host.join("bin/codex");
     std::fs::write(&agent, r#"#!/bin/sh
-case "$1" in --version) printf '0.160.0\n'; exit 0;; auth|login) printf '{"loggedIn":true}\n'; exit 0;; esac
+case "$1" in --fixture-warm) exit 0;; --version) printf '0.160.0\n'; exit 0;; auth|login) printf '{"loggedIn":true}\n'; exit 0;; esac
 printf '%s\n' "$@" >> "$HOME/dag-agent-argv"
 printf 'fixture task result\n' >> dag-result
 printf '%s\n' '{"type":"thread.started","thread_id":"00000000-0000-0000-0000-000000000031"}' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"status\":\"done\",\"summary\":\"dag work done\",\"questions\":[],\"files_changed\":[],\"checks\":[]}"}}'
 "#).unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    super::session_import_e2e::warm_executable(&agent);
     std::fs::write(
         f.project.root().join(".worker.toml"),
         "[task]\nintegrate = 'main'\n",
@@ -1643,6 +1646,7 @@ fn native_mismatched_from_parent_policy_refuses_before_capture_or_admission() {
 fn refuse_integration_transport(f: &super::session_import_e2e::Fixture) -> String {
     let original = std::fs::read_to_string(&f.ssh).unwrap();
     std::fs::write(&f.ssh, original.replace("os.execv('/bin/sh', ['/bin/sh', '-c', command])", "if command.endswith(' host task-integration'):\n    sys.stdin.buffer.read()\n    sys.exit(255)\nos.execv('/bin/sh', ['/bin/sh', '-c', command])")).unwrap();
+    super::session_import_e2e::warm_executable(&f.ssh);
     original
 }
 
@@ -1687,6 +1691,7 @@ fn native_offline_cancel_close_and_discard_remain_unconfirmed_until_revoke_proof
         );
     }
     std::fs::write(&f.ssh, original_ssh).unwrap();
+    super::session_import_e2e::warm_executable(&f.ssh);
     assert!(
         f.worker(&["--json", "task", "cancel", &task.to_string()])
             .status
@@ -1753,6 +1758,7 @@ fn native_interrupted_say_waits_for_revoke_then_queues_one_ordinary_turn() {
     assert_eq!(tasks.load_task(task).unwrap().status().turns().len(), 1);
     assert!(tasks.queue_snapshot().unwrap().entries().is_empty());
     std::fs::write(&f.ssh, original_ssh).unwrap();
+    super::session_import_e2e::warm_executable(&f.ssh);
     let queued = say();
     assert!(
         queued.status.success(),
@@ -1938,6 +1944,7 @@ os.execv('/bin/sh', ['/bin/sh', '-c', command])"#,
         &interception,
     );
     std::fs::write(&f.ssh, ssh).unwrap();
+    super::session_import_e2e::warm_executable(&f.ssh);
     let task = submitted_task(&f.worker(&[
         "--json",
         "task",

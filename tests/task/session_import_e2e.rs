@@ -30,9 +30,27 @@ pub(super) struct Fixture {
     pub(super) config: PathBuf,
 }
 
+pub(super) fn warm_executable(path: &Path) {
+    // Pay first-exec assessment outside the helper's bounded probe.
+    assert!(
+        Command::new(path)
+            .arg("--fixture-warm")
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
 fn executable(path: &Path, content: &str) {
-    fs::write(path, content).unwrap();
+    let (header, body) = content.split_once('\n').unwrap();
+    let warm = match header {
+        "#!/usr/bin/python3" => "import sys\nif sys.argv[1:] == ['--fixture-warm']: sys.exit(0)\n",
+        "#!/bin/sh" => "[ \"$1\" = --fixture-warm ] && exit 0\n",
+        _ => panic!("unsupported fixture interpreter"),
+    };
+    fs::write(path, format!("{header}\n{warm}{body}")).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    warm_executable(path);
 }
 
 impl Fixture {
