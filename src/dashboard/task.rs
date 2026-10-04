@@ -1238,6 +1238,7 @@ mod replay_tests {
         config: Arc<Config>,
         state: RootedIntegrationState,
         request: TaskIntegrationRequest,
+        now: Arc<std::sync::atomic::AtomicU64>,
     }
     impl Fixture {
         fn new() -> Self {
@@ -1249,7 +1250,15 @@ mod replay_tests {
                 cache: root.join("cache"),
                 data: root.join("data"),
             };
-            let client = Arc::new(ClientStateStore::open(&paths.state).unwrap());
+            let now = Arc::new(std::sync::atomic::AtomicU64::new(1_000));
+            let clock = now.clone();
+            let client = Arc::new(
+                ClientStateStore::open(&paths.state)
+                    .unwrap()
+                    .with_admission_clock(Arc::new(move || {
+                        Ok(clock.load(std::sync::atomic::Ordering::SeqCst))
+                    })),
+            );
             let ordinary = sample_ordinary(fixture_task(), fixture_source());
             client.create_task(ordinary.clone()).unwrap();
             let state =
@@ -1298,6 +1307,7 @@ mod replay_tests {
                 config: Arc::new(Config::parse("version = 1\n").unwrap()),
                 state,
                 request,
+                now,
             }
         }
         fn native(&self) -> Arc<NativeDashboardIntegrations> {
@@ -1372,5 +1382,301 @@ mod replay_tests {
             "TASK_REVISION_CONFLICT"
         );
         assert_eq!(f.state.load(fixture_task()).unwrap().unwrap(), original);
+    }
+    fn storage_request(f: &Fixture, ordinal: u128) -> IntegrationRedriveRequest {
+        let mut request = f.request.integration.clone();
+        request.request_id = uuid::Uuid::from_u128(ordinal).simple().to_string();
+        request
+    }
+    fn storage_name(ordinal: u128) -> String {
+        format!(
+            "dashboard-redrive-{}.json",
+            uuid::Uuid::from_u128(ordinal).simple()
+        )
+    }
+    fn storage_rows(f: &Fixture) -> std::collections::BTreeMap<String, Vec<u8>> {
+        let root = f
+            .paths
+            .state
+            .join(format!("integrations/tasks/{}", fixture_task()));
+        std::fs::read_dir(root)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("dashboard-redrive-")
+                    && entry.path().extension().is_some_and(|ext| ext == "json")
+            })
+            .map(|entry| {
+                (
+                    entry.file_name().into_string().unwrap(),
+                    std::fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect()
+    }
+    fn storage_write(
+        f: &Fixture,
+        ordinal: u128,
+        pending: bool,
+        padding: usize,
+    ) -> Result<serde_json::Value, WorkerError> {
+        let source = f.native();
+        let owner = source.owner().unwrap();
+        let mut validate = || Ok(());
+        let mut execute = || {
+            if pending {
+                Err(IntegrationCode::IntegrationNetwork.error())
+            } else {
+                Ok(serde_json::json!({"accepted": ordinal}))
+            }
+        };
+        owner.dashboard_redrive(
+            &storage_request(f, ordinal),
+            &serde_json::json!({"padding": "x".repeat(padding)}),
+            &mut validate,
+            &mut execute,
+        )
+    }
+
+    #[test]
+    fn dashboard_replay_evicts_oldest_completed_without_evicting_pending() {
+        let f = Fixture::new();
+        assert!(storage_write(&f, 1, true, 0).is_err());
+        let pending = storage_rows(&f)[&storage_name(1)].clone();
+        for ordinal in 2..=32 {
+            f.now
+                .store(1_000 + ordinal as u64, std::sync::atomic::Ordering::SeqCst);
+            storage_write(&f, ordinal, false, 0).unwrap();
+        }
+        storage_write(&f, 33, false, 0).unwrap();
+        let rows = storage_rows(&f);
+        assert_eq!(rows.len(), 32);
+        assert_eq!(rows[&storage_name(1)], pending);
+        assert!(!rows.contains_key(&storage_name(2)));
+        assert!(rows.contains_key(&storage_name(3)));
+        assert!(rows.contains_key(&storage_name(33)));
+    }
+
+    #[test]
+    fn dashboard_replay_refuses_at_a_pending_count_budget_without_publication() {
+        let f = Fixture::new();
+        for ordinal in 1..=32 {
+            assert!(storage_write(&f, ordinal, true, 0).is_err());
+        }
+        let before = storage_rows(&f);
+        let original = f.state.load(fixture_task()).unwrap();
+        assert_eq!(
+            storage_write(&f, 33, false, 0).unwrap_err().public_code(),
+            "TASK_BUSY"
+        );
+        assert_eq!(storage_rows(&f), before);
+        assert_eq!(f.state.load(fixture_task()).unwrap(), original);
+    }
+
+    #[test]
+    fn dashboard_replay_evicts_completed_to_keep_total_bytes_bounded() {
+        let f = Fixture::new();
+        for ordinal in 1..=4 {
+            f.now
+                .store(1_000 + ordinal as u64, std::sync::atomic::Ordering::SeqCst);
+            storage_write(&f, ordinal, false, 80_000).unwrap();
+        }
+        let rows = storage_rows(&f);
+        assert!(rows.values().map(Vec::len).sum::<usize>() <= 262_144);
+        assert_eq!(rows.len(), 3);
+        assert!(!rows.contains_key(&storage_name(1)));
+    }
+
+    #[test]
+    fn dashboard_replay_refuses_when_pending_bytes_fill_the_budget() {
+        let f = Fixture::new();
+        for ordinal in 1..=2 {
+            assert!(storage_write(&f, ordinal, true, 130_000).is_err());
+        }
+        let before = storage_rows(&f);
+        assert_eq!(
+            storage_write(&f, 3, false, 4_096)
+                .unwrap_err()
+                .public_code(),
+            "TASK_BUSY"
+        );
+        assert_eq!(storage_rows(&f), before);
+    }
+
+    #[test]
+    fn dashboard_replay_prunes_after_24_hours_using_injected_time() {
+        let f = Fixture::new();
+        storage_write(&f, 1, false, 0).unwrap();
+        assert!(storage_write(&f, 2, true, 0).is_err());
+        let pending = storage_rows(&f)[&storage_name(2)].clone();
+        f.now.store(86_401_000, std::sync::atomic::Ordering::SeqCst);
+        storage_write(&f, 3, false, 0).unwrap();
+        assert!(
+            storage_rows(&f).contains_key(&storage_name(1)),
+            "the 24-hour boundary is still supported"
+        );
+        f.now.store(86_401_001, std::sync::atomic::Ordering::SeqCst);
+        storage_write(&f, 4, false, 0).unwrap();
+        let rows = storage_rows(&f);
+        assert!(!rows.contains_key(&storage_name(1)));
+        assert_eq!(rows[&storage_name(2)], pending);
+        assert!(rows.contains_key(&storage_name(3)));
+    }
+
+    #[test]
+    fn dashboard_replay_bindings_are_removed_with_the_owner_record() {
+        let f = Fixture::new();
+        storage_write(&f, 1, false, 0).unwrap();
+        assert!(storage_write(&f, 2, true, 0).is_err());
+        let before = f.client.load_task(fixture_task()).unwrap();
+        let mut wire = serde_json::to_value(before.status()).unwrap();
+        wire["state"] = "closed".into();
+        f.client
+            .update_task_if_current(
+                &before,
+                before
+                    .clone()
+                    .with_status(serde_json::from_value(wire).unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(storage_rows(&f).len(), 2, "Closed alone preserves replay");
+        f.client
+            .remove_task_submission_record(fixture_task())
+            .unwrap();
+        assert!(storage_rows(&f).is_empty());
+        assert!(
+            f.client
+                .load_task_optional(fixture_task())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn dashboard_replay_cleanup_precedes_owner_removal_and_retries_after_crash() {
+        let f = Fixture::new();
+        storage_write(&f, 1, false, 0).unwrap();
+        assert!(storage_write(&f, 2, true, 0).is_err());
+        f.client.inject_write_failure_once(
+            crate::client_state::ClientStateWritePoint::BeforeTaskSubmissionRecordRemoval,
+        );
+        assert!(
+            f.client
+                .remove_task_submission_record(fixture_task())
+                .is_err()
+        );
+        assert!(
+            storage_rows(&f).is_empty(),
+            "bindings must be removed before the record Delete decision"
+        );
+        assert!(
+            f.client
+                .load_task_optional(fixture_task())
+                .unwrap()
+                .is_some()
+        );
+        f.client
+            .remove_task_submission_record(fixture_task())
+            .unwrap();
+        assert!(
+            f.client
+                .load_task_optional(fixture_task())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn review_dashboard_replay_storage_is_bounded_and_tied_to_owner_lifetime() {
+        let f = Fixture::new();
+        let mutation = f.mutation();
+        let original = f.state.load(fixture_task()).unwrap();
+        let mut last = f.request.clone();
+        let mut result = serde_json::Value::Null;
+        for ordinal in 1..=64 {
+            f.now
+                .store(1_000 + ordinal, std::sync::atomic::Ordering::SeqCst);
+            last.integration.request_id = uuid::Uuid::new_v4().simple().to_string();
+            result = mutation.integrate_response(fixture_task(), &last).unwrap();
+            let rows = storage_rows(&f);
+            assert!(rows.len() <= 32);
+            assert!(rows.values().map(Vec::len).sum::<usize>() <= 262_144);
+        }
+        assert_eq!(f.state.load(fixture_task()).unwrap(), original);
+        let task_root = f
+            .paths
+            .state
+            .join(format!("integrations/tasks/{}", fixture_task()));
+        f.native().redrive(&last.integration).unwrap();
+        let native = task_root.join(format!("redrive-{}.json", last.integration.request_id));
+        assert!(native.exists());
+        let before = f.client.load_task(fixture_task()).unwrap();
+        let mut wire = serde_json::to_value(before.status()).unwrap();
+        wire["state"] = "closed".into();
+        f.client
+            .update_task_if_current(
+                &before,
+                before
+                    .clone()
+                    .with_status(serde_json::from_value(wire).unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            mutation.integrate_response(fixture_task(), &last).unwrap(),
+            result
+        );
+        f.client
+            .remove_task_submission_record(fixture_task())
+            .unwrap();
+        assert!(storage_rows(&f).is_empty());
+        assert!(!native.exists());
+        assert!(
+            f.client
+                .load_task_optional(fixture_task())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn dashboard_replay_removal_refuses_a_live_request_before_deleting_owner() {
+        use std::os::fd::AsRawFd;
+        let f = Fixture::new();
+        storage_write(&f, 1, false, 0).unwrap();
+        let path = f
+            .paths
+            .state
+            .join(format!("integrations/tasks/{}", fixture_task()));
+        let root = crate::rooted_fs::RootedDir::open_anchored_absolute(&path).unwrap();
+        let lock = root.open_private_lock("dashboard-redrive.lock").unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let before = storage_rows(&f);
+        assert_eq!(
+            f.client
+                .remove_task_submission_record(fixture_task())
+                .unwrap_err()
+                .public_code(),
+            "TASK_BUSY"
+        );
+        assert_eq!(storage_rows(&f), before);
+        assert!(
+            f.client
+                .load_task_optional(fixture_task())
+                .unwrap()
+                .is_some()
+        );
+        drop(lock);
+        f.client
+            .remove_task_submission_record(fixture_task())
+            .unwrap();
+        assert!(storage_rows(&f).is_empty());
     }
 }

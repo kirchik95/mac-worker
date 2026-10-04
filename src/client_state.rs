@@ -3640,6 +3640,7 @@ impl ClientStateStore {
         self.recover_task_replacement_residue(&tasks, &names)?;
         let task_name = task_file_name(task_id)?;
         let removed = self.load_task_locked(task_id).ok();
+        crate::integration::runner::remove_redrive_bindings(&self.inner.state_root, task_id)?;
         #[cfg(any(test, feature = "test-support"))]
         if self.take_fault(ClientStateWritePoint::BeforeTaskSubmissionRecordRemoval) {
             return Err(injected_failure(

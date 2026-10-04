@@ -534,11 +534,19 @@ impl<'a> OwnerIntegration<'a> {
                 request: request.clone(),
                 body: body.clone(),
                 result: None,
+                completed_at_millis: None,
             };
             let bytes = serde_json::to_vec(&binding).map_err(|_| invalid())?;
             if bytes.len() > MAX_INTEGRATION_RPC_BYTES {
                 return Err(invalid());
             }
+            dashboard_replay_capacity(
+                &root,
+                request.task_id,
+                &name,
+                bytes.len(),
+                self.runtime.now_millis(),
+            )?;
             root.write_private_atomic_no_replace(&name, &bytes)?;
             (binding, bytes)
         };
@@ -546,10 +554,18 @@ impl<'a> OwnerIntegration<'a> {
         // request, whose saved epoch/result prevents another epoch advance.
         let result = execute()?;
         binding.result = Some(result.clone());
+        binding.completed_at_millis = Some(self.runtime.now_millis());
         let bytes = serde_json::to_vec(&binding).map_err(|_| invalid())?;
         if bytes.len() > MAX_INTEGRATION_RPC_BYTES {
             return Err(invalid());
         }
+        dashboard_replay_capacity(
+            &root,
+            request.task_id,
+            &name,
+            bytes.len(),
+            self.runtime.now_millis(),
+        )?;
         root.replace_private_regular_exact(&name, &previous, &bytes)?;
         Ok(result)
     }
@@ -816,6 +832,137 @@ struct DashboardRedriveBinding {
     request: IntegrationRedriveRequest,
     body: serde_json::Value,
     result: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completed_at_millis: Option<u64>,
+}
+
+const MAX_DASHBOARD_REPLAY_BINDINGS: usize = 32;
+const MAX_DASHBOARD_REPLAY_BYTES: usize = 256 * 1024;
+const DASHBOARD_REPLAY_LIFETIME_MILLIS: u64 = 24 * 60 * 60 * 1000;
+
+fn replay_busy() -> WorkerError {
+    WorkerError::task("TASK_BUSY", "integration redrive is in progress")
+}
+
+/// Called under dashboard-redrive.lock before either durable publication.
+/// Pending accepted requests are never candidates for quota or age eviction.
+fn dashboard_replay_capacity(
+    root: &RootedDir,
+    task: TaskId,
+    replacement: &str,
+    bytes: usize,
+    now: u64,
+) -> Result<(), WorkerError> {
+    if bytes > MAX_DASHBOARD_REPLAY_BYTES {
+        return Err(replay_busy());
+    }
+    let mut count = 1usize;
+    let mut total = bytes;
+    let mut completed = Vec::new();
+    for raw in root.list_names()? {
+        let Some(name) = dashboard_replay_name(&raw) else {
+            continue;
+        };
+        if name == replacement {
+            continue;
+        }
+        let identity = root.private_entry_identity(name)?;
+        let saved = root.read_private_regular(name, MAX_INTEGRATION_RPC_BYTES as u64)?;
+        let binding: DashboardRedriveBinding =
+            serde_json::from_slice(&saved).map_err(|_| invalid())?;
+        binding.request.validate()?;
+        if binding.request.task_id != task
+            || name != format!("dashboard-redrive-{}.json", binding.request.request_id)
+            || serde_json::to_vec(&binding).map_err(|_| invalid())? != saved
+            || root.private_entry_identity(name)? != identity
+        {
+            return Err(invalid());
+        }
+        count = count.saturating_add(1);
+        total = total.saturating_add(saved.len());
+        if binding.result.is_some() {
+            // Completed pre-quota rows have no saved clock; treat them as the
+            // oldest cache entries rather than giving them an infinite life.
+            completed.push((
+                binding.completed_at_millis.unwrap_or(0),
+                name.to_owned(),
+                identity,
+                saved.len(),
+                binding.request.request_id,
+            ));
+        }
+    }
+    completed.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    let mut evict = Vec::new();
+    for row in completed {
+        let expired = now.saturating_sub(row.0) > DASHBOARD_REPLAY_LIFETIME_MILLIS;
+        if expired || count > MAX_DASHBOARD_REPLAY_BINDINGS || total > MAX_DASHBOARD_REPLAY_BYTES {
+            count -= 1;
+            total -= row.3;
+            evict.push(row);
+        }
+    }
+    if count > MAX_DASHBOARD_REPLAY_BINDINGS || total > MAX_DASHBOARD_REPLAY_BYTES {
+        return Err(replay_busy());
+    }
+    if !evict.is_empty() {
+        let _native = private_lock(root, "redrive.lock", true)?.ok_or_else(replay_busy)?;
+        for (_, name, identity, _, request_id) in evict {
+            // Retire a paired completed native result too, so expired or
+            // evicted dashboard requests cannot accumulate hidden receipts.
+            let native_name = format!("redrive-{request_id}.json");
+            if let Some(bytes) = read(root, &native_name)? {
+                let native: RedriveBinding =
+                    serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+                if native.result.is_some() {
+                    root.remove_owned_regular(&native_name)?;
+                }
+            }
+            root.channel_unlink_exact(&name, identity)?;
+        }
+    }
+    Ok(())
+}
+
+fn dashboard_replay_name(raw: &[u8]) -> Option<&str> {
+    let name = std::str::from_utf8(raw).ok()?;
+    (name.starts_with("dashboard-redrive-") && name.ends_with(".json")).then_some(name)
+}
+
+fn redrive_binding_name(raw: &[u8]) -> bool {
+    dashboard_replay_name(raw).is_some()
+        || std::str::from_utf8(raw)
+            .is_ok_and(|name| name.starts_with("redrive-") && name.ends_with(".json"))
+}
+
+/// The caller holds StateLock. Nonblocking request locks refuse a live writer;
+/// every binding is gone before the caller can delete the owner record.
+pub(crate) fn remove_redrive_bindings(
+    state: &std::path::Path,
+    task: TaskId,
+) -> Result<(), WorkerError> {
+    let reader = super::store::ExistingIntegrationReader::open_at(state)?;
+    if !reader.present() {
+        return Ok(());
+    }
+    let root = match RootedDir::open_anchored_absolute(state)?
+        .open_child_directory(&relative(&format!("integrations/tasks/{task}"))?, false)
+    {
+        Ok(root) => root,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let _dashboard =
+        private_lock(&root, "dashboard-redrive.lock", true)?.ok_or_else(replay_busy)?;
+    let _native = private_lock(&root, "redrive.lock", true)?.ok_or_else(replay_busy)?;
+    root.retry_pending_owned_regulars_matching(|name, _| redrive_binding_name(name))?;
+    for raw in root.list_names()? {
+        if redrive_binding_name(&raw) {
+            let name = std::str::from_utf8(&raw).map_err(|_| invalid())?;
+            root.remove_owned_regular(name)?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
