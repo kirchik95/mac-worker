@@ -3209,7 +3209,7 @@ mod review_fixes {
         client_state::{ActiveTaskConfig, ClientStateStore},
         core::{error::WorkerError, paths::PathLayout},
         host::process::SystemProcessRunner,
-        task::model::TaskState,
+        task::model::{TaskId, TaskState},
     };
     use std::sync::{
         Arc,
@@ -3406,6 +3406,484 @@ mod review_fixes {
                 .phase_retries
                 .iter()
                 .any(|retry| retry.phase == IntegrationPhase::Drive && retry.retries == 0)
+        );
+    }
+
+    struct CountingClosedHost<'a> {
+        fixture: &'a GitIntegrationFixture,
+        calls: AtomicUsize,
+    }
+    impl IntegrationHost for CountingClosedHost<'_> {
+        fn execute(
+            &self,
+            request: &HostIntegrationRequest,
+        ) -> Result<HostIntegrationResponse, WorkerError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert!(matches!(
+                request.action,
+                HostIntegrationAction::Step {
+                    step: IntegrationStep::Repair,
+                    ..
+                }
+            ));
+            HostIntegrationService::new(
+                &self.fixture.store,
+                &SystemProcessRunner,
+                &self.fixture.runtime,
+            )
+            .execute(request)
+        }
+    }
+
+    #[test]
+    fn review_closed_observation_respects_existing_target_and_four_driver_reservations() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = probe_paths(&temp.path().canonicalize().unwrap());
+        let mut f = GitIntegrationFixture::at(temp.path().join("git"));
+        f.commit_base();
+        f.commit_task();
+        let host = HostIntegrationService::new(&f.store, &SystemProcessRunner, &f.runtime);
+        host.execute(&HostIntegrationRequest {
+            protocol_version: 7,
+            task_id: f.record.task_id,
+            integration_id: None,
+            epoch: 0,
+            revision: IntegrationRevision(0),
+            action: HostIntegrationAction::Arm {
+                policy: f.record.policy.clone(),
+            },
+        })
+        .unwrap();
+        let close_at = f
+            .store
+            .task_status(&f.record.policy.project_id, f.record.task_id)
+            .unwrap()
+            .updated_at_millis()
+            + mac_worker::test_support::host::store::TASK_RETENTION_MILLIS
+            + 1;
+        assert!(
+            mac_worker::test_support::host::gc::apply_baseline_retention_close(
+                &f.store,
+                &SystemProcessRunner,
+                &f.record.policy.project_id,
+                f.record.task_id,
+                close_at
+            )
+            .unwrap()
+        );
+        let runtime = Arc::new(ManualIntegrationRuntime::default());
+        let state = RootedIntegrationState::open(&paths, runtime.clone()).unwrap();
+        state
+            .publish_policy(f.record.task_id, &f.record.policy)
+            .unwrap();
+        state
+            .replace(f.record.task_id, IntegrationRevision(0), &f.record)
+            .unwrap();
+        for i in 0..MAX_GIT_DRIVERS {
+            let mut policy = f.record.policy.clone();
+            if i != 0 {
+                policy.target = format!("held-{i}").parse().unwrap();
+            }
+            let key = policy.target_key().unwrap();
+            let actor = ProcessIdentity::new(5_001_000 + i as u32, 1).unwrap();
+            runtime.set_actor_verdict(actor, RunnerLivenessVerdict::Live);
+            let id = IntegrationId::derive(
+                TaskId::new(uuid::Uuid::from_u128(100 + i as u128)),
+                fixture_source(),
+                &f.record.snapshot.source_head,
+                &key,
+            )
+            .unwrap();
+            assert!(state.reserve(&key, id, 0, actor).unwrap().is_some());
+        }
+        let mut facts = IntegrationTaskFacts::from_record(
+            &sample_ordinary(f.record.task_id, f.record.snapshot.source_turn_id),
+            false,
+        );
+        facts.ordinary = facts
+            .ordinary
+            .with_status(
+                f.store
+                    .task_status(&f.record.policy.project_id, f.record.task_id)
+                    .unwrap(),
+            )
+            .unwrap();
+        facts.cycle_base = f.record.cycle_base.clone();
+        let observer = FakeIntegrationObserver::default();
+        observer.insert(facts);
+        let turns = FakeIntegrationTurns::default();
+        let host = CountingClosedHost {
+            fixture: &f,
+            calls: AtomicUsize::new(0),
+        };
+        let result =
+            IntegrationCoordinator::new(&state, &host, &turns, runtime.as_ref(), &observer)
+                .drive_once(f.record.task_id)
+                .unwrap();
+        println!(
+            "Closed drive while all slots and its exact target are held: state={:?}, real host calls={}",
+            result.state,
+            host.calls.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            host.calls.load(Ordering::SeqCst),
+            0,
+            "observation-only Git still must respect the canonical target and owner driver cap"
+        );
+    }
+
+    fn closed_fixture(
+        root: std::path::PathBuf,
+        task: TaskId,
+        reachable: bool,
+    ) -> GitIntegrationFixture {
+        let mut f = GitIntegrationFixture::at_for_task(root, task, None);
+        f.commit_base();
+        f.commit_task();
+        HostIntegrationService::new(&f.store, &SystemProcessRunner, &f.runtime)
+            .execute(&HostIntegrationRequest {
+                protocol_version: 7,
+                task_id: task,
+                integration_id: None,
+                epoch: 0,
+                revision: IntegrationRevision(0),
+                action: HostIntegrationAction::Arm {
+                    policy: f.record.policy.clone(),
+                },
+            })
+            .unwrap();
+        if reachable {
+            f.prepare();
+            f.push();
+        }
+        let now = f
+            .store
+            .task_status(&f.record.policy.project_id, task)
+            .unwrap()
+            .updated_at_millis()
+            + mac_worker::test_support::host::store::TASK_RETENTION_MILLIS
+            + 1;
+        assert!(
+            mac_worker::test_support::host::gc::apply_baseline_retention_close(
+                &f.store,
+                &SystemProcessRunner,
+                &f.record.policy.project_id,
+                task,
+                now
+            )
+            .unwrap()
+        );
+        f
+    }
+
+    fn insert_closed(
+        state: &RootedIntegrationState,
+        observer: &FakeIntegrationObserver,
+        f: &GitIntegrationFixture,
+    ) {
+        state
+            .publish_policy(f.record.task_id, &f.record.policy)
+            .unwrap();
+        assert!(
+            state
+                .replace(f.record.task_id, IntegrationRevision(0), &f.record)
+                .unwrap()
+        );
+        let mut facts = native_owner::observed(f);
+        facts.cycle_base = f.record.cycle_base.clone();
+        observer.insert(facts);
+    }
+
+    fn reservation_count(paths: &PathLayout) -> usize {
+        std::fs::read_dir(paths.state.join("integrations/reservations"))
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == "json")
+            })
+            .count()
+    }
+
+    fn assert_slot_held(state: &RootedIntegrationState, record: &IntegrationRecord) {
+        assert!(
+            record.actor.is_some(),
+            "Closed host/import has no durable actor"
+        );
+        let other = IntegrationId::derive(
+            TaskId::new(uuid::Uuid::from_u128(98765)),
+            fixture_source(),
+            &record.snapshot.source_head,
+            &record.target_key,
+        )
+        .unwrap();
+        assert!(
+            state
+                .reserve(
+                    &record.target_key,
+                    other,
+                    0,
+                    ProcessIdentity::new(5_000_888, 1).unwrap()
+                )
+                .unwrap()
+                .is_none(),
+            "Closed work did not retain canonical-target serialization"
+        );
+    }
+
+    struct GuardedClosedHost<'a> {
+        fixture: &'a GitIntegrationFixture,
+        state: &'a RootedIntegrationState,
+        calls: AtomicUsize,
+        offline: AtomicUsize,
+        malformed: bool,
+    }
+    impl IntegrationHost for GuardedClosedHost<'_> {
+        fn execute(
+            &self,
+            request: &HostIntegrationRequest,
+        ) -> Result<HostIntegrationResponse, WorkerError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let HostIntegrationAction::Step {
+                step: IntegrationStep::Repair,
+                record,
+            } = &request.action
+            else {
+                panic!("Closed observation admitted another host action");
+            };
+            assert_slot_held(self.state, record);
+            if self
+                .offline
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(IntegrationCode::IntegrationNetwork.error());
+            }
+            let mut response = HostIntegrationService::new(
+                &self.fixture.store,
+                &SystemProcessRunner,
+                &self.fixture.runtime,
+            )
+            .execute(request)?;
+            if self.malformed {
+                let HostIntegrationResponse::Blocked { identity, .. } = &mut response else {
+                    panic!("unreachable source must block")
+                };
+                identity.revision = identity.revision.next().unwrap();
+            }
+            Ok(response)
+        }
+    }
+
+    struct GuardedClosedImport<'a> {
+        state: &'a RootedIntegrationState,
+        imports: AtomicUsize,
+    }
+    impl IntegrationTurns for GuardedClosedImport<'_> {
+        fn enqueue(
+            &self,
+            _: &PreparedIntegrationTurn,
+        ) -> Result<mac_worker::test_support::task::model::TurnId, WorkerError> {
+            panic!("Closed observation admitted an auxiliary");
+        }
+        fn observe(
+            &self,
+            _: mac_worker::test_support::task::model::TurnId,
+        ) -> Result<IntegrationTurnObservation, WorkerError> {
+            panic!("Closed observation inspected an auxiliary");
+        }
+        fn import_receipt(
+            &self,
+            task: TaskId,
+            receipt: &IntegrationReceipt,
+        ) -> Result<IntegrationReceipt, WorkerError> {
+            assert_slot_held(self.state, &self.state.load(task)?.unwrap());
+            self.imports.fetch_add(1, Ordering::SeqCst);
+            let mut receipt = receipt.clone();
+            receipt.imported = true;
+            Ok(receipt)
+        }
+        fn close_integrated(&self, _: TaskId, _: &IntegrationReceipt) -> Result<(), WorkerError> {
+            panic!("Closed observation attempted another close");
+        }
+    }
+
+    #[test]
+    fn closed_observation_during_drain_and_disable_holds_the_slot_through_import_and_retries() {
+        for pause in [
+            IntegrationPauseReason::ControllerDrained,
+            IntegrationPauseReason::ControllerDisabled,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = probe_paths(&temp.path().canonicalize().unwrap());
+            let f = closed_fixture(temp.path().join("git"), fixture_task(), true);
+            let runtime = Arc::new(ManualIntegrationRuntime::default());
+            runtime.set_drive_gate(Some(pause));
+            let state = RootedIntegrationState::open(&paths, runtime.clone()).unwrap();
+            let observer = FakeIntegrationObserver::default();
+            insert_closed(&state, &observer, &f);
+            let host = GuardedClosedHost {
+                fixture: &f,
+                state: &state,
+                calls: AtomicUsize::new(0),
+                offline: AtomicUsize::new(1),
+                malformed: false,
+            };
+            let turns = GuardedClosedImport {
+                state: &state,
+                imports: AtomicUsize::new(0),
+            };
+            let owner =
+                IntegrationCoordinator::new(&state, &host, &turns, runtime.as_ref(), &observer);
+            let retry = owner.drive_once(f.record.task_id).unwrap();
+            assert_eq!(retry.state, IntegrationStatus::RetryWait);
+            assert_eq!(reservation_count(&paths), 0);
+            assert!(
+                state
+                    .load(f.record.task_id)
+                    .unwrap()
+                    .unwrap()
+                    .actor
+                    .is_none()
+            );
+            assert_eq!(owner.drive_once(f.record.task_id).unwrap(), retry);
+            assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+            runtime.advance(std::time::Duration::from_millis(2000));
+            assert_eq!(
+                owner.drive_once(f.record.task_id).unwrap().state,
+                IntegrationStatus::Integrated
+            );
+            assert_eq!(turns.imports.load(Ordering::SeqCst), 1);
+            assert_eq!(reservation_count(&paths), 0);
+            assert!(!f.workspace().exists());
+        }
+    }
+
+    #[test]
+    fn closed_observation_releases_the_slot_after_a_real_host_reply_fails_validation() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = probe_paths(&temp.path().canonicalize().unwrap());
+        let f = closed_fixture(temp.path().join("git"), fixture_task(), false);
+        let runtime = Arc::new(ManualIntegrationRuntime::default());
+        let state = RootedIntegrationState::open(&paths, runtime.clone()).unwrap();
+        let observer = FakeIntegrationObserver::default();
+        insert_closed(&state, &observer, &f);
+        let host = GuardedClosedHost {
+            fixture: &f,
+            state: &state,
+            calls: AtomicUsize::new(0),
+            offline: AtomicUsize::new(0),
+            malformed: true,
+        };
+        let turns = FakeIntegrationTurns::default();
+        let owner = IntegrationCoordinator::new(&state, &host, &turns, runtime.as_ref(), &observer);
+        assert_eq!(
+            owner
+                .drive_once(f.record.task_id)
+                .unwrap_err()
+                .public_code(),
+            "INTEGRATION_STATE_INVALID"
+        );
+        assert_eq!(reservation_count(&paths), 0);
+        assert!(
+            state
+                .load(f.record.task_id)
+                .unwrap()
+                .unwrap()
+                .actor
+                .is_none()
+        );
+        let good = GuardedClosedHost {
+            malformed: false,
+            ..host
+        };
+        let owner = IntegrationCoordinator::new(&state, &good, &turns, runtime.as_ref(), &observer);
+        assert_eq!(
+            owner.drive_once(f.record.task_id).unwrap().state,
+            IntegrationStatus::Blocked
+        );
+        assert_eq!(reservation_count(&paths), 0);
+    }
+
+    #[test]
+    fn five_closed_tasks_back_off_at_the_full_cap_without_spending_observation_retries() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = probe_paths(&temp.path().canonicalize().unwrap());
+        let runtime = Arc::new(ManualIntegrationRuntime::default());
+        runtime.set_drive_gate(Some(IntegrationPauseReason::ControllerDisabled));
+        let state = RootedIntegrationState::open(&paths, runtime.clone()).unwrap();
+        let observer = FakeIntegrationObserver::default();
+        let fixtures = (0..5)
+            .map(|i| {
+                closed_fixture(
+                    temp.path().join(format!("git-{i}")),
+                    TaskId::new(uuid::Uuid::from_u128(200 + i)),
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+        let held = fixtures
+            .iter()
+            .take(4)
+            .enumerate()
+            .map(|(i, f)| {
+                insert_closed(&state, &observer, f);
+                let actor = ProcessIdentity::new(5_002_000 + i as u32, 1).unwrap();
+                runtime.set_actor_verdict(actor, RunnerLivenessVerdict::Live);
+                let id = IntegrationId::derive(
+                    TaskId::new(uuid::Uuid::from_u128(300 + i as u128)),
+                    fixture_source(),
+                    &f.record.snapshot.source_head,
+                    &f.record.target_key,
+                )
+                .unwrap();
+                state
+                    .reserve(&f.record.target_key, id, 0, actor)
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        insert_closed(&state, &observer, &fixtures[4]);
+        let turns = FakeIntegrationTurns::default();
+        for f in &fixtures {
+            let host = CountingClosedHost {
+                fixture: f,
+                calls: AtomicUsize::new(0),
+            };
+            let owner =
+                IntegrationCoordinator::new(&state, &host, &turns, runtime.as_ref(), &observer);
+            let refused = owner.drive_once(f.record.task_id).unwrap();
+            assert_eq!(host.calls.load(Ordering::SeqCst), 0);
+            let saved = state.load(f.record.task_id).unwrap().unwrap();
+            assert_eq!(saved.phase_retries.len(), 1);
+            assert_eq!(saved.phase_retries[0].phase, IntegrationPhase::Drive);
+            assert_eq!(saved.phase_retries[0].retries, 0);
+            assert_eq!(saved.snapshot.retry_at_millis, Some(3000));
+            assert_eq!(owner.drive_once(f.record.task_id).unwrap(), refused);
+        }
+        assert_eq!(reservation_count(&paths), 4);
+        state.release(&held[0]).unwrap();
+        runtime.advance(std::time::Duration::from_millis(2000));
+        let f = &fixtures[0];
+        let host = CountingClosedHost {
+            fixture: f,
+            calls: AtomicUsize::new(0),
+        };
+        let owner = IntegrationCoordinator::new(&state, &host, &turns, runtime.as_ref(), &observer);
+        assert_eq!(
+            owner.drive_once(f.record.task_id).unwrap().state,
+            IntegrationStatus::Blocked
+        );
+        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(reservation_count(&paths), 3);
+        assert_eq!(
+            state.load(f.record.task_id).unwrap().unwrap().phase_retries[0].retries,
+            0
         );
     }
 }

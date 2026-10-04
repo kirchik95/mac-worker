@@ -1478,6 +1478,67 @@ impl<'a> IntegrationCoordinator<'a> {
         &self,
         mut record: IntegrationRecord,
     ) -> Result<IntegrationSnapshot, WorkerError> {
+        let now = self.runtime.now_millis();
+        let started = record
+            .phase_retries
+            .iter()
+            .any(|retry| retry.phase == IntegrationPhase::Drive);
+        if !closed_observation_pending(&record)
+            || (started && record.snapshot.retry_at_millis.is_some_and(|due| due > now))
+        {
+            return Ok(record.snapshot);
+        }
+        // D-R9 bypasses launch admission, never target serialization or the
+        // shared Git cap. Retain this slot through host Repair and owner import.
+        let actor = self.runtime.actor();
+        let Some(reservation) = self.state.reserve(
+            &record.target_key,
+            record.snapshot.integration_id,
+            record.snapshot.epoch,
+            actor,
+        )?
+        else {
+            let due = now.saturating_add(TRANSPORT_RETRY_DELAYS_MILLIS[0]);
+            if !started {
+                record.phase_retries.push(IntegrationPhaseRetry {
+                    phase: IntegrationPhase::Drive,
+                    retries: 0,
+                    code: IntegrationCode::IntegrationWorkerOffline,
+                    due_at_millis: due,
+                });
+            }
+            record.snapshot.state = IntegrationStatus::RetryWait;
+            record.snapshot.resume_state = Some(IntegrationStatus::Published);
+            record.snapshot.retry_at_millis = Some(due);
+            record.snapshot.pause_reason = None;
+            record.pause = None;
+            self.save(&mut record)?;
+            return Ok(record.snapshot);
+        };
+        let task = record.task_id;
+        record.actor = Some(actor);
+        let applied = (|| {
+            self.save(&mut record)?;
+            self.runtime.reach(IntegrationHook::TargetReserved);
+            self.settle_closed_reserved(record)
+        })();
+        // Release the known reservation even when response validation, import
+        // or state persistence fails. Clearing the saved actor is a separate CAS.
+        self.state.release(&reservation)?;
+        let mut latest = self.state.load(task)?.ok_or_else(integration_unavailable)?;
+        if latest.actor == Some(actor)
+            && latest.snapshot.integration_id == reservation.integration_id
+            && latest.snapshot.epoch == reservation.epoch
+        {
+            latest.actor = None;
+            self.save(&mut latest)?;
+        }
+        applied.map(|_| latest.snapshot)
+    }
+    fn settle_closed_reserved(
+        &self,
+        mut record: IntegrationRecord,
+    ) -> Result<IntegrationSnapshot, WorkerError> {
         if record.receipt.is_some() {
             return self.finish_receipt(record, true);
         }
