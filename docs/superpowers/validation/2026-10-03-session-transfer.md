@@ -73,21 +73,22 @@ Spike: [2026-10-03-session-transfer-spike.md](2026-10-03-session-transfer-spike.
 - `0.1.0+67183a0b9f59-release` was deployed to the laptop, the controller on mini-1, and mini-1, mini-2 and mini-3.
 
 ## Live acceptance (T8)
-Every run used the checkout `pool-smoke-20260912`. In the source session, the agent wrote two code words into an untracked file. The pool turn then had to recall both words without using tools.
+The Codex and Claude rows used the checkout `pool-smoke-20260912`. In the source session, the agent wrote two code words into an untracked file. The pool turn then had to recall both words without using tools. S7 used a real working session that the owner chose.
 
 | Check | Mode | Worker | Result |
 | --- | --- | --- | --- |
 | Codex 0.160.0 → 0.159.3, task `1db47bed` | controller | mini-3 | **Pass.** It recalled both words. A `say` follow-up continued the imported session and appended a third word. The diff held exactly that line, which shows that the `--wip` state arrived. |
 | Codex, task `c0dd185d` | direct (`[controller] enabled = false`) | mini-2 | **Pass.** It recalled both words. |
 | Claude Code 2.1.288 → 2.1.285, task `8ebe0682` | controller | none | **Not run.** No mini has a Claude login: over SSH, `claude auth status` reports `loggedIn: false`. So no worker offers `agent:claude@agents`, and the task stayed queued with `NO_WORKER_OFFERS`. The owner chose not to log Claude in on the minis for now. The T0 spike and the tests cover Claude placement and resume. |
-| Large real session (S7) | | | Pending: waiting for the owner to choose a session. |
+| Large real session (S7): a Codex 0.159.0 TUI session of 54.8 MB, with 3186 records and one compaction; task `62039224` | controller | mini-2 | **Pass.** The submit took 30.5 s wall time, 7.5 s of it user CPU. That covers capture, scrubbing of 18 secrets, packaging, and pushing the base snapshot and the session through the controller. From submit to the finished turn took 70 s. The summary recalled specifics of the conversation and its last open step. On `close --discard` the host deleted the imported session with `codex delete --force`; no copy was left on the worker. |
 
 Findings:
 - **Queued tasks could not be stopped (pre-existing bug).** A queued task has no turn summary before its first dispatch. On such a task, `task cancel` returned it unchanged, and `task close` refused with `TASK_BUSY` because its runner waits for capacity. Fixed in `61cf4f0`, merged as `42ec370`. Full suite: 3958 tests, 3958 passed, 921 s. Task `8ebe0682` is cleared by its pending controller close requests once the fix is deployed.
-- **The Codex preview showed the AGENTS.md instructions that Codex injects.** Newer Codex releases record the typed prompt as a completed `UserMessage` item, not as a `user_message` event. Fixed in `93147dc`, merged as `803fe8c`.
+- **The Codex preview showed the AGENTS.md instructions that Codex injects.** Newer Codex releases record the typed prompt as a completed `UserMessage` item, not as a `user_message` event. The S7 session, from Codex 0.159.0, uses this form too. Fixed in `93147dc`, merged as `803fe8c`.
+- **No way to exclude a single untracked file (follow-up).** The S7 checkout was dirty, and submit correctly refused with `SESSION_NEEDS_WIP`. But `--wip` requires every untracked path to be included, and there is no option to leave one out, for example an `.env` backup. For S7, the untracked paths were hidden from git for the duration of the submit with a temporary `.git/info/exclude` entry. An `--exclude` option for snapshots is a candidate follow-up.
 
 ## Open
-- **T8:** the large real session (S7) has not run yet. The live Claude run waits until a mini has a Claude login.
+- **T8:** done, except the live Claude run, which waits until a mini has a Claude login.
 - **Claude transcripts** of imported tasks stay in the worker's `~/.claude/projects`, which is pre-existing behaviour for Claude pool tasks.
 - **Deferred:** controller request-cache GC; legacy laptop pins created before retirement markers.
 - **Phase B** (pull a pool session back to the laptop) is next.
