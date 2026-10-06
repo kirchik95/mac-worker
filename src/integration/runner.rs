@@ -1158,22 +1158,19 @@ pub(crate) fn record_source_base(
             .clone()
     } else {
         // Blocked/revoked cycles and turns that never staged a cycle leave an
-        // unintegrated task head. Carry the earliest durable source base across
-        // all of them; the submit base covers histories without a sidecar.
-        let mut source_base = base.clone();
-        for prior in ordinary
+        // unintegrated task head. Carry the first turn's durable source base;
+        // the submit base covers a first turn without a sidecar. A later
+        // turn's sidecar is never read: older launches recorded their head.
+        match ordinary
             .status()
             .turns()
-            .iter()
-            .take_while(|prior| prior.turn_id() != turn)
+            .first()
+            .filter(|first| first.turn_id() != turn)
         {
-            source_base = ordinary.meta().base_oid().clone();
-            if let Some(recorded) = read_source_base(paths, task, prior.turn_id())? {
-                source_base = recorded;
-                break;
-            }
+            None => base.clone(),
+            Some(first) => read_source_base(paths, task, first.turn_id())?
+                .unwrap_or_else(|| ordinary.meta().base_oid().clone()),
         }
-        source_base
     };
     let root = task_root(paths, task)?.open_child_directory(&relative("sources")?, true)?;
     write(
@@ -1962,10 +1959,38 @@ pub(crate) mod native_launch_tests {
 
     #[test]
     fn source_base_uses_imported_receipts_or_the_earliest_source_base() {
+        let oid = |digit: &str| -> BaseOid { digit.repeat(40).parse().unwrap() };
+        // Every source of a base is distinct, so each case names the one used.
+        let policy_base = oid("f");
+        let submit_base = sample_ordinary(fixture_task(), fixture_source())
+            .meta()
+            .base_oid()
+            .clone();
+        let first_sidecar = oid("1");
+        let target = oid("c");
+        let merge = oid("2");
+        let followup_head = sample_ordinary_followup(fixture_task(), fixture_source(), None)
+            .status()
+            .head_oid()
+            .cloned()
+            .unwrap();
+        let sources = [
+            &policy_base,
+            &submit_base,
+            &first_sidecar,
+            &target,
+            &merge,
+            &fixture_head(),
+            &followup_head,
+        ];
+        let distinct: std::collections::BTreeSet<_> =
+            sources.iter().map(|oid| oid.as_str()).collect();
+        assert_eq!(distinct.len(), sources.len());
         for previous in [
             "first",
             "no_cycle",
             "blocked",
+            "blocked_without_sidecar",
             "revoked",
             "merged",
             "already_integrated",
@@ -1981,21 +2006,23 @@ pub(crate) mod native_launch_tests {
             )
             .unwrap();
             let mut record = sample_record(fixture_task(), fixture_source(), "main");
+            record.policy.base_oid = Some(policy_base.clone());
+            record.cycle_base = policy_base.clone();
             state
                 .publish_policy(record.task_id, &record.policy)
                 .unwrap();
-            let base = record.cycle_base.clone();
             let ordinary = sample_ordinary(record.task_id, fixture_source());
-            record_source_base(&paths, &ordinary, fixture_source(), &base).unwrap();
-            assert_eq!(
-                read_source_base(&paths, record.task_id, fixture_source()).unwrap(),
-                Some(base.clone())
-            );
+            // History from before sidecars has none for its first turn.
+            if previous != "blocked_without_sidecar" {
+                record_source_base(&paths, &ordinary, fixture_source(), &first_sidecar).unwrap();
+                assert_eq!(
+                    read_source_base(&paths, record.task_id, fixture_source()).unwrap(),
+                    Some(first_sidecar.clone())
+                );
+            }
             if previous == "first" {
                 continue;
             }
-            let target: BaseOid = "c".repeat(40).parse().unwrap();
-            let merge: BaseOid = "e".repeat(40).parse().unwrap();
             let receipt = IntegrationReceipt {
                 integration_id: record.snapshot.integration_id,
                 epoch: 0,
@@ -2018,7 +2045,11 @@ pub(crate) mod native_launch_tests {
                     record.snapshot.merge_oid = receipt.merge_oid.clone();
                     record.snapshot.observed_target_oid = Some(target.clone());
                     record.receipt = Some(receipt);
-                    if previous == "merged" { merge } else { target }
+                    if previous == "merged" {
+                        merge.clone()
+                    } else {
+                        target.clone()
+                    }
                 }
                 "blocked_after_integrated" | "revoked_after_integrated" => {
                     let mut older = receipt.clone();
@@ -2027,13 +2058,14 @@ pub(crate) mod native_launch_tests {
                     record.archived_receipts.push(receipt);
                     // Even a later unintegrated head must not replace the receipt head.
                     record.cycle_base = fixture_head();
-                    merge
+                    merge.clone()
                 }
                 "unimported_receipt" => {
                     record.receipt = Some(receipt);
-                    base.clone()
+                    first_sidecar.clone()
                 }
-                _ => base.clone(),
+                "blocked_without_sidecar" => submit_base.clone(),
+                _ => first_sidecar.clone(),
             };
             if previous.starts_with("blocked") {
                 record.snapshot.state = IntegrationStatus::Blocked;
@@ -2054,14 +2086,22 @@ pub(crate) mod native_launch_tests {
                 Some(expected.clone()),
                 "{previous}"
             );
-            // Re-entering an old launch after receipt import must not rebind
-            // its durable base, even when the proposed launch head changes.
-            record_source_base(&paths, &ordinary, fixture_source(), &fixture_head()).unwrap();
-            assert_eq!(
-                read_source_base(&paths, record.task_id, fixture_source()).unwrap(),
-                Some(base),
-                "replay: {previous}"
-            );
+            if previous == "blocked_without_sidecar" {
+                // Later launches never back-fill the first turn's sidecar.
+                assert_eq!(
+                    read_source_base(&paths, record.task_id, fixture_source()).unwrap(),
+                    None
+                );
+            } else {
+                // Re-entering an old launch after receipt import must not rebind
+                // its durable base, even when the proposed launch head changes.
+                record_source_base(&paths, &ordinary, fixture_source(), &fixture_head()).unwrap();
+                assert_eq!(
+                    read_source_base(&paths, record.task_id, fixture_source()).unwrap(),
+                    Some(first_sidecar.clone()),
+                    "replay: {previous}"
+                );
+            }
             let third = TurnId::new(uuid::Uuid::from_u128(9));
             record_source_base(&paths, &ordinary, third, &fixture_head()).unwrap();
             assert_eq!(
@@ -2076,6 +2116,43 @@ pub(crate) mod native_launch_tests {
                 "facts: {previous}"
             );
         }
+    }
+
+    #[test]
+    fn source_base_never_reads_a_later_turn_sidecar() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = paths(&root.path().canonicalize().unwrap());
+        let state = super::super::store::RootedIntegrationState::open(
+            &paths,
+            Arc::new(ManualIntegrationRuntime::default()),
+        )
+        .unwrap();
+        let record = sample_record(fixture_task(), fixture_source(), "main");
+        state
+            .publish_policy(record.task_id, &record.policy)
+            .unwrap();
+        let ordinary = sample_ordinary_followup(record.task_id, fixture_source(), None);
+        // Older launches had no first-turn sidecar and recorded each later
+        // turn's own unintegrated launch head.
+        let second = ordinary.status().turns()[1].turn_id();
+        let sources = task_root(&paths, record.task_id)
+            .unwrap()
+            .open_child_directory(&relative("sources").unwrap(), true)
+            .unwrap();
+        write(
+            &sources,
+            &format!("{second}.json"),
+            &serde_json::to_vec(&fixture_head()).unwrap(),
+            true,
+        )
+        .unwrap();
+        let third = TurnId::new(uuid::Uuid::from_u128(9));
+        record_source_base(&paths, &ordinary, third, &fixture_head()).unwrap();
+        assert_eq!(
+            read_source_base(&paths, record.task_id, third).unwrap(),
+            Some(ordinary.meta().base_oid().clone())
+        );
+        assert_ne!(ordinary.meta().base_oid(), &fixture_head());
     }
 
     #[test]
