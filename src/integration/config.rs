@@ -185,8 +185,13 @@ pub fn preflight_integration_base(
     let key = TargetKey::new(origin, branch.as_str())
         .map_err(|_| integration_error("TASK_CONFIG_INVALID"))?;
     let reference = format!("refs/heads/{}", key.branch.as_str());
-    let advertised = crate::git_transport::origin_ref_request(key.origin, &reference)?;
-    let Ok(mut request) = super::git::hardened_read_request(runner, local_repo, advertised.args)
+    let credentials =
+        crate::git_transport::GitTransport::new(runner).origin_credential_config(&key.origin);
+    let Ok(advertised) = crate::git_transport::origin_ref_request(key.origin, &reference) else {
+        return Ok(Unknown);
+    };
+    let Ok(mut request) =
+        super::git::hardened_read_request(runner, local_repo, advertised.args, &credentials)
     else {
         return Ok(Unknown);
     };
@@ -218,7 +223,7 @@ pub fn preflight_integration_base(
     };
 
     let run_local = |operation: Vec<std::ffi::OsString>| {
-        let request = super::git::hardened_read_request(runner, local_repo, operation)?;
+        let request = super::git::hardened_read_request(runner, local_repo, operation, &[])?;
         runner.run(&request)
     };
     // A negative answer in shallow/incomplete history is not a proof. Traverse
