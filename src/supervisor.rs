@@ -635,7 +635,7 @@ fn require_absent_group(
                 .monotonic_now()
                 .checked_add(TERM_GRACE)
                 .ok_or_else(|| reconciliation_ambiguous("TERM grace deadline overflowed"))?;
-            match poll_while_group_ambiguous(runtime, process_group, deadline)? {
+            match poll_while_group_ambiguous(runtime, process_group, deadline, libc::SIGTERM)? {
                 ResolvedLeaderlessGroup::Absent => Ok(()),
                 ResolvedLeaderlessGroup::Present => drain_leaderless_group(runtime, process_group),
             }
@@ -647,11 +647,11 @@ fn drain_leaderless_group(
     runtime: &dyn ReconciliationRuntime,
     process_group: u32,
 ) -> Result<(), WorkerError> {
-    runtime.signal_process_group(process_group, libc::SIGTERM)?;
+    signal_group_while_draining(runtime, process_group, libc::SIGTERM)?;
     if poll_leaderless_group_absent(runtime, process_group, DrainPhase::Term)? {
         return Ok(());
     }
-    runtime.signal_process_group(process_group, libc::SIGKILL)?;
+    signal_group_while_draining(runtime, process_group, libc::SIGKILL)?;
     if poll_leaderless_group_absent(runtime, process_group, DrainPhase::Kill)? {
         return Ok(());
     }
@@ -679,6 +679,13 @@ impl DrainPhase {
             Self::Kill => "KILL grace deadline overflowed",
         }
     }
+
+    fn signal(self) -> i32 {
+        match self {
+            Self::Term => libc::SIGTERM,
+            Self::Kill => libc::SIGKILL,
+        }
+    }
 }
 
 fn poll_leaderless_group_absent(
@@ -699,7 +706,8 @@ fn poll_leaderless_group_absent(
                 }
             }
             ProcessGroupObservation::Ambiguous => {
-                match poll_while_group_ambiguous(runtime, process_group, deadline)? {
+                match poll_while_group_ambiguous(runtime, process_group, deadline, phase.signal())?
+                {
                     ResolvedLeaderlessGroup::Absent => return Ok(true),
                     ResolvedLeaderlessGroup::Present => {
                         if !sleep_until_group_deadline(runtime, deadline) {
@@ -712,13 +720,18 @@ fn poll_leaderless_group_absent(
     }
 }
 
-/// Poll `observe_group` without signaling while the sample stays `Ambiguous`.
-/// Returns as soon as the group is `Absent` or `Present`; if it is still
-/// `Ambiguous` when `deadline` elapses, fail closed with the after-grace error.
+/// Poll `observe_group` while the sample stays `Ambiguous`.
+///
+/// Absence is only `ESRCH` from `kill(-pgid, 0)`, which the runtime reports as
+/// [`ProcessGroupObservation::Absent`]. `EPERM` (the macOS zombie-only answer)
+/// and any other probe errno stay ambiguous: keep probing until `ESRCH` or
+/// `deadline`. A member `observe_group_members` still reports as alive is
+/// signalled again with `resignal`; a zombie is not. The grace is unchanged.
 fn poll_while_group_ambiguous(
     runtime: &dyn ReconciliationRuntime,
     process_group: u32,
     deadline: Duration,
+    resignal: i32,
 ) -> Result<ResolvedLeaderlessGroup, WorkerError> {
     loop {
         if !sleep_until_group_deadline(runtime, deadline) {
@@ -727,8 +740,38 @@ fn poll_while_group_ambiguous(
         match runtime.observe_group(process_group) {
             ProcessGroupObservation::Absent => return Ok(ResolvedLeaderlessGroup::Absent),
             ProcessGroupObservation::Present => return Ok(ResolvedLeaderlessGroup::Present),
-            ProcessGroupObservation::Ambiguous => {}
+            ProcessGroupObservation::Ambiguous => {
+                if runtime.observe_group_members(process_group)
+                    == ProcessGroupMembership::OtherMembers
+                {
+                    signal_group_while_draining(runtime, process_group, resignal)?;
+                }
+            }
         }
+    }
+}
+
+/// `EPERM` is the draining answer (zombies, or a member exiting). `ESRCH` on
+/// the signal itself is not proof the group is gone; the caller still has to
+/// observe `kill(-pgid, 0)`. Every other errno still fails the reconciliation.
+fn group_signal_is_draining(error: &WorkerError) -> bool {
+    match error {
+        WorkerError::Io(source) => {
+            matches!(source.raw_os_error(), Some(libc::EPERM) | Some(libc::ESRCH))
+        }
+        _ => false,
+    }
+}
+
+fn signal_group_while_draining(
+    runtime: &dyn ReconciliationRuntime,
+    process_group: u32,
+    signal: i32,
+) -> Result<(), WorkerError> {
+    match runtime.signal_process_group(process_group, signal) {
+        Ok(()) => Ok(()),
+        Err(error) if group_signal_is_draining(&error) => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -892,11 +935,87 @@ fn inspect_group_members(leader: u32) -> ProcessGroupMembership {
         return ProcessGroupMembership::Ambiguous;
     }
     for pid in pids.into_iter().take(returned as usize) {
-        if pid > 0 && pid as u32 != leader {
+        if pid > 0 && pid as u32 != leader && group_pid_is_live(pid as u32) {
             return ProcessGroupMembership::OtherMembers;
         }
     }
     ProcessGroupMembership::LeaderOnly
+}
+
+/// Live means a process `proc_pidinfo` can still describe and that is not a
+/// zombie. macOS answers ESRCH for zombies, while `kill(-pgid, 0)` keeps
+/// returning EPERM until the zombie is reaped. Counting that pid as another
+/// member holds the leader unreaped for the whole TERM grace.
+#[cfg(target_os = "macos")]
+fn group_pid_is_live(pid: u32) -> bool {
+    const SZOMB: u32 = 5;
+    let Ok(pid) = c_int::try_from(pid) else {
+        return true;
+    };
+    let mut info = std::mem::MaybeUninit::<ProcBsdInfo>::zeroed();
+    let size = size_of::<ProcBsdInfo>();
+    let Ok(size) = c_int::try_from(size) else {
+        return true;
+    };
+    let result = unsafe { proc_pidinfo(pid, 3, 0, info.as_mut_ptr().cast(), size) };
+    if result == 0 {
+        return io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+    }
+    if result != size {
+        return true;
+    }
+    let info = unsafe { info.assume_init() };
+    info.pid != pid as u32 || info.status != SZOMB
+}
+
+/// `kill(-pgid, 0)` classifies the group. Only ESRCH is absence. Any other
+/// errno, including the EPERM macOS returns while the leader is exiting, stays
+/// ambiguous until this process collects that leader with `waitpid`. A group
+/// signal does not collect it, and under load the unreaped leader keeps EPERM
+/// until the grace expires. A child this process does not own is left alone.
+fn observe_process_group(process_group: i32) -> ProcessGroupObservation {
+    match classify_group_probe(process_group) {
+        ProcessGroupObservation::Ambiguous if reap_owned_exiting_leader(process_group) => {
+            classify_group_probe(process_group)
+        }
+        observation => observation,
+    }
+}
+
+fn classify_group_probe(process_group: i32) -> ProcessGroupObservation {
+    if unsafe { libc::kill(-process_group, 0) } == 0 {
+        return ProcessGroupObservation::Present;
+    }
+    match io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => ProcessGroupObservation::Absent,
+        _ => ProcessGroupObservation::Ambiguous,
+    }
+}
+
+/// Collect an exiting leader that still belongs to this process.
+///
+/// `waitpid(WNOHANG)` returns 0 while the leader is exiting and not yet a
+/// zombie. That window is short once a parent is actually waiting; cancellation
+/// otherwise only probes the group and the leader stays unreaped.
+fn reap_owned_exiting_leader(process_group: i32) -> bool {
+    if process_group <= 0 {
+        return false;
+    }
+    for _ in 0..20_000 {
+        let mut status = 0;
+        let result = unsafe { libc::waitpid(process_group, &raw mut status, libc::WNOHANG) };
+        if result == process_group {
+            return true;
+        }
+        if result == -1 {
+            let errno = io::Error::last_os_error().raw_os_error();
+            if errno == Some(libc::EINTR) {
+                continue;
+            }
+            return false;
+        }
+    }
+    false
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -939,13 +1058,7 @@ impl ProcessInspector for SystemProcessInspector {
         let Ok(process_group) = i32::try_from(process_group) else {
             return ProcessGroupObservation::Ambiguous;
         };
-        if unsafe { libc::kill(-process_group, 0) } == 0 {
-            return ProcessGroupObservation::Present;
-        }
-        match io::Error::last_os_error().raw_os_error() {
-            Some(libc::ESRCH) => ProcessGroupObservation::Absent,
-            _ => ProcessGroupObservation::Ambiguous,
-        }
+        observe_process_group(process_group)
     }
 
     fn observe_group_members(&self, leader: u32) -> ProcessGroupMembership {
@@ -3481,14 +3594,40 @@ fn wait_for_child(
         .checked_add(Duration::from_millis(timeout_millis))
         .ok_or_else(|| protocol_code("TIMEOUT_INVALID", "child deadline overflow"))?;
     loop {
-        if child_is_waitable(pid)? {
-            return complete_waitable_child(identity, inspector, timings);
+        match child_is_waitable(pid) {
+            Ok(true) => {
+                return match complete_waitable_child(identity, inspector, timings) {
+                    Err(error) if owned_child_was_collected(&error, pid) => {
+                        Ok(ChildOutcome::Signalled(libc::SIGTERM as u32))
+                    }
+                    other => other,
+                };
+            }
+            Ok(false) => {}
+            Err(error) if owned_child_was_collected(&error, pid) => {
+                return Ok(ChildOutcome::Signalled(libc::SIGTERM as u32));
+            }
+            Err(error) => return Err(error),
         }
         if Instant::now() >= deadline {
             return terminate_exact_group(identity, inspector, timings);
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+/// Cancellation can collect this process's zombie leader while proving the
+/// group gone. `ECHILD` after the pid itself is gone is that collection, not a
+/// lost child.
+fn owned_child_was_collected(error: &WorkerError, pid: libc::pid_t) -> bool {
+    let WorkerError::Io(source) = error else {
+        return false;
+    };
+    if source.raw_os_error() != Some(libc::ECHILD) {
+        return false;
+    }
+    (unsafe { libc::kill(pid, 0) }) != 0
+        && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
 fn complete_waitable_child(
@@ -6939,6 +7078,8 @@ commands = ["PATH=/bin:/usr/bin /bin/sleep 8; printf done > setup.done"]
     struct ScriptedReconciliationRuntime {
         process: Mutex<VecDeque<ProcessObservation>>,
         groups: Mutex<VecDeque<ProcessGroupObservation>>,
+        members: Mutex<VecDeque<ProcessGroupMembership>>,
+        signal_errnos: Mutex<VecDeque<i32>>,
         signals: Mutex<Vec<(u32, i32)>>,
         sleeps: Mutex<Vec<Duration>>,
         now: Mutex<Duration>,
@@ -6953,6 +7094,8 @@ commands = ["PATH=/bin:/usr/bin /bin/sleep 8; printf done > setup.done"]
             Self {
                 process: Mutex::new(process.into_iter().collect()),
                 groups: Mutex::new(groups.into_iter().collect()),
+                members: Mutex::new(VecDeque::new()),
+                signal_errnos: Mutex::new(VecDeque::new()),
                 signals: Mutex::new(Vec::new()),
                 sleeps: Mutex::new(Vec::new()),
                 now: Mutex::new(Duration::ZERO),
@@ -6962,6 +7105,18 @@ commands = ["PATH=/bin:/usr/bin /bin/sleep 8; printf done > setup.done"]
 
         fn with_clock(self, clock: impl IntoIterator<Item = Duration>) -> Self {
             *self.clock.lock().unwrap() = Some(clock.into_iter().collect());
+            self
+        }
+
+        fn with_members(self, members: impl IntoIterator<Item = ProcessGroupMembership>) -> Self {
+            *self.members.lock().unwrap() = members.into_iter().collect();
+            self
+        }
+
+        /// Errnos returned by the next `signal_process_group` calls. An empty
+        /// queue means every signal succeeds.
+        fn with_signal_errnos(self, errnos: impl IntoIterator<Item = i32>) -> Self {
+            *self.signal_errnos.lock().unwrap() = errnos.into_iter().collect();
             self
         }
 
@@ -7000,13 +7155,20 @@ commands = ["PATH=/bin:/usr/bin /bin/sleep 8; printf done > setup.done"]
         }
 
         fn observe_group_members(&self, _leader: u32) -> ProcessGroupMembership {
-            panic!("recorded-group termination must not use parent wait anchors")
+            self.members
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(ProcessGroupMembership::LeaderOnly)
         }
     }
 
     impl ReconciliationRuntime for ScriptedReconciliationRuntime {
         fn signal_process_group(&self, process_group: u32, signal: i32) -> Result<(), WorkerError> {
             self.signals.lock().unwrap().push((process_group, signal));
+            if let Some(errno) = self.signal_errnos.lock().unwrap().pop_front() {
+                return Err(WorkerError::Io(io::Error::from_raw_os_error(errno)));
+            }
             Ok(())
         }
 
@@ -7146,6 +7308,62 @@ commands = ["PATH=/bin:/usr/bin /bin/sleep 8; printf done > setup.done"]
     }
 
     #[test]
+    fn eperm_from_group_kill_keeps_probing_until_esrch() {
+        let child = recorded_child();
+        let runtime = ScriptedReconciliationRuntime::new(
+            [ProcessObservation::Absent],
+            [
+                ProcessGroupObservation::Present,
+                ProcessGroupObservation::Absent,
+            ],
+        )
+        .with_signal_errnos([libc::EPERM]);
+
+        terminate_exact_recorded_group(&runtime, Some(child)).unwrap();
+
+        assert_eq!(runtime.signals(), vec![(child.pid(), libc::SIGTERM)]);
+        assert_eq!(runtime.sleeps(), Vec::<Duration>::new());
+    }
+
+    #[test]
+    fn non_draining_group_kill_errno_still_fails_without_another_probe() {
+        let child = recorded_child();
+        let runtime = ScriptedReconciliationRuntime::new(
+            [ProcessObservation::Absent],
+            [ProcessGroupObservation::Present],
+        )
+        .with_signal_errnos([libc::EINVAL]);
+
+        let error = terminate_exact_recorded_group(&runtime, Some(child)).unwrap_err();
+
+        match error {
+            WorkerError::Io(source) => assert_eq!(source.raw_os_error(), Some(libc::EINVAL)),
+            other => panic!("expected the injected errno, got {other}"),
+        }
+        assert_eq!(runtime.signals(), vec![(child.pid(), libc::SIGTERM)]);
+        assert_eq!(runtime.sleeps(), Vec::<Duration>::new());
+    }
+
+    #[test]
+    fn leaderless_ambiguous_group_with_a_live_member_is_resignalled() {
+        let child = recorded_child();
+        let runtime = ScriptedReconciliationRuntime::new(
+            [ProcessObservation::Absent],
+            [
+                ProcessGroupObservation::Ambiguous,
+                ProcessGroupObservation::Ambiguous,
+                ProcessGroupObservation::Absent,
+            ],
+        )
+        .with_members([ProcessGroupMembership::OtherMembers]);
+
+        terminate_exact_recorded_group(&runtime, Some(child)).unwrap();
+
+        assert_eq!(runtime.signals(), vec![(child.pid(), libc::SIGTERM)]);
+        assert_eq!(runtime.sleeps(), vec![POLL_INTERVAL, POLL_INTERVAL]);
+    }
+
+    #[test]
     fn leaderless_ambiguous_group_becomes_absent_after_two_polls() {
         let child = recorded_child();
         let runtime = ScriptedReconciliationRuntime::new(
@@ -7223,6 +7441,156 @@ commands = ["PATH=/bin:/usr/bin /bin/sleep 8; printf done > setup.done"]
 
         assert_eq!(runtime.signals(), vec![(child.pid(), libc::SIGTERM)]);
         assert_eq!(runtime.sleeps(), vec![POLL_INTERVAL]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owned_zombie_leader_probe_reaps_and_reports_absent() {
+        run_isolated_raw_fork_scenario(
+            "supervisor::tests::owned_zombie_leader_probe_reaps_and_reports_absent",
+            || {
+                let (fork_exclusion, leader) = fork_without_exec();
+                assert!(leader >= 0, "fork failed: {}", io::Error::last_os_error());
+                if leader == 0 {
+                    unsafe {
+                        if libc::setpgid(0, 0) != 0 {
+                            libc::_exit(70);
+                        }
+                        libc::_exit(0);
+                    }
+                }
+                let _exclusion = fork_exclusion;
+                let _ = unsafe { libc::setpgid(leader, leader) };
+                let mut zombie = false;
+                for _ in 0..1_000_000 {
+                    let mut info = std::mem::MaybeUninit::<ProcBsdInfo>::zeroed();
+                    let size = size_of::<ProcBsdInfo>() as c_int;
+                    let described =
+                        unsafe { proc_pidinfo(leader, 3, 0, info.as_mut_ptr().cast(), size) };
+                    let pid_alive = unsafe { libc::kill(leader, 0) } == 0;
+                    if described == 0 && pid_alive {
+                        if unsafe { libc::kill(-leader, 0) } == 0 {
+                            continue;
+                        }
+                        assert_eq!(
+                            io::Error::last_os_error().raw_os_error(),
+                            Some(libc::EPERM),
+                            "owned zombie group probe was not EPERM"
+                        );
+                        zombie = true;
+                        break;
+                    }
+                    if !pid_alive && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                    {
+                        panic!("leader disappeared before its zombie could be probed");
+                    }
+                }
+                assert!(zombie, "leader did not become an owned zombie");
+                assert_eq!(
+                    SystemProcessInspector.observe_group(leader as u32),
+                    ProcessGroupObservation::Absent,
+                    "EPERM on an owned exiting leader must be collected and then proven absent"
+                );
+                let mut status = 0;
+                assert_eq!(
+                    unsafe { libc::waitpid(leader, &raw mut status, libc::WNOHANG) },
+                    -1,
+                    "group probe left the zombie for a second waiter"
+                );
+                assert_eq!(
+                    io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ECHILD)
+                );
+            },
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn zombie_grandchild_is_not_a_live_group_member() {
+        run_isolated_raw_fork_scenario(
+            "supervisor::tests::zombie_grandchild_is_not_a_live_group_member",
+            || {
+                let mut descriptors = [-1; 2];
+                assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+                let (fork_exclusion, leader) = fork_without_exec();
+                assert!(leader >= 0, "fork failed: {}", io::Error::last_os_error());
+                if leader == 0 {
+                    unsafe {
+                        libc::close(descriptors[0]);
+                        if libc::setpgid(0, 0) != 0 {
+                            libc::_exit(70);
+                        }
+                        let grand = libc::fork();
+                        if grand <= 0 {
+                            libc::_exit(if grand == 0 { 0 } else { 71 });
+                        }
+                        loop {
+                            let mut info = std::mem::MaybeUninit::<ProcBsdInfo>::zeroed();
+                            let size = size_of::<ProcBsdInfo>() as c_int;
+                            let described =
+                                proc_pidinfo(grand, 3, 0, info.as_mut_ptr().cast(), size);
+                            let kill_result = libc::kill(grand, 0);
+                            if described == 0 && kill_result == 0 {
+                                let bytes = (grand as u32).to_ne_bytes();
+                                libc::write(descriptors[1], bytes.as_ptr().cast(), bytes.len());
+                                loop {
+                                    libc::pause();
+                                }
+                            }
+                            if kill_result != 0
+                                && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                            {
+                                libc::_exit(72);
+                            }
+                        }
+                    }
+                }
+                let _exclusion = fork_exclusion;
+                let grouped = unsafe { libc::setpgid(leader, leader) };
+                if grouped != 0 {
+                    let errno = io::Error::last_os_error().raw_os_error();
+                    assert_eq!(
+                        errno,
+                        Some(libc::EACCES),
+                        "parent setpgid failed: {errno:?}"
+                    );
+                }
+                unsafe { libc::close(descriptors[1]) };
+                let mut bytes = [0_u8; 4];
+                let read =
+                    unsafe { libc::read(descriptors[0], bytes.as_mut_ptr().cast(), bytes.len()) };
+                assert_eq!(read, 4, "grandchild zombie was not reported");
+                let grand = u32::from_ne_bytes(bytes);
+                let mut listed = [0 as c_int; 16];
+                let returned = unsafe {
+                    proc_listpgrppids(
+                        leader,
+                        listed.as_mut_ptr().cast(),
+                        size_of_val(&listed) as c_int,
+                    )
+                };
+                let listed_grand = listed
+                    .into_iter()
+                    .take(usize::try_from(returned.max(0)).unwrap_or(0))
+                    .any(|pid| pid == grand as c_int);
+                assert!(
+                    listed_grand,
+                    "zombie grandchild {grand} was not in the leader group (listpgrp={returned})"
+                );
+                assert_eq!(
+                    SystemProcessInspector.observe_group_members(leader as u32),
+                    ProcessGroupMembership::LeaderOnly,
+                    "a zombie grandchild must not hold the leader's TERM grace"
+                );
+                unsafe {
+                    libc::kill(leader, libc::SIGKILL);
+                    let mut status = 0;
+                    libc::waitpid(leader, &raw mut status, 0);
+                    libc::close(descriptors[0]);
+                }
+            },
+        );
     }
 
     #[test]
