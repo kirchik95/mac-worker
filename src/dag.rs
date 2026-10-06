@@ -832,7 +832,12 @@ pub(crate) fn merge_pending_into_projection(
         .tasks
         .iter()
         .filter(|row| {
-            row.integration
+            // parent_gate_at fails children of a Closed, Abandoned or Lost parent.
+            !matches!(
+                row.state,
+                TaskState::Closed | TaskState::Abandoned | TaskState::Lost
+            ) && row
+                .integration
                 .as_ref()
                 .is_some_and(|snapshot| snapshot.state == IntegrationStatus::Blocked)
         })
@@ -1264,14 +1269,24 @@ mod tests {
     }
 
     #[test]
-    fn waiting_child_row_ignores_unconfigured_missing_and_unrelated_parents() {
+    fn waiting_child_row_ignores_unconfigured_missing_unrelated_and_terminal_parents() {
         let (dag, projection) = waiting_child_fixture();
-        for case in ["unconfigured", "missing", "unrelated"] {
+        for case in [
+            "unconfigured",
+            "missing",
+            "unrelated",
+            "closed",
+            "abandoned",
+            "lost",
+        ] {
             let mut projection = projection.clone();
             match case {
                 "unconfigured" => projection.tasks[0].integration = None,
                 "missing" => projection.tasks.clear(),
                 "unrelated" => projection.tasks[0].task_id = TaskId::new(Uuid::from_u128(99)),
+                "closed" => projection.tasks[0].state = TaskState::Closed,
+                "abandoned" => projection.tasks[0].state = TaskState::Abandoned,
+                "lost" => projection.tasks[0].state = TaskState::Lost,
                 _ => unreachable!(),
             }
             merge_pending_into_projection(&mut projection, dag.run_id, &dag, dag.created_at_millis);
