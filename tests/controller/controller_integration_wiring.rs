@@ -828,8 +828,71 @@ fn replayed_cancel_after_unbound_commit_is_already_committed() {
 }
 
 #[test]
-fn replayed_close_after_unbound_commit_is_already_committed() {
-    replayed_stop_after_unbound_commit("task.close", "00000000000000000000000000000072");
+fn replayed_close_after_unbound_commit_closes() {
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        controller::{ControllerFault, ControllerStore, RequestPhase, TaskSubmitHandler},
+        task::model::{LocalTaskRecord, TaskOutcome},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let paths = isolated_paths(&temp.path().canonicalize().unwrap());
+    let config = fixture_config(&paths);
+    let tasks = ClientStateStore::open(&paths.state).unwrap();
+    let ordinary = sample_ordinary(fixture_task(), fixture_source());
+    tasks.create_task(ordinary.clone()).unwrap();
+    let state = RootedIntegrationState::open(
+        &paths,
+        std::sync::Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    let mut integration = sample_record(fixture_task(), fixture_source(), "main");
+    state
+        .publish_policy(fixture_task(), &integration.policy)
+        .unwrap();
+    let handler = TaskSubmitHandler::new(&NoProcesses, &config, &paths, &tasks);
+    let store = ControllerStore::open(&paths.controller_state_root()).unwrap();
+    let request = freeze_published(
+        &store,
+        &handler,
+        "task.close",
+        "00000000000000000000000000000072",
+    );
+    integration.snapshot.state = IntegrationStatus::Integrated;
+    integration.snapshot.disposition = Some(IntegrationDisposition::AlreadyIntegrated);
+    integration.snapshot.observed_target_oid = Some(fixture_head());
+    integration.receipt = Some(IntegrationReceipt {
+        integration_id: integration.snapshot.integration_id,
+        epoch: 0,
+        source_turn_id: fixture_source(),
+        source_head: fixture_head(),
+        target_head: fixture_head(),
+        merge_oid: None,
+        disposition: IntegrationDisposition::AlreadyIntegrated,
+        imported: true,
+        recorded_at_millis: 1001,
+    });
+    state
+        .replace(fixture_task(), IntegrationRevision(0), &integration)
+        .unwrap();
+    let mut wire = serde_json::to_value(&ordinary).unwrap();
+    wire["status"]["updated_at_millis"] = json!(1002);
+    let bumped: LocalTaskRecord = serde_json::from_value(wire).unwrap();
+    assert!(tasks.update_task_if_current(&ordinary, bumped).unwrap());
+    for _ in 0..2 {
+        let error = store
+            .handle_with(&request, &handler, ControllerFault::None)
+            .unwrap_err();
+        assert_eq!(error.public_code(), "WORKER_NOT_FOUND");
+        assert_eq!(
+            store.load(request.request_id()).unwrap().unwrap().phase(),
+            RequestPhase::Published
+        );
+        let current = tasks.load_task(fixture_task()).unwrap();
+        assert!(current.close_intent().is_some());
+        assert_eq!(current.status().last_outcome(), Some(&TaskOutcome::Done));
+        assert_eq!(state.load(fixture_task()).unwrap().unwrap(), integration);
+        assert!(tasks.queue_snapshot().unwrap().entries().is_empty());
+    }
 }
 
 /// The frozen cancel/close was prepared before any integration record existed.
@@ -1458,4 +1521,385 @@ fn controller_companion_read_contract_is_separate_strict_and_bounded() {
     assert!(overflow.validate().is_err());
     assert_eq!(HOST_FEATURE_INTEGRATION, "task.integration");
     assert_eq!(CONTROLLER_FEATURE_INTEGRATION, "controller.integration");
+}
+
+fn freeze_published(
+    store: &mac_worker::test_support::controller::ControllerStore,
+    handler: &mac_worker::test_support::controller::TaskSubmitHandler<'_>,
+    command: &str,
+    request_id: &str,
+) -> mac_worker::test_support::controller::ControllerRequest {
+    let body = if command == "task.close" {
+        json!({"task_id": fixture_task(), "discard": false})
+    } else {
+        json!({"task_id": fixture_task()})
+    };
+    let request = parse_request(
+        &serde_json::to_vec(&json!({"protocol_version": 7,
+            "request_id": request_id, "command": command, "body": body}))
+        .unwrap(),
+    )
+    .unwrap();
+    store
+        .handle_with(
+            &request,
+            handler,
+            mac_worker::test_support::controller::ControllerFault::StopAfterPublish,
+        )
+        .unwrap();
+    request
+}
+
+fn owner_active_before_done_import(
+    done: &mac_worker::test_support::task::model::LocalTaskRecord,
+) -> mac_worker::test_support::task::model::LocalTaskRecord {
+    let mut wire = serde_json::to_value(done).unwrap();
+    wire["status"]["state"] = json!("active");
+    wire["status"]["last_outcome"] = serde_json::Value::Null;
+    let turn = wire["status"]["turns"]
+        .as_array_mut()
+        .unwrap()
+        .last_mut()
+        .unwrap();
+    turn["terminal"] = serde_json::Value::Null;
+    turn["outcome"] = serde_json::Value::Null;
+    turn["ended_at_millis"] = serde_json::Value::Null;
+    serde_json::from_value(wire).unwrap()
+}
+
+/// Unbound cancel/close frozen on an earlier ordinary turn. A newer turn's
+/// imported commit is not that request's cycle.
+#[test]
+fn unbound_replay_after_a_newer_turn_commit_stays_a_conflict() {
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        controller::{ControllerFault, ControllerStore, TaskSubmitHandler},
+        task::model::TaskOutcome,
+    };
+    for (command, id) in [
+        ("task.close", "00000000000000000000000000000092"),
+        ("task.cancel", "00000000000000000000000000000091"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = isolated_paths(&temp.path().canonicalize().unwrap());
+        let config = fixture_config(&paths);
+        let tasks = ClientStateStore::open(&paths.state).unwrap();
+        let ordinary = sample_ordinary(fixture_task(), fixture_source());
+        tasks.create_task(ordinary.clone()).unwrap();
+        let state = RootedIntegrationState::open(
+            &paths,
+            std::sync::Arc::new(ManualIntegrationRuntime::default()),
+        )
+        .unwrap();
+        state
+            .publish_policy(fixture_task(), &sample_policy("main"))
+            .unwrap();
+        let handler = TaskSubmitHandler::new(&NoProcesses, &config, &paths, &tasks);
+        let store = ControllerStore::open(&paths.controller_state_root()).unwrap();
+        let request = freeze_published(&store, &handler, command, id);
+        let followup =
+            sample_ordinary_followup(fixture_task(), fixture_source(), Some(TaskOutcome::Done));
+        assert!(
+            tasks
+                .update_task_if_current(&ordinary, followup.clone())
+                .unwrap()
+        );
+        let newer = followup.status().turns().last().unwrap().turn_id();
+        let accepted = followup.status().head_oid().unwrap().clone();
+        let mut integration = sample_record(fixture_task(), newer, "main");
+        integration.snapshot.state = IntegrationStatus::Integrated;
+        integration.snapshot.disposition = Some(IntegrationDisposition::AlreadyIntegrated);
+        integration.snapshot.observed_target_oid = Some(accepted.clone());
+        integration.receipt = Some(IntegrationReceipt {
+            integration_id: integration.snapshot.integration_id,
+            epoch: 0,
+            source_turn_id: newer,
+            source_head: fixture_head(),
+            target_head: accepted.clone(),
+            merge_oid: None,
+            disposition: IntegrationDisposition::AlreadyIntegrated,
+            imported: true,
+            recorded_at_millis: 1004,
+        });
+        state
+            .replace(fixture_task(), IntegrationRevision(0), &integration)
+            .unwrap();
+        let error = store
+            .handle_with(&request, &handler, ControllerFault::None)
+            .unwrap_err();
+        assert_eq!(
+            error.public_code(),
+            "TASK_REVISION_CONFLICT",
+            "{command}: a newer turn's commit relabels the frozen request"
+        );
+    }
+}
+
+/// Owner-lag cancel frozen while Active. Importing that same turn's Done
+/// status is allowed progress: busy while a runner is recorded, then a resumable
+/// stop once the source can be covered. It must not settle as a final conflict.
+/// Close prepare reconciles an Active task and would launch a worker, so this
+/// fixture only freezes cancel; close shares the same decode refresh.
+#[test]
+fn unbound_replay_after_its_own_done_import_refreshes_and_stops() {
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        controller::{ControllerFault, ControllerStore, RequestPhase, TaskSubmitHandler},
+        task::model::{RunnerIdentity, TaskState},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let paths = isolated_paths(&temp.path().canonicalize().unwrap());
+    let config = fixture_config(&paths);
+    let tasks = ClientStateStore::open(&paths.state).unwrap();
+    let done = sample_ordinary(fixture_task(), fixture_source());
+    let active = owner_active_before_done_import(&done);
+    assert_eq!(active.status().state(), TaskState::Active);
+    tasks.create_task(active.clone()).unwrap();
+    let state = RootedIntegrationState::open(
+        &paths,
+        std::sync::Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    state
+        .publish_policy(fixture_task(), &sample_policy("main"))
+        .unwrap();
+    let handler = TaskSubmitHandler::new(&NoProcesses, &config, &paths, &tasks);
+    let store = ControllerStore::open(&paths.controller_state_root()).unwrap();
+    let request = freeze_published(
+        &store,
+        &handler,
+        "task.cancel",
+        "00000000000000000000000000000093",
+    );
+    assert!(tasks.update_task_if_current(&active, done).unwrap());
+    let runner = ProcessIdentity::new(5_000_031, 9_999_999).unwrap();
+    tasks
+        .record_runner(fixture_task(), Some(RunnerIdentity::new(runner)))
+        .unwrap();
+    let busy = store
+        .handle_with(&request, &handler, ControllerFault::None)
+        .unwrap_err();
+    assert_eq!(busy.public_code(), "TASK_BUSY");
+    assert_eq!(busy.public_message(), "INTEGRATION_IN_PROGRESS");
+    assert_eq!(
+        store.load(request.request_id()).unwrap().unwrap().phase(),
+        RequestPhase::Published
+    );
+    assert!(state.load(fixture_task()).unwrap().is_none());
+    tasks.record_runner(fixture_task(), None).unwrap();
+    let error = store
+        .handle_with(&request, &handler, ControllerFault::None)
+        .unwrap_err();
+    assert_eq!(error.public_code(), "INTEGRATION_STOP_UNCONFIRMED");
+    assert_eq!(
+        store.load(request.request_id()).unwrap().unwrap().phase(),
+        RequestPhase::Published
+    );
+    let record = state.load(fixture_task()).unwrap().expect("cycle");
+    assert_eq!(record.snapshot.source_turn_id, fixture_source());
+    assert_eq!(record.snapshot.state, IntegrationStatus::Pending);
+    assert!(
+        record
+            .tombstone
+            .is_some_and(|tombstone| !tombstone.acknowledged)
+    );
+}
+
+/// Same turn, but the cycle epoch is no longer the one an unbound freeze could
+/// have started. That is a real change and stays a final conflict.
+#[test]
+fn unbound_replay_after_an_epoch_change_stays_a_conflict() {
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        controller::{ControllerFault, ControllerStore, RequestPhase, TaskSubmitHandler},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let paths = isolated_paths(&temp.path().canonicalize().unwrap());
+    let config = fixture_config(&paths);
+    let tasks = ClientStateStore::open(&paths.state).unwrap();
+    let done = sample_ordinary(fixture_task(), fixture_source());
+    let active = owner_active_before_done_import(&done);
+    tasks.create_task(active.clone()).unwrap();
+    let state = RootedIntegrationState::open(
+        &paths,
+        std::sync::Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    state
+        .publish_policy(fixture_task(), &sample_policy("main"))
+        .unwrap();
+    let handler = TaskSubmitHandler::new(&NoProcesses, &config, &paths, &tasks);
+    let store = ControllerStore::open(&paths.controller_state_root()).unwrap();
+    let request = freeze_published(
+        &store,
+        &handler,
+        "task.cancel",
+        "00000000000000000000000000000097",
+    );
+    assert!(tasks.update_task_if_current(&active, done).unwrap());
+    let mut integration = sample_record(fixture_task(), fixture_source(), "main");
+    integration.snapshot.epoch = 1;
+    integration.snapshot.state = IntegrationStatus::Pending;
+    state
+        .replace(fixture_task(), IntegrationRevision(0), &integration)
+        .unwrap();
+    let error = store
+        .handle_with(&request, &handler, ControllerFault::None)
+        .unwrap_err();
+    assert_eq!(error.public_code(), "TASK_REVISION_CONFLICT");
+    assert_eq!(
+        store.load(request.request_id()).unwrap().unwrap().phase(),
+        RequestPhase::Acked
+    );
+    assert_eq!(state.load(fixture_task()).unwrap().unwrap(), integration);
+}
+
+/// The frozen turn's cycle has a receipt that is not imported yet. The replay
+/// stays resumable, then becomes INTEGRATION_ALREADY_COMMITTED once imported.
+#[test]
+fn unbound_replay_in_the_pending_receipt_window_stays_resumable() {
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        controller::{ControllerFault, ControllerStore, RequestPhase, TaskSubmitHandler},
+        task::model::TaskOutcome,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let paths = isolated_paths(&temp.path().canonicalize().unwrap());
+    let config = fixture_config(&paths);
+    let tasks = ClientStateStore::open(&paths.state).unwrap();
+    let active = sample_ordinary_followup(fixture_task(), fixture_source(), None);
+    tasks.create_task(active.clone()).unwrap();
+    let state = RootedIntegrationState::open(
+        &paths,
+        std::sync::Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    state
+        .publish_policy(fixture_task(), &sample_policy("main"))
+        .unwrap();
+    let handler = TaskSubmitHandler::new(&NoProcesses, &config, &paths, &tasks);
+    let store = ControllerStore::open(&paths.controller_state_root()).unwrap();
+    let request = freeze_published(
+        &store,
+        &handler,
+        "task.cancel",
+        "00000000000000000000000000000095",
+    );
+    let done = sample_ordinary_followup(fixture_task(), fixture_source(), Some(TaskOutcome::Done));
+    assert!(tasks.update_task_if_current(&active, done.clone()).unwrap());
+    let turn = done.status().turns().last().unwrap().turn_id();
+    let accepted = done.status().head_oid().unwrap().clone();
+    let mut integration = sample_record(fixture_task(), turn, "main");
+    integration.snapshot.state = IntegrationStatus::Published;
+    integration.snapshot.disposition = Some(IntegrationDisposition::AlreadyIntegrated);
+    integration.snapshot.observed_target_oid = Some(accepted.clone());
+    integration.receipt = Some(IntegrationReceipt {
+        integration_id: integration.snapshot.integration_id,
+        epoch: 0,
+        source_turn_id: turn,
+        source_head: fixture_head(),
+        target_head: accepted.clone(),
+        merge_oid: None,
+        disposition: IntegrationDisposition::AlreadyIntegrated,
+        imported: false,
+        recorded_at_millis: 1004,
+    });
+    state
+        .replace(fixture_task(), IntegrationRevision(0), &integration)
+        .unwrap();
+    let error = store
+        .handle_with(&request, &handler, ControllerFault::None)
+        .unwrap_err();
+    assert_eq!(error.public_code(), "INTEGRATION_STOP_UNCONFIRMED");
+    assert_eq!(
+        store.load(request.request_id()).unwrap().unwrap().phase(),
+        RequestPhase::Published
+    );
+    let previous = integration.snapshot.revision;
+    integration.snapshot.revision = IntegrationRevision(2);
+    integration.snapshot.state = IntegrationStatus::Integrated;
+    integration.receipt.as_mut().unwrap().imported = true;
+    state
+        .replace(fixture_task(), previous, &integration)
+        .unwrap();
+    let error = store
+        .handle_with(&request, &handler, ControllerFault::None)
+        .unwrap_err();
+    assert_eq!(error.public_code(), "INTEGRATION_ALREADY_COMMITTED");
+    assert_eq!(
+        store.load(request.request_id()).unwrap().unwrap().phase(),
+        RequestPhase::Acked
+    );
+}
+
+/// A close frozen after the cycle record existed is refreshed by decode and
+/// goes on to close. The fixture has no worker, so the host step is
+/// WORKER_NOT_FOUND after the close intent is fenced.
+#[test]
+fn bound_close_replay_after_import_goes_on_to_close() {
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        controller::{ControllerFault, ControllerStore, TaskSubmitHandler},
+        task::model::LocalTaskRecord,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let paths = isolated_paths(&temp.path().canonicalize().unwrap());
+    let config = fixture_config(&paths);
+    let tasks = ClientStateStore::open(&paths.state).unwrap();
+    let ordinary = sample_ordinary(fixture_task(), fixture_source());
+    tasks.create_task(ordinary.clone()).unwrap();
+    let state = RootedIntegrationState::open(
+        &paths,
+        std::sync::Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    let mut integration = sample_record(fixture_task(), fixture_source(), "main");
+    state
+        .publish_policy(fixture_task(), &integration.policy)
+        .unwrap();
+    state
+        .replace(fixture_task(), IntegrationRevision(0), &integration)
+        .unwrap();
+    let handler = TaskSubmitHandler::new(&NoProcesses, &config, &paths, &tasks);
+    let store = ControllerStore::open(&paths.controller_state_root()).unwrap();
+    let request = freeze_published(
+        &store,
+        &handler,
+        "task.close",
+        "00000000000000000000000000000096",
+    );
+    let previous = integration.snapshot.revision;
+    integration.snapshot.revision = IntegrationRevision(2);
+    integration.snapshot.state = IntegrationStatus::Integrated;
+    integration.snapshot.disposition = Some(IntegrationDisposition::AlreadyIntegrated);
+    integration.snapshot.observed_target_oid = Some(fixture_head());
+    integration.receipt = Some(IntegrationReceipt {
+        integration_id: integration.snapshot.integration_id,
+        epoch: 0,
+        source_turn_id: fixture_source(),
+        source_head: fixture_head(),
+        target_head: fixture_head(),
+        merge_oid: None,
+        disposition: IntegrationDisposition::AlreadyIntegrated,
+        imported: true,
+        recorded_at_millis: 1001,
+    });
+    state
+        .replace(fixture_task(), previous, &integration)
+        .unwrap();
+    let mut wire = serde_json::to_value(&ordinary).unwrap();
+    wire["status"]["updated_at_millis"] = json!(1002);
+    let bumped: LocalTaskRecord = serde_json::from_value(wire).unwrap();
+    assert!(tasks.update_task_if_current(&ordinary, bumped).unwrap());
+    let error = store
+        .handle_with(&request, &handler, ControllerFault::None)
+        .unwrap_err();
+    assert_eq!(error.public_code(), "WORKER_NOT_FOUND");
+    assert!(
+        tasks
+            .load_task(fixture_task())
+            .unwrap()
+            .close_intent()
+            .is_some()
+    );
 }

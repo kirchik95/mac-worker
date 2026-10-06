@@ -3198,6 +3198,115 @@ fn stop_while_owner_status_lags_host_done(operation: &str) {
     }
 }
 
+#[test]
+fn native_cancel_lag_with_recorded_runner_is_busy_then_stops() {
+    lag_with_recorded_runner_is_busy_then_stops("cancel");
+}
+
+#[test]
+fn native_close_lag_with_recorded_runner_is_busy_then_stops() {
+    lag_with_recorded_runner_is_busy_then_stops("close");
+}
+
+/// Owner Active, host Done, runner still recorded. The first stop imports Done
+/// and stays TASK_BUSY with no cycle; after the runner is cleared the same
+/// command revokes before any push.
+fn lag_with_recorded_runner_is_busy_then_stops(operation: &str) {
+    use mac_worker::test_support::client_state::ClientStateStore;
+    use std::sync::{Arc, Mutex, mpsc};
+
+    let (f, task) = parked_source_fixture();
+    let paths = owner_paths(&f);
+    let state = RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+        .unwrap();
+    let parked = state.load(task).unwrap().unwrap();
+    std::fs::remove_file(
+        paths
+            .state
+            .join(format!("integrations/tasks/{task}/record.json")),
+    )
+    .unwrap();
+    let client = ClientStateStore::open(&paths.state).unwrap();
+    let ordinary = client.load_task(task).unwrap();
+    let observer = FakeIntegrationObserver::default();
+    observer.insert(IntegrationTaskFacts {
+        cycle_base: parked.cycle_base,
+        ordinary,
+        result_imported: true,
+        session_import_complete: true,
+        continuation_pending: false,
+        runner_present: false,
+        stop_requested: false,
+        close_pending: false,
+        submission_pending: false,
+        auxiliary_purpose: None,
+    });
+    let host = FakeIntegrationHost::default();
+    let turns = FakeIntegrationTurns::default();
+    let (ready, reached) = mpsc::channel();
+    let (release, resume) = mpsc::channel();
+    let runtime = FirstIntentBarrier {
+        clock: ManualIntegrationRuntime::default(),
+        ready,
+        release: Mutex::new(resume),
+    };
+    let coordinator = IntegrationCoordinator::new(&state, &host, &turns, &runtime, &observer);
+    let origin = f.laptop.parent().unwrap().join("origin.git");
+    let target = || {
+        f.project
+            .git(&["--git-dir", origin.to_str().unwrap(), "rev-parse", "main"])
+            .stdout
+    };
+    let before = target();
+    let (busy, after_busy, stopped) = std::thread::scope(|scope| {
+        let publisher =
+            scope.spawn(|| coordinator.on_terminal(task, parked.snapshot.source_turn_id));
+        reached
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+            .unwrap();
+        let current = client.load_task(task).unwrap();
+        let lagged = owner_status_lagging_host_done(&current);
+        assert!(client.update_task_if_current(&current, lagged).unwrap());
+        let runner =
+            ProcessIdentity::new(crate::support::fixture_pid(2_000_000_031), 9_999_999).unwrap();
+        client
+            .record_runner(task, Some(RunnerIdentity::new(runner)))
+            .unwrap();
+        let busy = f.worker(&["--json", "task", operation, &task.to_string()]);
+        let after_busy = (client.load_task(task).unwrap(), state.load(task).unwrap());
+        client.record_runner(task, None).unwrap();
+        let stopped = f.worker(&["--json", "task", operation, &task.to_string()]);
+        release.send(()).unwrap();
+        publisher.join().unwrap().unwrap();
+        (busy, after_busy, stopped)
+    });
+    assert_eq!(
+        busy.status.code(),
+        Some(64),
+        "{operation}: {}",
+        String::from_utf8_lossy(&busy.stdout)
+    );
+    let reply: Value = serde_json::from_slice(&busy.stdout).unwrap();
+    assert_eq!(reply["code"], "TASK_BUSY", "{reply}");
+    assert_eq!(reply["message"], "INTEGRATION_IN_PROGRESS", "{reply}");
+    let (owner, cycle) = after_busy;
+    assert_eq!(owner.status().state(), TaskState::Open, "Done was imported");
+    assert!(cycle.is_none(), "no cycle while the runner is recorded");
+    assert!(
+        stopped.status.success(),
+        "{operation} after retirement: {}",
+        String::from_utf8_lossy(&stopped.stdout)
+    );
+    let record = state.load(task).unwrap().expect("integration cycle");
+    assert_eq!(record.snapshot.state, IntegrationStatus::Revoked);
+    assert!(record.tombstone.unwrap().acknowledged);
+    assert_eq!(target(), before);
+    assert!(f.worker(&["controller", "drain", "--off"]).status.success());
+    assert!(f.worker(&["--json", "task", "reconcile"]).status.success());
+    assert_eq!(target(), before, "push after acknowledged {operation}");
+    assert!(host.calls().is_empty());
+}
+
 fn owner_status_lagging_host_done(record: &LocalTaskRecord) -> LocalTaskRecord {
     let mut wire = serde_json::to_value(record).unwrap();
     wire["status"]["state"] = json!("active");
