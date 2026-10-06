@@ -627,7 +627,14 @@ impl<'a> OriginOutbox<'a> {
         idle_millis: u64,
         identity: &dyn BinaryIdentitySource,
     ) -> Result<(), WorkerError> {
-        self.run_watch_with_wait(stop, now, idle_millis, identity, interruptible_sleep)
+        self.run_watch_with_wait(
+            stop,
+            now,
+            idle_millis,
+            identity,
+            || self.store.validate_layout(),
+            interruptible_sleep,
+        )
     }
 
     fn run_watch_with_wait(
@@ -636,6 +643,7 @@ impl<'a> OriginOutbox<'a> {
         now: impl Fn() -> u64,
         idle_millis: u64,
         identity: &dyn BinaryIdentitySource,
+        mut validate: impl FnMut() -> Result<(), WorkerError>,
         mut wait: impl FnMut(&AtomicBool, u64),
     ) -> Result<(), WorkerError> {
         let Some(_pump) = self.try_pump_lock()? else {
@@ -649,11 +657,17 @@ impl<'a> OriginOutbox<'a> {
             // when idle. Mutable outbox files and directory timestamps are not
             // installation identity: their disappearance or writes must not
             // end a live watcher.
-            if self.store.validate_layout().is_err() {
-                return Ok(());
-            }
+            let validated = match validate() {
+                Ok(()) => true,
+                // Descriptor or memory pressure and interrupted calls prove
+                // nothing about the installation: skip this pump, check again.
+                Err(error) if transient_validation_error(&error) => false,
+                Err(_) => return Ok(()),
+            };
             let now_millis = now();
-            let _ = self.pump_due_locked(now_millis);
+            if validated {
+                let _ = self.pump_due_locked(now_millis);
+            }
             if watch_should_stop(stop) {
                 break;
             }
@@ -1541,6 +1555,16 @@ fn watch_should_stop(stop: &AtomicBool) -> bool {
     stop.load(Ordering::SeqCst) || WATCH_STOP.load(Ordering::SeqCst)
 }
 
+fn transient_validation_error(error: &WorkerError) -> bool {
+    matches!(
+        error,
+        WorkerError::Io(error) if matches!(
+            error.raw_os_error(),
+            Some(libc::EMFILE | libc::ENFILE | libc::ENOMEM | libc::EINTR)
+        )
+    )
+}
+
 fn interruptible_sleep(stop: &AtomicBool, millis: u64) {
     let mut remaining = millis;
     while remaining > 0 && !watch_should_stop(stop) {
@@ -1779,7 +1803,7 @@ mod tests {
     }
 
     fn fixture() -> (tempfile::TempDir, HostStore) {
-        let temp = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
         let store = HostStore::open(&temp.path().join("host")).unwrap();
         (temp, store)
     }
@@ -1787,6 +1811,15 @@ mod tests {
     fn watch(
         outbox: &OriginOutbox<'_>,
         stop: &AtomicBool,
+        wait: impl FnMut(&AtomicBool, u64),
+    ) -> Result<(), WorkerError> {
+        watch_validating(outbox, stop, || outbox.store.validate_layout(), wait)
+    }
+
+    fn watch_validating(
+        outbox: &OriginOutbox<'_>,
+        stop: &AtomicBool,
+        validate: impl FnMut() -> Result<(), WorkerError>,
         wait: impl FnMut(&AtomicBool, u64),
     ) -> Result<(), WorkerError> {
         outbox.run_watch_with_wait(
@@ -1797,8 +1830,73 @@ mod tests {
                 started: None,
                 installed: None,
             },
+            validate,
             wait,
         )
+    }
+
+    #[test]
+    fn watch_keeps_polling_through_transient_validation_errors() {
+        for errno in [libc::EMFILE, libc::ENFILE, libc::ENOMEM, libc::EINTR] {
+            let (_temp, store) = fixture();
+            let outbox = OriginOutbox::new(&store, &NoProcesses);
+            let stop = AtomicBool::new(false);
+            let before = due_index_reads_for(store.root());
+            let mut validations = 0;
+            let mut polls = 0;
+
+            watch_validating(
+                &outbox,
+                &stop,
+                || {
+                    validations += 1;
+                    if validations == 1 {
+                        return Err(io::Error::from_raw_os_error(errno).into());
+                    }
+                    store.validate_layout()
+                },
+                |stop, _| {
+                    polls += 1;
+                    // Every poll reads the due index to size its sleep; only a
+                    // validated poll reads it again to pump.
+                    let reads = due_index_reads_for(store.root()) - before;
+                    match polls {
+                        1 => assert_eq!(reads, 1, "errno {errno}: unvalidated poll pumped"),
+                        2 => {
+                            assert_eq!(reads, 3, "errno {errno}: validated poll skipped the pump");
+                            stop.store(true, Ordering::SeqCst);
+                        }
+                        _ => panic!("watcher ignored the stop request"),
+                    }
+                },
+            )
+            .unwrap();
+
+            assert_eq!(polls, 2, "errno {errno}: transient error ended the watch");
+            assert_eq!(validations, 2, "errno {errno}");
+        }
+    }
+
+    #[test]
+    fn watch_exits_on_validation_errors_that_are_not_transient() {
+        let errors: [fn() -> WorkerError; 3] = [
+            || io::Error::from_raw_os_error(libc::ENOENT).into(),
+            || io::Error::from_raw_os_error(libc::ESTALE).into(),
+            || WorkerError::Protocol("canonical host layout record changed".into()),
+        ];
+        for error in errors {
+            let (_temp, store) = fixture();
+            let outbox = OriginOutbox::new(&store, &NoProcesses);
+            let stop = AtomicBool::new(false);
+
+            watch_validating(
+                &outbox,
+                &stop,
+                || Err(error()),
+                |_, _| panic!("watcher kept polling after a failed validation"),
+            )
+            .expect("a failed validation must be a clean exit");
+        }
     }
 
     #[test]
