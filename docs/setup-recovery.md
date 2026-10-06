@@ -389,6 +389,26 @@ If inspection shows the exact terminal state `promoted` or `rolled_back`, run th
 If any inspection, identity check, probe, removal, or `rmdir` step fails, stop, retain the lock and transaction as evidence, and do not retry setup. Do not delete unrelated setup directories or release a lock whose owner no longer matches.
 
 
+## Promotion drain refusals
+
+`worker setup` checks for undrained host work every time it promotes a new helper, and also when it migrates a host layout. A refusal is reported as `PROMOTION_FAILED`; its diagnostic includes `HOST_UPGRADE_DRAIN_REQUIRED` followed by one fixed, path-free reason:
+
+- `private cleanup residue in the host root`
+- `private cleanup residue remains in an upgrade-scoped namespace`
+- `live or partial lease remains`
+- `lease inventory is incomplete or unreadable`
+- `incoming transfer remains`
+- `non-terminal job remains`
+- `job retains mutable execution evidence`
+- `accepted job index staging residue remains`
+- `job index is incomplete or inconsistent`
+- `job inventory is incomplete or unreadable`
+- `host inventory requires draining`
+
+The reason names only the evidence family and never an on-disk inventory name or path. Drain or finish the named work before retrying; do not remove unknown lease, transfer, job, index, or cleanup entries by hand.
+
+Host-store open performs bounded cleanup recovery before this drain inspection. If a killed atomic host-root write left an identity-bound replacement stage with a committed cleanup intent, open retries that replacement and can clear the residue so promotion proceeds. It deliberately preserves unbound writer temporaries, and refused or ambiguous evidence still produces the fixed drain reason. Retain such evidence rather than deleting it manually.
+
 ## Migrating an older installation
 
 The v2 helper migrates the host layout only through `worker setup`. Every other entry point, including the read-only probe, fails closed on an outdated layout. A worker whose data root predates the installation anchor reports `HOST_LAYOUT_OUTDATED` or fails setup; it is not eligible until setup has migrated it.
