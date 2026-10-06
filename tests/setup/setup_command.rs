@@ -1477,6 +1477,64 @@ fn promotion_failure_before_move_reconciles_previous_target_then_cleans_up() {
 }
 
 #[test]
+fn promotion_drain_failure_renders_host_reason_without_inventory_secrets() {
+    use mac_worker::test_support::host::store::HostStore;
+
+    for (scope, reason) in [
+        (
+            ".mac-worker-rooted-fs",
+            "private cleanup residue in the host root",
+        ),
+        ("incoming", "incoming transfer remains"),
+    ] {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let residue = root.join(scope);
+        fs::create_dir_all(&residue).unwrap();
+        fs::set_permissions(&residue, fs::Permissions::from_mode(0o700)).unwrap();
+        let secret = "PLANTED_USERNAME_AND_SECRET";
+        fs::write(residue.join(secret), b"pending").unwrap();
+        fs::set_permissions(residue.join(secret), fs::Permissions::from_mode(0o600)).unwrap();
+        let error = store.require_protocol_upgrade_drain().unwrap_err();
+        let stderr = format!("{}: {}\n", error.public_code(), error.public_message());
+        let (_executable_directory, current_exe) = executable_fixture();
+        let runner = RecordingRunner::returning(vec![
+            result(0, valid_probe_json(), b""),
+            result(0, b"", b""),
+            result(0, b"", b""),
+            result(0, b"match\n", b""),
+            result(0, b"", b""),
+            result(77, b"", stderr.as_bytes()),
+            result(0, b"previous\n", b""),
+            result(0, b"", b""),
+        ]);
+        let installer =
+            Installer::with_installation_id(&runner, Uuid::parse_str(INSTALLATION_ID).unwrap());
+        let installed = installer.install(&current_exe, &worker());
+        assert_eq!(installed.error_code.as_deref(), Some("PROMOTION_FAILED"));
+        let expected =
+            format!("promotion failed with exit 77: HOST_UPGRADE_DRAIN_REQUIRED: {reason}");
+        assert_eq!(installed.error_message.as_deref(), Some(expected.as_str()));
+        let output = CommandOutput::Setup(SetupReport {
+            protocol_version: PROTOCOL_VERSION,
+            workers: vec![installed],
+            warnings: Vec::new(),
+        });
+        assert_eq!(
+            output.render_human(),
+            format!("mini-1: failed [PROMOTION_FAILED]: {expected}\n  sha256: {CANDIDATE_DIGEST}")
+        );
+        let json: serde_json::Value = serde_json::from_str(&output.render_json().unwrap()).unwrap();
+        assert_eq!(json["workers"][0]["error_message"], expected);
+        for rendered in [output.render_human(), output.render_json().unwrap()] {
+            assert!(!rendered.contains(secret));
+            assert!(!rendered.contains(root.to_str().unwrap()));
+        }
+    }
+}
+
+#[test]
 fn disconnected_promotion_reconciled_as_candidate_continues_to_probe() {
     // Catches submitting promotion twice or rolling back an already-active
     // candidate merely because the SSH result was lost.

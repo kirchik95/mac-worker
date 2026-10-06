@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -824,6 +824,25 @@ pub(crate) fn merge_pending_into_projection(
     dag: &DagRecord,
     created_at_millis: u64,
 ) {
+    use crate::integration::contracts::{IntegrationCode, IntegrationStatus};
+
+    // The caller attaches current integration snapshots before merging DAG rows.
+    // Derive this wait from those rows so a redrive clears it without changing the DAG.
+    let integration_blocked: BTreeSet<_> = projection
+        .tasks
+        .iter()
+        .filter(|row| {
+            // parent_gate_at fails children of a Closed, Abandoned or Lost parent.
+            !matches!(
+                row.state,
+                TaskState::Closed | TaskState::Abandoned | TaskState::Lost
+            ) && row
+                .integration
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.state == IntegrationStatus::Blocked)
+        })
+        .map(|row| row.task_id)
+        .collect();
     let mut dag_nodes = Vec::with_capacity(dag.nodes.len());
     for node in dag.nodes.values() {
         dag_nodes.push(DagNodeProjection {
@@ -845,9 +864,21 @@ pub(crate) fn merge_pending_into_projection(
         {
             continue;
         }
-        projection
-            .tasks
-            .push(pending_list_row(run_id, node, created_at_millis));
+        let mut row = pending_list_row(run_id, node, created_at_millis);
+        if node.state == DagNodeState::Waiting
+            && node.depends_on.iter().any(|parent| {
+                dag.nodes
+                    .get(parent)
+                    .is_some_and(|parent| integration_blocked.contains(&parent.task_id))
+            })
+        {
+            row.blocking_code = Some(
+                IntegrationCode::IntegrationDependencyBlocked
+                    .as_str()
+                    .into(),
+            );
+        }
+        projection.tasks.push(row);
     }
     projection.dag_nodes.extend(dag_nodes);
     if let Some(run) = projection.runs.iter_mut().find(|run| run.run_id == run_id) {
@@ -1108,6 +1139,196 @@ mod tests {
             record.retention_pin_refs(),
             vec![dag_pin_ref(run_id, "login")]
         );
+    }
+
+    fn waiting_child_fixture() -> (DagRecord, TaskListProjection) {
+        use crate::integration::{
+            contracts::{IntegrationCode, IntegrationStatus, IntegrationTaskFacts},
+            testing::{fixture_source, fixture_task, sample_ordinary, sample_record},
+        };
+
+        let run_id = RunId::new(Uuid::from_u128(10));
+        let parent = DagNode {
+            batch_id: "parent".into(),
+            task_id: fixture_task(),
+            turn_id: fixture_source(),
+            depends_on: vec![],
+            base: DagBase::Frozen {
+                oid: oid(),
+                pin_ref: dag_pin_ref(run_id, "parent"),
+                wip: false,
+            },
+            frozen: sample_frozen(),
+            state: DagNodeState::Submitted,
+            bound_oid: None,
+            bound_turn_id: None,
+            pin_ref: None,
+            blocked_by: None,
+            claimed_by: None,
+            claimed_at_millis: None,
+        };
+        let child = DagNode {
+            batch_id: "child".into(),
+            task_id: TaskId::new(Uuid::from_u128(4)),
+            turn_id: TurnId::new(Uuid::from_u128(5)),
+            depends_on: vec!["parent".into()],
+            base: DagBase::From {
+                parent: "parent".into(),
+            },
+            state: DagNodeState::Waiting,
+            ..parent.clone()
+        };
+        let dag = DagRecord::new(
+            run_id,
+            BTreeMap::from([("parent".into(), parent), ("child".into(), child)]),
+            1,
+            None,
+            1000,
+        )
+        .unwrap();
+        let ordinary = sample_ordinary(fixture_task(), fixture_source());
+        let mut projection = crate::task_view::project_task_list(
+            std::slice::from_ref(&ordinary),
+            &[],
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
+        let mut integration = sample_record(fixture_task(), fixture_source(), "main");
+        integration.snapshot.state = IntegrationStatus::Blocked;
+        integration.snapshot.blocked_code = Some(IntegrationCode::IntegrationTargetMissing);
+        projection.tasks[0] = projection.tasks[0]
+            .clone()
+            .with_current_integration(
+                Some(&integration.snapshot),
+                &IntegrationTaskFacts::from_record(&ordinary, false),
+                true,
+            )
+            .unwrap();
+        projection.tasks[0].run_id = Some(run_id);
+        (dag, projection)
+    }
+
+    #[test]
+    fn waiting_child_row_reports_blocked_parent_integration() {
+        let (dag, mut projection) = waiting_child_fixture();
+        let before = dag.clone();
+        merge_pending_into_projection(&mut projection, dag.run_id, &dag, dag.created_at_millis);
+        let row = projection
+            .tasks
+            .iter()
+            .find(|row| row.task_id == dag.nodes["child"].task_id)
+            .unwrap();
+        assert_eq!(row.state, TaskState::Queued);
+        assert_eq!(
+            row.blocking_code.as_deref(),
+            Some("INTEGRATION_DEPENDENCY_BLOCKED")
+        );
+        assert_eq!(
+            dag, before,
+            "displaying the wait must not persist a terminal block"
+        );
+        assert_eq!(
+            projection
+                .dag_nodes
+                .iter()
+                .find(|node| node.batch_id == "child")
+                .unwrap()
+                .blocked_by,
+            None
+        );
+    }
+
+    #[test]
+    fn waiting_child_row_clears_integration_code_after_parent_redrive() {
+        use crate::integration::contracts::{IntegrationDisposition, IntegrationStatus};
+
+        let (dag, projection) = waiting_child_fixture();
+        for state in [
+            IntegrationStatus::Pending,
+            IntegrationStatus::Integrated,
+            IntegrationStatus::Revoked,
+        ] {
+            let mut projection = projection.clone();
+            let snapshot = projection.tasks[0].integration.as_mut().unwrap();
+            snapshot.state = state;
+            snapshot.blocked_code = None;
+            if state == IntegrationStatus::Integrated {
+                snapshot.disposition = Some(IntegrationDisposition::Merged);
+                snapshot.merge_oid = Some(oid());
+            }
+            merge_pending_into_projection(&mut projection, dag.run_id, &dag, dag.created_at_millis);
+            let row = projection
+                .tasks
+                .iter()
+                .find(|row| row.task_id == dag.nodes["child"].task_id)
+                .unwrap();
+            assert_eq!(row.state, TaskState::Queued);
+            assert_eq!(row.blocking_code.as_deref(), Some(DAG_WAITING), "{state:?}");
+        }
+    }
+
+    #[test]
+    fn waiting_child_row_ignores_unconfigured_missing_unrelated_and_terminal_parents() {
+        let (dag, projection) = waiting_child_fixture();
+        for case in [
+            "unconfigured",
+            "missing",
+            "unrelated",
+            "closed",
+            "abandoned",
+            "lost",
+        ] {
+            let mut projection = projection.clone();
+            match case {
+                "unconfigured" => projection.tasks[0].integration = None,
+                "missing" => projection.tasks.clear(),
+                "unrelated" => projection.tasks[0].task_id = TaskId::new(Uuid::from_u128(99)),
+                "closed" => projection.tasks[0].state = TaskState::Closed,
+                "abandoned" => projection.tasks[0].state = TaskState::Abandoned,
+                "lost" => projection.tasks[0].state = TaskState::Lost,
+                _ => unreachable!(),
+            }
+            merge_pending_into_projection(&mut projection, dag.run_id, &dag, dag.created_at_millis);
+            let row = projection
+                .tasks
+                .iter()
+                .find(|row| row.task_id == dag.nodes["child"].task_id)
+                .unwrap();
+            assert_eq!(row.blocking_code.as_deref(), Some(DAG_WAITING), "{case}");
+        }
+    }
+
+    #[test]
+    fn nonwaiting_child_rows_keep_their_codes_with_blocked_parent_integration() {
+        let (dag, projection) = waiting_child_fixture();
+        for (state, code) in [
+            (DagNodeState::Claimed, DAG_CLAIMED),
+            (
+                DagNodeState::Blocked,
+                "INTEGRATION_DEPENDENCY_NOT_INTEGRATED",
+            ),
+        ] {
+            let mut dag = dag.clone();
+            let child = dag.nodes.get_mut("child").unwrap();
+            if state == DagNodeState::Claimed {
+                child.take_claim(
+                    ProcessIdentity::new(crate::fixture_pid::fixture_pid(7), 1).unwrap(),
+                    1001,
+                );
+            } else {
+                child.mark_blocked(code);
+            }
+            dag.validate().unwrap();
+            let mut projection = projection.clone();
+            merge_pending_into_projection(&mut projection, dag.run_id, &dag, dag.created_at_millis);
+            let row = projection
+                .tasks
+                .iter()
+                .find(|row| row.task_id == dag.nodes["child"].task_id)
+                .unwrap();
+            assert_eq!(row.blocking_code.as_deref(), Some(code));
+        }
     }
 
     fn sample_frozen() -> DagFrozenSpec {

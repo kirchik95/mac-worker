@@ -35,10 +35,13 @@ const DRIVER_PATTERN: &str =
 
 /// Read-only laptop preflight uses the same overrides as host integration Git.
 /// Driver discovery is a bounded local config read; it never runs a driver.
+/// `credentials` are appended last, after the hardening and driver overrides,
+/// and only to `operation`'s request: the driver probe never sees them.
 pub(crate) fn hardened_read_request(
     runner: &dyn ProcessRunner,
     repo: &RootedDir,
     operation: Vec<OsString>,
+    credentials: &[(String, String)],
 ) -> Result<ProcessRequest, WorkerError> {
     repo.verify_bound()?;
     let mut config: Vec<_> = HARDENING
@@ -72,6 +75,7 @@ pub(crate) fn hardened_read_request(
     ));
     let names = runner.run(&probe)?;
     config.extend(driver_overrides(&names)?);
+    config.extend_from_slice(credentials);
     repo.verify_bound()?;
     Ok(read_policy(git_request_with_config(
         repo.path(),
@@ -1176,21 +1180,7 @@ impl<'a> IntegrationGit<'a> {
         if let Some(outcome) = self.observed_outcome(record, candidate, &mirror, &credentials)? {
             return Ok(outcome);
         }
-        let code = match result {
-            Ok(result) if crate::git_transport::origin_auth_failed(&result.stderr) => {
-                IntegrationCode::IntegrationAuthFailed
-            }
-            Ok(result)
-                if result.stdout.split(|b| *b == b'\n').any(|line| {
-                    line.starts_with(b"!\t")
-                        && line.windows(17).any(|part| part == b"[remote rejected]")
-                }) =>
-            {
-                IntegrationCode::IntegrationPolicyRejected
-            }
-            _ => IntegrationCode::IntegrationNetwork,
-        };
-        Err(code.error())
+        Err(push_failure_code(result).error())
     }
     fn observed_outcome(
         &self,
@@ -1555,6 +1545,31 @@ fn native_regular_digest(
     Ok((before.mode, digest.finalize().into(), total, binary))
 }
 
+fn push_failure_code(result: Result<ProcessResult, WorkerError>) -> IntegrationCode {
+    match result {
+        // GitHub can accompany a repository policy rejection with HTTP 403.
+        // This push is --porcelain, so a declined hook is reported on stdout.
+        Ok(result)
+            if crate::git_transport::origin_policy_rejected(&result.stderr)
+                || crate::git_transport::origin_policy_rejected(&result.stdout) =>
+        {
+            IntegrationCode::IntegrationPolicyRejected
+        }
+        Ok(result) if crate::git_transport::origin_auth_failed(&result.stderr) => {
+            IntegrationCode::IntegrationAuthFailed
+        }
+        Ok(result)
+            if result.stdout.split(|b| *b == b'\n').any(|line| {
+                line.starts_with(b"!\t")
+                    && line.windows(17).any(|part| part == b"[remote rejected]")
+            }) =>
+        {
+            IntegrationCode::IntegrationPolicyRejected
+        }
+        _ => IntegrationCode::IntegrationNetwork,
+    }
+}
+
 fn added_text_markers(diff: &[u8]) -> bool {
     let mut symlink = false;
     let mut added_marker = false;
@@ -1584,6 +1599,136 @@ fn marker(line: &[u8]) -> bool {
 mod tests {
     use super::*;
     use std::{os::unix::process::ExitStatusExt, sync::Mutex};
+
+    fn rejected_push(stdout: &str, stderr: &str) -> Result<ProcessResult, WorkerError> {
+        Ok(ProcessResult {
+            status: std::process::ExitStatus::from_raw(128 << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        })
+    }
+
+    #[test]
+    fn push_failure_policy_markers_precede_http_403() {
+        let messages = [
+            "remote: This repository was archived so it is read-only.",
+            "remote: error: GH006: Protected branch update failed for refs/heads/main.",
+            "remote: error: GH013: Repository rule violations found for refs/heads/main.",
+            " ! [remote rejected] main -> main (protected branch hook declined)",
+            " ! [remote rejected] main -> main (pre-receive hook declined)",
+        ];
+        for suffix in [
+            "\nfatal: unable to access 'https://github.com/fixture/repo.git/': The requested URL returned error: 403\n",
+            "",
+        ] {
+            let actual: Vec<_> = messages
+                .iter()
+                .map(|message| {
+                    push_failure_code(rejected_push("", &format!("{message}{suffix}")))
+                        .error()
+                        .public_code()
+                })
+                .collect();
+            assert_eq!(actual, ["INTEGRATION_POLICY_REJECTED"; 5], "{suffix}");
+        }
+    }
+
+    #[test]
+    fn push_failure_classifies_porcelain_and_ssh_policy_rejections() {
+        let oid = "e".repeat(40);
+        for (stdout, stderr) in [
+            // HTTPS push to a protected branch: the ref status is on stdout,
+            // GitHub's explanation on stderr.
+            (
+                format!(
+                    "To https://github.com/fixture/repo.git\n!\t{oid}:refs/heads/main\t[remote rejected] (protected branch hook declined)\n"
+                ),
+                "remote: error: GH006: Protected branch update failed for refs/heads/main.\nremote: error: Changes must be made through a pull request.\nerror: failed to push some refs to 'https://github.com/fixture/repo.git'\n".to_owned(),
+            ),
+            // SSH push to an archived repository is refused before any ref status.
+            (
+                String::new(),
+                "ERROR: This repository was archived so it is read-only.\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n".to_owned(),
+            ),
+            // A ref status proves the remote took the push, so a declined hook
+            // named only on stdout outranks auth-looking stderr.
+            (
+                format!("!\t{oid}:refs/heads/main\t[remote rejected] (pre-receive hook declined)\n"),
+                "fatal: unable to access 'https://github.com/fixture/repo.git/': The requested URL returned error: 403\n".to_owned(),
+            ),
+        ] {
+            assert_eq!(
+                push_failure_code(rejected_push(&stdout, &stderr))
+                    .error()
+                    .public_code(),
+                "INTEGRATION_POLICY_REJECTED",
+                "{stdout}{stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn push_failure_auth_messages_keep_auth_code() {
+        for stderr in [
+            "fatal: unable to access 'https://github.com/fixture/repo.git/': The requested URL returned error: 401\n",
+            "fatal: could not read Username for 'https://github.com': terminal prompts disabled\n",
+            "fatal: Authentication failed for 'https://github.com/fixture/repo.git/'\n",
+            "git@github.com: Permission denied (publickey).\n",
+            "remote: HTTP Basic: Access denied\n",
+            "fatal: unable to access 'https://github.com/fixture/repo.git/': The requested URL returned error: 403\n",
+        ] {
+            assert_eq!(
+                push_failure_code(rejected_push("", stderr))
+                    .error()
+                    .public_code(),
+                "INTEGRATION_AUTH_FAILED",
+                "{stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn push_failure_preserves_porcelain_rejection_and_network_codes() {
+        for (stdout, stderr, expected) in [
+            (
+                "!\tHEAD:refs/heads/main\t[remote rejected] (custom policy)\n",
+                "",
+                "INTEGRATION_POLICY_REJECTED",
+            ),
+            (
+                "",
+                "fatal: Could not resolve host: github.com",
+                "INTEGRATION_NETWORK",
+            ),
+            (
+                "!\tHEAD:refs/heads/main\t[rejected] (stale info)\n",
+                "",
+                "INTEGRATION_NETWORK",
+            ),
+            (
+                "",
+                "remote: hook log: object 4015c0de in /tmp/403/failed\n",
+                "INTEGRATION_NETWORK",
+            ),
+        ] {
+            assert_eq!(
+                push_failure_code(rejected_push(stdout, stderr))
+                    .error()
+                    .public_code(),
+                expected
+            );
+        }
+        assert_eq!(
+            push_failure_code(Err(crate::error::ProcessError::DeadlineExceeded {
+                deadline: GIT_DEADLINE,
+            }
+            .into()))
+            .error()
+            .public_code(),
+            "INTEGRATION_NETWORK"
+        );
+    }
+
     #[derive(Default)]
     struct FakeCredentials {
         calls: Mutex<Vec<ProcessRequest>>,

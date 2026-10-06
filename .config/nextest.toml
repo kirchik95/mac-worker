@@ -32,7 +32,10 @@ test-group = 'fork_heavy'
 
 [[profile.default.overrides]]
 filter = '''
-  (binary(task) & test(/^task_integration_direct::/))
+  (binary(task) & (
+    test(/^task_integration_direct::/)
+    | test(/^task_integration_turns::direct_followup_repairs_failed_checks_and_integrates_both_turns$/)
+  ))
   | (binary(controller) & (
     test(/^controller_integration_wiring::native_controller_shutdown_preserves_undrained_dispatch_across_restart$/)
     | test(/^controller_integration_wiring::verified_nested_source_keeps_request_pins_and_retires_the_unadopted_task_pin$/)

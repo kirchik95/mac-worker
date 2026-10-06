@@ -234,8 +234,8 @@ impl<'a> GitTransport<'a> {
         }
     }
 
-    /// Global credential-helper settings for one HTTPS origin. Empty for
-    /// SSH/file URLs. Never loads the global config into the hermetic push.
+    /// The current account's global credential-helper settings for one HTTPS
+    /// origin. Empty for SSH/file URLs. Only these settings enter hermetic Git.
     pub(crate) fn origin_credential_config(&self, origin: &str) -> Vec<(String, String)> {
         let Some((scheme, host)) = http_origin_parts(origin) else {
             return Vec::new();
@@ -999,11 +999,24 @@ fn http_origin_parts(origin: &str) -> Option<(String, String)> {
 }
 
 fn origin_push_error(stderr: &[u8]) -> WorkerError {
-    if origin_auth_failed(stderr) {
+    if !origin_policy_rejected(stderr) && origin_auth_failed(stderr) {
         git_error(ORIGIN_AUTH_FAILED, "origin authentication failed")
     } else {
         git_error("PUBLISH_FAILED", "origin publication failed")
     }
+}
+
+pub(crate) fn origin_policy_rejected(stderr: &[u8]) -> bool {
+    let stderr = String::from_utf8_lossy(stderr);
+    [
+        "This repository was archived so it is read-only",
+        "GH006: Protected branch update failed",
+        "GH013: Repository rule violations",
+        "protected branch hook declined",
+        "pre-receive hook declined",
+    ]
+    .iter()
+    .any(|message| stderr.contains(message))
 }
 
 pub(crate) fn origin_auth_failed(stderr: &[u8]) -> bool {
@@ -1831,6 +1844,24 @@ mod tests {
             origin_push_error(rejected.as_bytes()).public_code(),
             "PUBLISH_FAILED"
         );
+    }
+
+    #[test]
+    fn origin_policy_rejections_keep_existing_publish_failed_code() {
+        for message in [
+            "This repository was archived so it is read-only",
+            "GH006: Protected branch update failed",
+            "GH013: Repository rule violations",
+            "protected branch hook declined",
+            "pre-receive hook declined",
+        ] {
+            for suffix in ["", "\nfatal: The requested URL returned error: 403\n"] {
+                let stderr = format!("remote: {message}{suffix}");
+                let error = origin_push_error(stderr.as_bytes());
+                assert_eq!(error.public_code(), "PUBLISH_FAILED", "{stderr}");
+                assert!(!error.public_message().contains(message));
+            }
+        }
     }
 
     #[test]

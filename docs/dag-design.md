@@ -38,7 +38,7 @@ Invalid or cyclic graphs, `depends_on` or `from:` without `id`, and unknown pare
 - **Independent:** every task has empty `depends_on` and no `from:` base. Submit uses today's `TaskClient::batch` path. No `dags/<run_id>.json`.
 - **Dependent:** at least one `depends_on` or `from:`. Submit freezes the graph, writes the DAG file, then materializes only currently eligible nodes. Later nodes wait for the parent gate.
 
-`worker task batch FILE --preview` reports `dag.status = "enforced"` with message `Dependencies execute when parents are Closed and Done.`
+`worker task batch FILE --preview` reports `dag.status = "enforced"` with message `Dependencies execute when parents are Closed and Done.` When any task in the batch has integration enabled, the message is instead `Configured parents unlock children after integration success and current result import, including requested never parents that stay Open. Disabled parents must be Closed and Done.`
 
 ## Parent gate
 
@@ -76,7 +76,7 @@ Stable `task_id` and first `turn_id` are persisted on every node before `create_
 
 `worker task reconcile` re-owns dead runners and re-enqueues orphans, then advances eligible DAG nodes. It does not submit work the operator did not already freeze in that run. Close after durable Closed, and a finished turn after this-turn import, also advance pending nodes.
 
-List rows for not-yet-submitted nodes may show `DAG_WAITING` or `DAG_CLAIMED`.
+List rows for not-yet-submitted nodes may show `DAG_WAITING` or `DAG_CLAIMED`. One display-only exception applies to integration-configured graphs: a Waiting child shows `INTEGRATION_DEPENDENCY_BLOCKED` while any configured parent has Blocked integration and that parent is not Closed, Abandoned, or Lost. The DAG node remains Waiting; this projection does not persist a terminal block or change eligibility, and a parent re-drive clears the displayed code.
 
 ## Remote controller
 

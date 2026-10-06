@@ -2886,3 +2886,191 @@ fn review_native_dashboard_replay_returns_the_durable_request_result() {
     );
     assert_eq!(state.load(task).unwrap().unwrap(), after);
 }
+
+struct FirstIntentBarrier {
+    clock: ManualIntegrationRuntime,
+    ready: std::sync::mpsc::Sender<()>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl IntegrationRuntime for FirstIntentBarrier {
+    fn now_millis(&self) -> u64 {
+        self.clock.now_millis()
+    }
+    fn actor(&self) -> ProcessIdentity {
+        self.clock.actor()
+    }
+    fn actor_verdict(&self, actor: ProcessIdentity) -> RunnerLivenessVerdict {
+        self.clock.actor_verdict(actor)
+    }
+    fn begin_phase(
+        &self,
+        key: &IntegrationPhaseKey,
+    ) -> Result<IntegrationDriveAdmission, mac_worker::test_support::core::error::WorkerError> {
+        self.clock.begin_phase(key)
+    }
+    fn reach(&self, point: IntegrationHook) {
+        if point == IntegrationHook::AfterRunnerRetirement {
+            self.ready.send(()).unwrap();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+                .unwrap();
+        }
+    }
+}
+
+#[test]
+fn native_cancel_in_done_before_runner_retirement_is_fenced() {
+    stop_in_done_before_first_intent("cancel", false);
+}
+
+#[test]
+fn native_close_in_done_before_runner_retirement_is_fenced() {
+    stop_in_done_before_first_intent("close", false);
+}
+
+#[test]
+fn native_cancel_in_done_after_runner_retirement_stops_before_the_first_intent() {
+    stop_in_done_before_first_intent("cancel", true);
+}
+
+#[test]
+fn native_close_in_done_after_runner_retirement_stops_before_the_first_intent() {
+    stop_in_done_before_first_intent("close", true);
+}
+
+/// Stop a task while its finalizer sits between the Done turn and the first
+/// integration intent. Before runner retirement the source cannot be published
+/// yet, so the stop is fenced; after it, the stop replays the finalizer's
+/// source CAS and revokes that cycle before any phase.
+fn stop_in_done_before_first_intent(operation: &str, retired: bool) {
+    use mac_worker::test_support::client_state::ClientStateStore;
+    use std::sync::{Arc, Mutex, mpsc};
+
+    let (f, task) = parked_source_fixture();
+    let paths = owner_paths(&f);
+    let state = RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+        .unwrap();
+    let parked = state.load(task).unwrap().unwrap();
+    assert_eq!(parked.snapshot.attempts, 0);
+    assert!(parked.candidates.is_empty());
+    // Replay publication from the already imported, retired ordinary result.
+    // The host has only been armed: no integration phase has run.
+    std::fs::remove_file(
+        paths
+            .state
+            .join(format!("integrations/tasks/{task}/record.json")),
+    )
+    .unwrap();
+    let client = ClientStateStore::open(&paths.state).unwrap();
+    let ordinary = client.load_task(task).unwrap();
+    assert_eq!(ordinary.status().state(), TaskState::Open);
+    assert_eq!(ordinary.status().last_outcome(), Some(&TaskOutcome::Done));
+    assert!(ordinary.runner().is_none());
+    let observer = FakeIntegrationObserver::default();
+    observer.insert(IntegrationTaskFacts {
+        cycle_base: parked.cycle_base,
+        ordinary,
+        result_imported: true,
+        session_import_complete: true,
+        continuation_pending: false,
+        runner_present: false,
+        stop_requested: false,
+        close_pending: false,
+        submission_pending: false,
+        auxiliary_purpose: None,
+    });
+    let host = FakeIntegrationHost::default();
+    let turns = FakeIntegrationTurns::default();
+    let (ready, reached) = mpsc::channel();
+    let (release, resume) = mpsc::channel();
+    let runtime = FirstIntentBarrier {
+        clock: ManualIntegrationRuntime::default(),
+        ready,
+        release: Mutex::new(resume),
+    };
+    let coordinator = IntegrationCoordinator::new(&state, &host, &turns, &runtime, &observer);
+    let origin = f.laptop.parent().unwrap().join("origin.git");
+    let target = || {
+        f.project
+            .git(&["--git-dir", origin.to_str().unwrap(), "rev-parse", "main"])
+            .stdout
+    };
+    let before = target();
+    let output = std::thread::scope(|scope| {
+        let publisher =
+            scope.spawn(|| coordinator.on_terminal(task, parked.snapshot.source_turn_id));
+        reached
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+            .unwrap();
+        assert!(state.load(task).unwrap().is_none());
+        if !retired {
+            // A recorded runner keeps the source unpublishable, as it is
+            // before the finalizer retires that runner.
+            let runner =
+                ProcessIdentity::new(crate::support::fixture_pid(2_000_000_021), 9_999_999)
+                    .unwrap();
+            client
+                .record_runner(task, Some(RunnerIdentity::new(runner)))
+                .unwrap();
+        }
+        let output = f.worker(&["--json", "task", operation, &task.to_string()]);
+        if !retired {
+            client.record_runner(task, None).unwrap();
+        }
+        // Always release before checking the CLI result so a regression cannot
+        // leave the scoped publisher blocked during assertion unwinding.
+        release.send(()).unwrap();
+        publisher.join().unwrap().unwrap();
+        output
+    });
+    if retired {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    } else {
+        assert_eq!(
+            output.status.code(),
+            Some(64),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(reply["code"], "TASK_BUSY", "{reply}");
+        assert_eq!(reply["message"], "INTEGRATION_IN_PROGRESS", "{reply}");
+        assert_eq!(target(), before);
+        // After publication the same command must acknowledge a durable revoke.
+        let stopped = f.worker(&["--json", "task", operation, &task.to_string()]);
+        assert!(
+            stopped.status.success(),
+            "{}",
+            String::from_utf8_lossy(&stopped.stdout)
+        );
+    }
+    let record = state.load(task).unwrap().unwrap();
+    assert_eq!(record.snapshot.state, IntegrationStatus::Revoked);
+    assert_eq!(record.snapshot.attempts, 0);
+    assert!(record.tombstone.unwrap().acknowledged);
+    assert_eq!(target(), before);
+    // Resume and reconcile afterwards to prove no later phase can push.
+    assert!(f.worker(&["controller", "drain", "--off"]).status.success());
+    assert!(f.worker(&["--json", "task", "reconcile"]).status.success());
+    assert_eq!(target(), before, "push after acknowledged {operation}");
+    assert!(host.calls().is_empty());
+    if operation == "close" {
+        let closed = ClientStateStore::open(&paths.state)
+            .unwrap()
+            .load_task(task)
+            .unwrap();
+        assert_eq!(closed.status().state(), TaskState::Closed);
+        assert_eq!(closed.status().last_outcome(), Some(&TaskOutcome::Done));
+        assert_eq!(
+            closed.status().head_oid(),
+            Some(&parked.snapshot.source_head)
+        );
+    }
+}

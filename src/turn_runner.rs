@@ -1408,7 +1408,7 @@ impl<'a> TurnRunner<'a> {
         )?)?;
         crate::integration::runner::record_source_base(
             self.paths,
-            task_id,
+            &initial_record,
             turn_id,
             turn.base_oid(),
         )?;

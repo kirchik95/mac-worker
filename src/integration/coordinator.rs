@@ -359,7 +359,7 @@ impl<'a> IntegrationCoordinator<'a> {
         if self.owner_source_is_current(record, &facts)? {
             return Ok(false);
         }
-        self.revoke(record.task_id, record.snapshot.revision)?;
+        self.revoke_for_stop(record.task_id, &record.snapshot)?;
         *record = self
             .state
             .load(record.task_id)?
@@ -623,20 +623,21 @@ impl<'a> IntegrationCoordinator<'a> {
         Ok(())
     }
     pub(crate) fn mark_given_up(&self, task: TaskId) -> Result<(), WorkerError> {
-        let Some(mut record) = self.state.load(task)? else {
+        let Some(record) = self.state.load(task)? else {
             return Ok(());
         };
-        if record.snapshot.state != IntegrationStatus::Revoked
-            || record.tombstone.as_ref().is_none_or(|t| !t.acknowledged)
-        {
-            return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
-        }
-        if record.snapshot.blocked_code != Some(IntegrationCode::IntegrationDependencyNotIntegrated)
-        {
+        self.save_stop_update(record, |record| {
+            if record.snapshot.state != IntegrationStatus::Revoked
+                || record.tombstone.as_ref().is_none_or(|t| !t.acknowledged)
+            {
+                return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
+            }
+            // The DAG gate reads this durable give-up evidence to fail
+            // configured children whose parent was not integrated.
             record.snapshot.blocked_code =
                 Some(IntegrationCode::IntegrationDependencyNotIntegrated);
-            self.save(&mut record)?;
-        }
+            Ok(())
+        })?;
         Ok(())
     }
     pub(crate) fn ready_to_drive(&self, task: TaskId) -> Result<bool, WorkerError> {
@@ -684,14 +685,14 @@ impl<'a> IntegrationCoordinator<'a> {
             || facts.stop_requested
             || facts.close_pending
         {
-            return self.revoke(task, record.snapshot.revision);
+            return self.revoke_for_stop(task, &record.snapshot);
         }
         if !matches!(
             record.snapshot.state,
             IntegrationStatus::Integrated | IntegrationStatus::Revoked
         ) && !self.owner_source_is_current(&record, &facts)?
         {
-            return self.revoke(task, record.snapshot.revision);
+            return self.revoke_for_stop(task, &record.snapshot);
         }
         if matches!(
             record.snapshot.state,
@@ -1145,7 +1146,7 @@ impl<'a> IntegrationCoordinator<'a> {
         }
         let facts = self.observer.facts(record.task_id)?;
         if !self.owner_source_is_current(record, &facts)? {
-            self.revoke(record.task_id, record.snapshot.revision)?;
+            self.revoke_for_stop(record.task_id, &record.snapshot)?;
             *record = self
                 .state
                 .load(record.task_id)?
@@ -1621,7 +1622,7 @@ impl<'a> IntegrationCoordinator<'a> {
             return Err(WorkerError::task("TASK_BUSY", "INTEGRATION_IN_PROGRESS"));
         }
         if !stopped {
-            self.revoke(task, record.snapshot.revision)?;
+            self.revoke_for_stop(task, &record.snapshot)?;
         }
         let mut record = self.state.load(task)?.ok_or_else(integration_unavailable)?;
         if record.snapshot.state != IntegrationStatus::Revoked
@@ -1657,6 +1658,81 @@ impl<'a> IntegrationCoordinator<'a> {
         self.save(&mut record)?;
         Ok(record.snapshot)
     }
+    /// A stop targets the observed cycle by its integration id and epoch, not
+    /// by its revision or phase. Auxiliary retirement, or a driver admitting
+    /// the next phase (Pending to Fetching, say), can move the record after the
+    /// caller read it; neither may skip the tombstone or turn the stop into a
+    /// CAS error. A new epoch or cycle is a different stop: unconfirmed.
+    pub(crate) fn revoke_for_stop(
+        &self,
+        task: TaskId,
+        expected: &IntegrationSnapshot,
+    ) -> Result<IntegrationSnapshot, WorkerError> {
+        for _ in 0..3 {
+            let record = self
+                .state
+                .load(task)?
+                .ok_or_else(|| IntegrationCode::IntegrationStopUnconfirmed.error())?;
+            if record.snapshot.integration_id != expected.integration_id
+                || record.snapshot.epoch != expected.epoch
+            {
+                return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
+            }
+            match self.revoke(task, record.snapshot.revision) {
+                Err(error) if error.public_code() == "TASK_REVISION_CONFLICT" => continue,
+                result => return result,
+            }
+        }
+        Err(IntegrationCode::IntegrationStopUnconfirmed.error())
+    }
+
+    /// Rebase only onto the same durable stop request. In particular, an old
+    /// host acknowledgement cannot acknowledge a replacement epoch/tombstone.
+    fn save_stop_update(
+        &self,
+        mut record: IntegrationRecord,
+        update: impl Fn(&mut IntegrationRecord) -> Result<(), WorkerError>,
+    ) -> Result<IntegrationRecord, WorkerError> {
+        let id = record.snapshot.integration_id;
+        let tombstone = record
+            .tombstone
+            .clone()
+            .ok_or_else(|| IntegrationCode::IntegrationStopUnconfirmed.error())?;
+        for attempt in 0..=3 {
+            if record.snapshot.integration_id != id
+                || record.snapshot.epoch != tombstone.epoch
+                || record.tombstone.as_ref().is_none_or(|current| {
+                    current.epoch != tombstone.epoch
+                        || current.revision != tombstone.revision
+                        || current.requested_at_millis != tombstone.requested_at_millis
+                        || (tombstone.acknowledged && !current.acknowledged)
+                })
+            {
+                return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
+            }
+            let before = record.clone();
+            update(&mut record)?;
+            if record == before {
+                return Ok(record);
+            }
+            if attempt == 3 {
+                break;
+            }
+            self.release(&mut record)?;
+            match self.save(&mut record) {
+                Ok(()) => return Ok(record),
+                Err(error) if error.public_code() == "TASK_REVISION_CONFLICT" => {
+                    record = self
+                        .state
+                        .load(record.task_id)?
+                        .ok_or_else(|| IntegrationCode::IntegrationStopUnconfirmed.error())?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(IntegrationCode::IntegrationStopUnconfirmed.error())
+    }
+
     pub fn revoke(
         &self,
         task: TaskId,
@@ -1735,19 +1811,23 @@ impl<'a> IntegrationCoordinator<'a> {
         self.runtime.reach(IntegrationHook::BeforeRevokeAck);
         match response {
             HostIntegrationResponse::Revoked { .. } => {
-                record
-                    .tombstone
-                    .as_mut()
-                    .ok_or_else(|| IntegrationCode::IntegrationStateInvalid.error())?
-                    .acknowledged = true;
-                record.snapshot.state = IntegrationStatus::Revoked;
-                record.snapshot.resume_state = None;
-                record.snapshot.pause_reason = None;
-                record.pause = None;
-                record.admission_deadline_millis = None;
-                record.snapshot.retry_at_millis = None;
-                self.release(&mut record)?;
-                self.save(&mut record)?;
+                let record = self.save_stop_update(record, |record| {
+                    if record.snapshot.state == IntegrationStatus::Integrated {
+                        return Err(IntegrationCode::IntegrationAlreadyCommitted.error());
+                    }
+                    record
+                        .tombstone
+                        .as_mut()
+                        .ok_or_else(|| IntegrationCode::IntegrationStopUnconfirmed.error())?
+                        .acknowledged = true;
+                    record.snapshot.state = IntegrationStatus::Revoked;
+                    record.snapshot.resume_state = None;
+                    record.snapshot.pause_reason = None;
+                    record.pause = None;
+                    record.admission_deadline_millis = None;
+                    record.snapshot.retry_at_millis = None;
+                    Ok(())
+                })?;
                 self.runtime.reach(IntegrationHook::AfterRevokeAck);
                 Ok(record.snapshot)
             }
@@ -2075,6 +2155,430 @@ impl PreparedIntegrationTurn {
         };
         prepared.validate_for(integration)?;
         Ok(prepared)
+    }
+}
+
+#[cfg(test)]
+mod stop_race_tests {
+    use super::*;
+    use crate::{integration::testing::*, job::ProcessIdentity};
+    use std::sync::Mutex;
+
+    struct AckRace<'a> {
+        clock: ManualIntegrationRuntime,
+        at: Option<IntegrationHook>,
+        action: Mutex<Option<Box<dyn FnOnce() + Send + 'a>>>,
+    }
+    impl AckRace<'_> {
+        fn run_action(&self) {
+            let action = self.action.lock().unwrap().take();
+            if let Some(action) = action {
+                action();
+            }
+        }
+    }
+    impl IntegrationRuntime for AckRace<'_> {
+        fn now_millis(&self) -> u64 {
+            if self.at.is_none() {
+                self.run_action();
+            }
+            self.clock.now_millis()
+        }
+        fn actor(&self) -> ProcessIdentity {
+            self.clock.actor()
+        }
+        fn actor_verdict(
+            &self,
+            actor: ProcessIdentity,
+        ) -> crate::client_state::RunnerLivenessVerdict {
+            self.clock.actor_verdict(actor)
+        }
+        fn begin_phase(
+            &self,
+            key: &IntegrationPhaseKey,
+        ) -> Result<IntegrationDriveAdmission, WorkerError> {
+            self.clock.begin_phase(key)
+        }
+        fn reach(&self, hook: IntegrationHook) {
+            if self.at == Some(hook) {
+                self.run_action();
+            }
+        }
+    }
+
+    struct RevokeHost;
+    impl IntegrationHost for RevokeHost {
+        fn execute(
+            &self,
+            request: &HostIntegrationRequest,
+        ) -> Result<HostIntegrationResponse, WorkerError> {
+            request.validate()?;
+            assert!(matches!(
+                request.action,
+                HostIntegrationAction::Revoke { .. }
+            ));
+            Ok(HostIntegrationResponse::Revoked {
+                identity: IntegrationResponseIdentity::for_request(request),
+            })
+        }
+    }
+
+    fn auxiliary(
+        state: &MemoryIntegrationState,
+        turns: &FakeIntegrationTurns,
+    ) -> IntegrationRecord {
+        let mut record = sample_record(fixture_task(), fixture_source(), "main");
+        record.snapshot.state = IntegrationStatus::Resolving;
+        record.snapshot.attempts = 1;
+        record.snapshot.resolve_turns = 1;
+        record.followups_spent = 1;
+        record.candidates.push(sample_candidate(&record));
+        let prepared = sample_prepared_turn(&record, IntegrationTurnPurpose::Resolve, 1, 1);
+        let turn = turns.enqueue(&prepared).unwrap();
+        let mut intent = prepared.intent().unwrap();
+        intent.queue_position = turns.queue_position(turn);
+        intent.accepted = true;
+        record.auxiliaries.push(intent);
+        state
+            .publish_policy(record.task_id, &record.policy)
+            .unwrap();
+        state.publish_prepared(record.task_id, &prepared).unwrap();
+        assert!(
+            state
+                .replace(record.task_id, IntegrationRevision(0), &record)
+                .unwrap()
+        );
+        turns
+            .set_observation(IntegrationTurnObservation {
+                turn_id: turn,
+                queue_position: turns.queue_position(turn),
+                accepted: true,
+                completed: true,
+            })
+            .unwrap();
+        record
+    }
+
+    #[test]
+    fn revoke_ack_reloads_after_terminal_auxiliary_save() {
+        let state = MemoryIntegrationState::default();
+        let turns = FakeIntegrationTurns::default();
+        let record = auxiliary(&state, &turns);
+        let observer = FakeIntegrationObserver::default();
+        let clock = ManualIntegrationRuntime::default();
+        let completion =
+            IntegrationCoordinator::new(&state, &RevokeHost, &turns, &clock, &observer);
+        let runtime = AckRace {
+            clock: ManualIntegrationRuntime::default(),
+            at: Some(IntegrationHook::BeforeRevokeAck),
+            action: Mutex::new(Some(Box::new(|| {
+                assert!(
+                    state
+                        .load(record.task_id)
+                        .unwrap()
+                        .unwrap()
+                        .tombstone
+                        .is_some()
+                );
+                completion
+                    .on_terminal(record.task_id, record.auxiliaries[0].turn_id)
+                    .unwrap();
+            }))),
+        };
+        let coordinator =
+            IntegrationCoordinator::new(&state, &RevokeHost, &turns, &runtime, &observer);
+        let stopped = coordinator
+            .revoke(record.task_id, record.snapshot.revision)
+            .unwrap();
+        let saved = state.load(record.task_id).unwrap().unwrap();
+        assert_eq!(stopped, saved.snapshot);
+        assert_eq!(stopped.state, IntegrationStatus::Revoked);
+        assert!(saved.tombstone.unwrap().acknowledged);
+        assert!(saved.auxiliaries[0].completed);
+    }
+
+    #[test]
+    fn revoke_ack_accepts_another_acknowledger_of_the_same_tombstone() {
+        let state = MemoryIntegrationState::default();
+        let turns = FakeIntegrationTurns::default();
+        let record = auxiliary(&state, &turns);
+        let observer = FakeIntegrationObserver::default();
+        let clock = ManualIntegrationRuntime::default();
+        let other = IntegrationCoordinator::new(&state, &RevokeHost, &turns, &clock, &observer);
+        let runtime = AckRace {
+            clock: ManualIntegrationRuntime::default(),
+            at: Some(IntegrationHook::BeforeRevokeAck),
+            action: Mutex::new(Some(Box::new(|| {
+                let current = state.load(record.task_id).unwrap().unwrap();
+                other
+                    .revoke(record.task_id, current.snapshot.revision)
+                    .unwrap();
+            }))),
+        };
+        let coordinator =
+            IntegrationCoordinator::new(&state, &RevokeHost, &turns, &runtime, &observer);
+        let stopped = coordinator
+            .revoke(record.task_id, record.snapshot.revision)
+            .unwrap();
+        assert_eq!(
+            stopped,
+            state.load(record.task_id).unwrap().unwrap().snapshot
+        );
+        assert_eq!(stopped.state, IntegrationStatus::Revoked);
+    }
+
+    #[test]
+    fn revoke_ack_refuses_a_removed_or_replaced_tombstone() {
+        for replace in [false, true] {
+            let state = MemoryIntegrationState::default();
+            let turns = FakeIntegrationTurns::default();
+            let record = auxiliary(&state, &turns);
+            let observer = FakeIntegrationObserver::default();
+            let clock = ManualIntegrationRuntime::default();
+            let runtime = AckRace {
+                clock: ManualIntegrationRuntime::default(),
+                at: Some(IntegrationHook::BeforeRevokeAck),
+                action: Mutex::new(Some(Box::new(|| {
+                    let mut current = state.load(record.task_id).unwrap().unwrap();
+                    if replace {
+                        current.tombstone.as_mut().unwrap().requested_at_millis += 1;
+                    } else {
+                        current.tombstone = None;
+                    }
+                    persist_record(&state, &clock, &mut current).unwrap();
+                }))),
+            };
+            let coordinator =
+                IntegrationCoordinator::new(&state, &RevokeHost, &turns, &runtime, &observer);
+            let error = coordinator
+                .revoke(record.task_id, record.snapshot.revision)
+                .unwrap_err();
+            assert_eq!(error.public_code(), "INTEGRATION_STOP_UNCONFIRMED");
+            assert_eq!(
+                state.load(record.task_id).unwrap().unwrap().snapshot.state,
+                IntegrationStatus::Resolving
+            );
+        }
+    }
+
+    #[test]
+    fn revoke_stop_rebases_only_the_observed_cycle_after_auxiliary_retirement() {
+        for changed_epoch in [false, true] {
+            let state = MemoryIntegrationState::default();
+            let turns = FakeIntegrationTurns::default();
+            let record = auxiliary(&state, &turns);
+            let observer = FakeIntegrationObserver::default();
+            let clock = ManualIntegrationRuntime::default();
+            let coordinator =
+                IntegrationCoordinator::new(&state, &RevokeHost, &turns, &clock, &observer);
+            coordinator
+                .on_terminal(record.task_id, record.auxiliaries[0].turn_id)
+                .unwrap();
+            if changed_epoch {
+                let mut next = state.load(record.task_id).unwrap().unwrap();
+                next.snapshot.epoch += 1;
+                next.auxiliaries.clear();
+                next.candidates.clear();
+                persist_record(&state, &clock, &mut next).unwrap();
+            }
+            let result = coordinator.revoke_for_stop(record.task_id, &record.snapshot);
+            if changed_epoch {
+                let error = result.unwrap_err();
+                assert_eq!(error.public_code(), "INTEGRATION_STOP_UNCONFIRMED");
+                assert_eq!(error.exit_code(), 69);
+                assert!(
+                    state
+                        .load(record.task_id)
+                        .unwrap()
+                        .unwrap()
+                        .tombstone
+                        .is_none()
+                );
+            } else {
+                assert_eq!(result.unwrap().state, IntegrationStatus::Revoked);
+                let saved = state.load(record.task_id).unwrap().unwrap();
+                assert!(saved.auxiliaries[0].completed);
+                assert!(saved.tombstone.unwrap().acknowledged);
+            }
+        }
+    }
+
+    #[test]
+    fn stop_after_a_phase_advance_still_revokes_the_observed_cycle() {
+        let state = MemoryIntegrationState::default();
+        let record = sample_record(fixture_task(), fixture_source(), "main");
+        state
+            .publish_policy(record.task_id, &record.policy)
+            .unwrap();
+        assert!(
+            state
+                .replace(record.task_id, IntegrationRevision(0), &record)
+                .unwrap()
+        );
+        let turns = FakeIntegrationTurns::default();
+        let observer = FakeIntegrationObserver::default();
+        let clock = ManualIntegrationRuntime::default();
+        let coordinator =
+            IntegrationCoordinator::new(&state, &RevokeHost, &turns, &clock, &observer);
+        // The CLI read Pending; a driver then admitted the Fetch phase.
+        let observed = state.load(record.task_id).unwrap().unwrap().snapshot;
+        assert_eq!(observed.state, IntegrationStatus::Pending);
+        let mut next = state.load(record.task_id).unwrap().unwrap();
+        next.snapshot.state = IntegrationStatus::Fetching;
+        next.snapshot.attempts = 1;
+        persist_record(&state, &clock, &mut next).unwrap();
+        let stopped = coordinator
+            .revoke_for_stop(record.task_id, &observed)
+            .unwrap();
+        let saved = state.load(record.task_id).unwrap().unwrap();
+        assert_eq!(stopped, saved.snapshot);
+        assert_eq!(stopped.state, IntegrationStatus::Revoked);
+        assert!(saved.tombstone.unwrap().acknowledged);
+    }
+
+    #[test]
+    fn cancel_given_up_save_reloads_terminal_auxiliary() {
+        let state = MemoryIntegrationState::default();
+        let turns = FakeIntegrationTurns::default();
+        let record = auxiliary(&state, &turns);
+        let observer = FakeIntegrationObserver::default();
+        let clock = ManualIntegrationRuntime::default();
+        let completion =
+            IntegrationCoordinator::new(&state, &RevokeHost, &turns, &clock, &observer);
+        completion
+            .revoke(record.task_id, record.snapshot.revision)
+            .unwrap();
+        let mut stopped = state.load(record.task_id).unwrap().unwrap();
+        stopped.snapshot.blocked_code = Some(IntegrationCode::IntegrationChecksFailed);
+        persist_record(&state, &clock, &mut stopped).unwrap();
+        let runtime = AckRace {
+            clock: ManualIntegrationRuntime::default(),
+            at: None,
+            action: Mutex::new(Some(Box::new(|| {
+                completion
+                    .on_terminal(record.task_id, record.auxiliaries[0].turn_id)
+                    .unwrap();
+            }))),
+        };
+        let coordinator =
+            IntegrationCoordinator::new(&state, &RevokeHost, &turns, &runtime, &observer);
+        coordinator.mark_given_up(record.task_id).unwrap();
+        let saved = state.load(record.task_id).unwrap().unwrap();
+        assert!(runtime.action.lock().unwrap().is_none());
+        assert!(saved.auxiliaries[0].completed);
+        assert!(saved.tombstone.unwrap().acknowledged);
+        assert_eq!(
+            saved.snapshot.blocked_code,
+            Some(IntegrationCode::IntegrationDependencyNotIntegrated)
+        );
+    }
+
+    #[test]
+    fn cancel_given_up_still_blocks_configured_children() {
+        use crate::{
+            dag::ParentGate, integration::store::RootedIntegrationState, paths::PathLayout,
+        };
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = PathLayout {
+            config: dir.path().join("config"),
+            state: dir.path().join("state"),
+            cache: dir.path().join("cache"),
+            data: dir.path().join("data"),
+        };
+        let clock = Arc::new(ManualIntegrationRuntime::default());
+        let state = RootedIntegrationState::open(&paths, clock.clone()).unwrap();
+        let record = sample_record(fixture_task(), fixture_source(), "main");
+        state
+            .publish_policy(record.task_id, &record.policy)
+            .unwrap();
+        assert!(
+            state
+                .replace(record.task_id, IntegrationRevision(0), &record)
+                .unwrap()
+        );
+        let turns = FakeIntegrationTurns::default();
+        let observer = FakeIntegrationObserver::default();
+        let coordinator =
+            IntegrationCoordinator::new(&state, &RevokeHost, &turns, clock.as_ref(), &observer);
+        coordinator
+            .revoke(record.task_id, record.snapshot.revision)
+            .unwrap();
+        let ordinary = sample_ordinary(record.task_id, fixture_source());
+        assert_eq!(
+            crate::dag::parent_gate_at(&paths.state, &ordinary).unwrap(),
+            ParentGate::Waiting
+        );
+        coordinator.mark_given_up(record.task_id).unwrap();
+        // The configured-child gate must distinguish an operator's give-up
+        // from the reversible revoke used by a blocked cycle's ordinary say.
+        assert_eq!(
+            crate::dag::parent_gate_at(&paths.state, &ordinary).unwrap(),
+            ParentGate::IntegrationFailed
+        );
+    }
+
+    #[test]
+    fn revoke_ack_retry_exhaustion_is_unconfirmed_after_three_saves() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Churn<'a> {
+            clock: ManualIntegrationRuntime,
+            state: &'a MemoryIntegrationState,
+            writes: AtomicUsize,
+        }
+        impl IntegrationRuntime for Churn<'_> {
+            fn now_millis(&self) -> u64 {
+                let mut current = self.state.load(fixture_task()).unwrap().unwrap();
+                if current.tombstone.is_some() {
+                    current.ready_at_millis += 1;
+                    persist_record(self.state, &self.clock, &mut current).unwrap();
+                    self.writes.fetch_add(1, Ordering::SeqCst);
+                }
+                self.clock.now_millis()
+            }
+            fn actor(&self) -> ProcessIdentity {
+                self.clock.actor()
+            }
+            fn actor_verdict(
+                &self,
+                actor: ProcessIdentity,
+            ) -> crate::client_state::RunnerLivenessVerdict {
+                self.clock.actor_verdict(actor)
+            }
+            fn begin_phase(
+                &self,
+                key: &IntegrationPhaseKey,
+            ) -> Result<IntegrationDriveAdmission, WorkerError> {
+                self.clock.begin_phase(key)
+            }
+            fn reach(&self, _: IntegrationHook) {}
+        }
+        let state = MemoryIntegrationState::default();
+        let turns = FakeIntegrationTurns::default();
+        let record = auxiliary(&state, &turns);
+        let observer = FakeIntegrationObserver::default();
+        let runtime = Churn {
+            clock: ManualIntegrationRuntime::default(),
+            state: &state,
+            writes: AtomicUsize::new(0),
+        };
+        let coordinator =
+            IntegrationCoordinator::new(&state, &RevokeHost, &turns, &runtime, &observer);
+        let error = coordinator
+            .revoke(record.task_id, record.snapshot.revision)
+            .unwrap_err();
+        assert_eq!(error.public_code(), "INTEGRATION_STOP_UNCONFIRMED");
+        assert_eq!(error.exit_code(), 69);
+        assert_eq!(runtime.writes.load(Ordering::SeqCst), 3);
+        assert!(
+            !state
+                .load(record.task_id)
+                .unwrap()
+                .unwrap()
+                .tombstone
+                .unwrap()
+                .acknowledged
+        );
     }
 }
 

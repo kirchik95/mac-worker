@@ -2465,7 +2465,7 @@ fn write_task_report_with_interrupt(
         )?;
         write_turn_diagnostics(stdout, report.status())?;
         if let Some(view) = report.integration_view() {
-            write_integration_line(stdout, view.integration.as_ref())?;
+            write_integration_detail(stdout, view.integration.as_ref())?;
         }
         writeln!(
             stdout,
@@ -2644,6 +2644,21 @@ fn write_integration_line(
     Ok(())
 }
 
+fn write_integration_detail(
+    stdout: &mut dyn Write,
+    snapshot: Option<&crate::integration::contracts::IntegrationSnapshot>,
+) -> Result<(), WorkerError> {
+    write_integration_line(stdout, snapshot)?;
+    if let Some(snapshot) = snapshot
+        && snapshot.state == crate::integration::contracts::IntegrationStatus::Blocked
+        && let Some(code) = snapshot.blocked_code
+        && let Some(hint) = crate::error::hint_for(code.as_str())
+    {
+        writeln!(stdout, "{hint}")?;
+    }
+    Ok(())
+}
+
 pub(crate) fn write_task_result_report(
     report: &task_client::TaskResultReport,
     json: bool,
@@ -2684,7 +2699,7 @@ pub(crate) fn write_task_result_report(
         )?;
         write_turn_diagnostics(stdout, report.status())?;
         if let Some(view) = report.integration_view() {
-            write_integration_line(stdout, view.integration.as_ref())?;
+            write_integration_detail(stdout, view.integration.as_ref())?;
         }
         for warning in report.warnings() {
             writeln!(stdout, "warning: {warning}")?;
@@ -7823,6 +7838,182 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod task_integration_render_tests {
+    use crate::{
+        integration::{
+            contracts::{
+                IntegrationCode, IntegrationDisposition, IntegrationSnapshot, IntegrationStatus,
+                IntegrationTaskFacts,
+            },
+            testing::{fixture_source, fixture_task, sample_ordinary, sample_record},
+        },
+        task_client::{ControllerTaskProjection, TaskReport, TaskResultReport},
+    };
+
+    fn snapshot() -> IntegrationSnapshot {
+        let mut snapshot = sample_record(fixture_task(), fixture_source(), "main").snapshot;
+        snapshot.attempts = 1;
+        snapshot
+    }
+
+    fn reports(snapshot: &IntegrationSnapshot) -> (TaskReport, TaskResultReport) {
+        let ordinary = sample_ordinary(fixture_task(), fixture_source());
+        let view = crate::integration::view::project_integration(
+            Some(snapshot),
+            &IntegrationTaskFacts::from_record(&ordinary, false),
+        )
+        .unwrap();
+        let mut status = TaskReport::from_controller(ControllerTaskProjection {
+            task_id: fixture_task(),
+            run_id: None,
+            status: ordinary.status().clone(),
+            warnings: vec![],
+            events: vec![],
+            runner: None,
+            exit_code: None,
+            delivery: None,
+            deliveries: vec![],
+            failure_receipt: None,
+        });
+        status.integration_view = Some(view.clone());
+        let mut result = TaskResultReport::from_controller(
+            fixture_task(),
+            ordinary.status().clone(),
+            "task/fixture".into(),
+            "worker task fetch fixture".into(),
+            None,
+            vec![],
+            vec![],
+        );
+        result.integration_view = Some(view);
+        (status, result)
+    }
+
+    fn assert_text(snapshot: &IntegrationSnapshot, integration_text: &str) {
+        let (status, result) = reports(snapshot);
+        let mut text = Vec::new();
+        super::write_task_report(&status, false, &mut text).unwrap();
+        assert_eq!(
+            String::from_utf8(text).unwrap(),
+            format!(
+                "task {}: open (fixture-worker)\noutcome: done\n{integration_text}questions policy: ask\n",
+                fixture_task()
+            )
+        );
+        let mut text = Vec::new();
+        super::write_task_result_report(&result, false, &mut text).unwrap();
+        assert_eq!(
+            String::from_utf8(text).unwrap(),
+            format!(
+                "task {}: open\noutcome: done\n{integration_text}summary: Fixture work completed\nbranch: task/fixture\nfetch: worker task fetch fixture\n",
+                fixture_task()
+            )
+        );
+    }
+
+    fn assert_blocked_hint(code: IntegrationCode) {
+        let mut snapshot = snapshot();
+        snapshot.state = IntegrationStatus::Blocked;
+        snapshot.blocked_code = Some(code);
+        let hint = crate::error::hint_for(code.as_str()).unwrap();
+        assert_text(
+            &snapshot,
+            &format!(
+                "integration: blocked target=main attempts=1 code={}\n{hint}\n",
+                code.as_str()
+            ),
+        );
+    }
+
+    #[test]
+    fn status_and_result_blocked_target_missing_include_repair_hint() {
+        assert_blocked_hint(IntegrationCode::IntegrationTargetMissing);
+    }
+
+    #[test]
+    fn status_and_result_blocked_auth_failed_include_repair_hint() {
+        assert_blocked_hint(IntegrationCode::IntegrationAuthFailed);
+    }
+
+    #[test]
+    fn status_and_result_pending_and_integrated_text_stays_unchanged() {
+        let mut snapshot = snapshot();
+        assert_text(&snapshot, "integration: pending target=main attempts=1\n");
+        // A retained code alone must not add a repair action outside Blocked.
+        snapshot.blocked_code = Some(IntegrationCode::IntegrationNetwork);
+        assert_text(
+            &snapshot,
+            "integration: pending target=main attempts=1 code=INTEGRATION_NETWORK\n",
+        );
+        snapshot.blocked_code = None;
+        snapshot.state = IntegrationStatus::Integrated;
+        snapshot.disposition = Some(IntegrationDisposition::Merged);
+        snapshot.merge_oid = Some("e".repeat(40).parse().unwrap());
+        assert_text(
+            &snapshot,
+            &format!(
+                "integration: integrated target=main attempts=1 merge={}\n",
+                "e".repeat(40)
+            ),
+        );
+    }
+
+    #[test]
+    fn status_and_result_blocked_json_stays_unchanged() {
+        let mut snapshot = snapshot();
+        snapshot.state = IntegrationStatus::Blocked;
+        snapshot.blocked_code = Some(IntegrationCode::IntegrationTargetMissing);
+        let (status, result) = reports(&snapshot);
+        let mut status_json = Vec::new();
+        super::write_task_report(&status, true, &mut status_json).unwrap();
+        let mut result_json = Vec::new();
+        super::write_task_result_report(&result, true, &mut result_json).unwrap();
+        let view = status.integration_view().unwrap();
+        for (bytes, mut expected) in [
+            (
+                status_json,
+                serde_json::json!({
+                    "protocol_version": crate::PROTOCOL_VERSION,
+                    "task_id": fixture_task(), "run_id": null,
+                    "questions_policy": "ask", "status": status.status(),
+                    "runner": null, "events": [], "exit_code": null,
+                }),
+            ),
+            (
+                result_json,
+                serde_json::json!({
+                    "protocol_version": crate::PROTOCOL_VERSION,
+                    "task_id": fixture_task(), "status": result.status(),
+                    "branch": "task/fixture", "fetch": "worker task fetch fixture",
+                }),
+            ),
+        ] {
+            expected["integration"] = serde_json::json!(snapshot);
+            expected["workflow_state"] = serde_json::json!(view.workflow_state);
+            expected["requested_close"] = serde_json::json!(view.requested_close);
+            expected["review_state"] = serde_json::json!(view.review_state);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn list_integration_line_stays_unchanged() {
+        let mut snapshot = snapshot();
+        snapshot.state = IntegrationStatus::Blocked;
+        snapshot.blocked_code = Some(IntegrationCode::IntegrationTargetMissing);
+        let mut text = Vec::new();
+        super::write_integration_line(&mut text, Some(&snapshot)).unwrap();
+        assert_eq!(
+            String::from_utf8(text).unwrap(),
+            "integration: blocked target=main attempts=1 code=INTEGRATION_TARGET_MISSING\n"
+        );
     }
 }
 

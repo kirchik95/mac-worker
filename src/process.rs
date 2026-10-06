@@ -700,34 +700,35 @@ fn saved_process_group_is_gone(process_group: libc::pid_t) -> bool {
         && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
-fn recover_after_killpg_eperm(
-    child: &mut Child,
-    process_group: libc::pid_t,
-    error: io::Error,
-) -> io::Result<()> {
+fn recover_after_killpg_eperm(child: &mut Child, error: io::Error) -> io::Result<()> {
     if error.raw_os_error() != Some(libc::EPERM) {
         return Err(error);
     }
-    // Reap the owned leader only. getpgid(leader) ESRCH and kill(pid) do not
-    // prove the saved group is empty. Accept the original EPERM only if
-    // killpg of that same pgid with signal 0 is ESRCH.
-    reap_owned_child(child)?;
-    if saved_process_group_is_gone(process_group) {
-        return Ok(());
-    }
-    Err(error)
+    // macOS can report EPERM while the group's last members exit or await
+    // reaping. Reap our leader, then let the caller keep probing the saved
+    // group within the original kill budget. Reaping the leader does not
+    // prove the saved group is gone.
+    reap_owned_child(child)
 }
 
 fn terminate_child(
     child: &mut Child,
     process_group: Option<libc::pid_t>,
 ) -> io::Result<CleanupState> {
+    #[cfg(test)]
+    if let Some(result) = tests::TERMINATION_HOOK
+        .with_borrow(|hook| hook.as_ref().map(|hook| hook(child, process_group)))
+    {
+        return result;
+    }
     let started = Instant::now();
     terminate_child_with_evidence(
         child,
         process_group,
         &|| started.elapsed() >= PROCESS_GROUP_KILL_BUDGET,
         &saved_process_group_is_gone,
+        &terminate_process_group,
+        &|| thread::sleep(Duration::from_millis(2)),
     )
 }
 
@@ -755,16 +756,13 @@ fn terminate_child_with_evidence(
     process_group: Option<libc::pid_t>,
     expired: &dyn Fn() -> bool,
     group_is_gone: &dyn Fn(libc::pid_t) -> bool,
+    terminate_group: &dyn Fn(libc::pid_t) -> io::Result<()>,
+    wait_for_retry: &dyn Fn(),
 ) -> io::Result<CleanupState> {
     if let Some(process_group) = process_group {
         loop {
-            if let Err(error) = terminate_process_group(process_group) {
-                recover_after_killpg_eperm(child, process_group, error)?;
-                return Ok(if group_is_gone(process_group) {
-                    CleanupState::Completed
-                } else {
-                    CleanupState::Unknown
-                });
+            if let Err(error) = terminate_group(process_group) {
+                recover_after_killpg_eperm(child, error)?;
             }
             // Reap before probing: our own zombie leader would keep the group
             // present. Child caches this status on subsequent iterations.
@@ -775,7 +773,7 @@ fn terminate_child_with_evidence(
             if expired() {
                 return Ok(CleanupState::Unknown);
             }
-            thread::sleep(Duration::from_millis(2));
+            wait_for_retry();
         }
     }
     if let Err(error) = child.kill()
@@ -1151,8 +1149,15 @@ mod tests {
             .spawn()
             .unwrap();
         let group = child.id() as libc::pid_t;
-        let cleanup =
-            terminate_child_with_evidence(&mut child, Some(group), &|| true, &|_| false).unwrap();
+        let cleanup = terminate_child_with_evidence(
+            &mut child,
+            Some(group),
+            &|| true,
+            &|_| false,
+            &terminate_process_group,
+            &|| panic!("expired budget must not wait"),
+        )
+        .unwrap();
         assert_eq!(cleanup, CleanupState::Unknown);
         assert!(child.try_wait().unwrap().is_some());
     }
@@ -1391,13 +1396,153 @@ mod tests {
         io::Error::from_raw_os_error(libc::EPERM)
     }
 
+    type TerminationHook = Box<dyn Fn(&mut Child, Option<libc::pid_t>) -> io::Result<CleanupState>>;
+
+    thread_local! {
+        pub(super) static TERMINATION_HOOK: std::cell::RefCell<Option<TerminationHook>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    fn with_termination_hook<T>(hook: TerminationHook, run: impl FnOnce() -> T) -> T {
+        struct ResetHook;
+        impl Drop for ResetHook {
+            fn drop(&mut self) {
+                TERMINATION_HOOK.set(None);
+            }
+        }
+        TERMINATION_HOOK.with_borrow_mut(|slot| {
+            assert!(slot.is_none(), "termination hooks must not nest");
+            *slot = Some(hook);
+        });
+        let _reset = ResetHook;
+        run()
+    }
+
+    fn assert_eperm_recovery_preserves_outcome(cancelled: bool, disappears: bool) {
+        use std::{cell::Cell, rc::Rc};
+
+        let kills = Rc::new(Cell::new(0));
+        let probes = Rc::new(Cell::new(0));
+        let elapsed = Rc::new(Cell::new(Duration::ZERO));
+        let hook = {
+            let kills = Rc::clone(&kills);
+            let probes = Rc::clone(&probes);
+            let elapsed = Rc::clone(&elapsed);
+            Box::new(move |child: &mut Child, group: Option<libc::pid_t>| {
+                let saved_group = child.id() as libc::pid_t;
+                assert_eq!(group, Some(saved_group));
+                let result = terminate_child_with_evidence(
+                    child,
+                    group,
+                    &|| elapsed.get() >= PROCESS_GROUP_KILL_BUDGET,
+                    &|pgid| {
+                        assert_eq!(pgid, saved_group);
+                        probes.set(probes.get() + 1);
+                        disappears && probes.get() == 3
+                    },
+                    &|pgid| {
+                        assert_eq!(pgid, saved_group);
+                        kills.set(kills.get() + 1);
+                        assert!(kills.get() <= 3, "kill budget must bound retries");
+                        if kills.get() <= 2 || !disappears {
+                            Err(injected_eperm())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    &|| elapsed.set(elapsed.get() + PROCESS_GROUP_KILL_BUDGET / 2),
+                );
+                assert!(child.try_wait().unwrap().is_some(), "leader must be reaped");
+                result
+            })
+        };
+        let mut request = cleanup_request("while :; do :; done");
+        if !cancelled {
+            request.policy.deadline = Duration::ZERO;
+        }
+        let completion = with_termination_hook(hook, || {
+            SystemProcessRunner.run_interruptible_with_cleanup(&request, &|| cancelled)
+        });
+        if cancelled {
+            assert!(
+                matches!(
+                    completion.outcome,
+                    Err(WorkerError::Process(ProcessError::Cancelled))
+                ),
+                "{completion:?}"
+            );
+        } else {
+            assert!(
+                matches!(completion.outcome, Err(WorkerError::Process(ProcessError::DeadlineExceeded { deadline })) if deadline == Duration::ZERO),
+                "{completion:?}"
+            );
+        }
+        assert_eq!(
+            completion.cleanup,
+            if disappears {
+                CleanupState::Completed
+            } else {
+                CleanupState::Unknown
+            }
+        );
+        assert_eq!(kills.get(), 3);
+        assert_eq!(probes.get(), 3);
+        assert_eq!(elapsed.get(), PROCESS_GROUP_KILL_BUDGET);
+    }
+
     #[test]
-    fn eperm_recovery_preserves_error_while_a_fixture_descendant_holds_the_group() {
+    fn eperm_recovery_retries_until_gone_preserving_deadline() {
+        assert_eperm_recovery_preserves_outcome(false, true);
+    }
+
+    #[test]
+    fn eperm_recovery_retries_until_gone_preserving_cancellation() {
+        assert_eperm_recovery_preserves_outcome(true, true);
+    }
+
+    #[test]
+    fn eperm_recovery_expires_unknown_preserving_deadline() {
+        assert_eperm_recovery_preserves_outcome(false, false);
+    }
+
+    #[test]
+    fn eperm_recovery_expires_unknown_preserving_cancellation() {
+        assert_eperm_recovery_preserves_outcome(true, false);
+    }
+
+    #[test]
+    fn termination_preserves_non_eperm_errors_without_retrying() {
+        let hook = Box::new(|child: &mut Child, group: Option<libc::pid_t>| {
+            let result = terminate_child_with_evidence(
+                child,
+                group,
+                &|| panic!("non-EPERM errors must propagate before checking the budget"),
+                &|_| panic!("non-EPERM errors must propagate before probing"),
+                &|_| Err(io::Error::from_raw_os_error(libc::EINVAL)),
+                &|| panic!("non-EPERM errors must not retry"),
+            );
+            // The injected error leaves the real child alive; reap the fixture.
+            reap_owned_child(child).unwrap();
+            result
+        });
+        let mut request = cleanup_request("while :; do :; done");
+        request.policy.deadline = Duration::ZERO;
+        let completion = with_termination_hook(hook, || {
+            SystemProcessRunner.run_interruptible_with_cleanup(&request, &|| false)
+        });
+        assert!(
+            matches!(completion.outcome, Err(WorkerError::Io(ref error)) if error.raw_os_error() == Some(libc::EINVAL)),
+            "{completion:?}"
+        );
+        assert_eq!(completion.cleanup, CleanupState::Unknown);
+    }
+
+    #[test]
+    fn eperm_recovery_is_unknown_while_a_fixture_descendant_holds_the_group() {
         // Leader exits; `cat` stays blocked on the stdin pipe we hold, so the
         // saved pgid remains. Noninteractive sh redirects a bare `cat &` to
         // /dev/null; dup the pipe onto fd 3 so the descendant actually holds
-        // it. Injected EPERM must not be swallowed (0d8 Ok-after-reap /
-        // getpgid-only).
+        // it. Reaping the leader must not prove the saved group is gone.
         let mut child = Command::new("/bin/sh")
             .args(["-c", "exec 3<&0; PATH=/bin:/usr/bin /bin/cat <&3 & exit 0"])
             .stdin(Stdio::piped())
@@ -1416,11 +1561,17 @@ mod tests {
             "fixture cat must remain live in the saved group, not zombie-only"
         );
         assert_eq!(
-            recover_after_killpg_eperm(&mut child, process_group, injected_eperm())
-                .unwrap_err()
-                .raw_os_error(),
-            Some(libc::EPERM),
-            "recovery must keep EPERM while the saved group still exists"
+            terminate_child_with_evidence(
+                &mut child,
+                Some(process_group),
+                &|| true,
+                &saved_process_group_is_gone,
+                &|_| Err(injected_eperm()),
+                &|| panic!("expired budget must not wait"),
+            )
+            .unwrap(),
+            CleanupState::Unknown,
+            "recovery must not prove completion while the saved group still exists"
         );
         assert!(!saved_process_group_is_gone(process_group));
         guard.cleanup_once();
@@ -1445,8 +1596,18 @@ mod tests {
         while stdout.read(&mut rest).unwrap_or(0) > 0 {}
         drop(stdout);
         child.wait().unwrap();
-        recover_after_killpg_eperm(&mut child, process_group, injected_eperm())
-            .expect("empty saved group after reap is the accepted EPERM recovery");
+        assert_eq!(
+            terminate_child_with_evidence(
+                &mut child,
+                Some(process_group),
+                &|| panic!("proven absence must complete before checking the budget"),
+                &saved_process_group_is_gone,
+                &|_| Err(injected_eperm()),
+                &|| panic!("proven absence must not wait"),
+            )
+            .unwrap(),
+            CleanupState::Completed,
+        );
         assert!(saved_process_group_is_gone(process_group));
     }
 }

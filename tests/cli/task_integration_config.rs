@@ -273,7 +273,21 @@ impl mac_worker::test_support::host::process::ProcessRunner for PreflightRunner 
     > {
         use std::os::unix::process::ExitStatusExt;
         self.requests.lock().unwrap().push(request.clone());
-        let (code, stdout) = if request.args.iter().any(|arg| arg == "config") {
+        let (code, stdout) = if request.args.iter().any(|arg| arg == "--global") {
+            let stdout = match request.args.last().unwrap().to_str().unwrap() {
+                "credential.helper" => b"osxkeychain\n\n!fixture-helper\n".to_vec(),
+                "credential.https://github.com.helper" => b"\n!fixture-url-helper\n".to_vec(),
+                "credential.useHttpPath" => b"true\n".to_vec(),
+                _ => {
+                    return Ok(mac_worker::test_support::host::process::ProcessResult {
+                        status: std::process::ExitStatus::from_raw(1 << 8),
+                        stdout: vec![],
+                        stderr: vec![],
+                    });
+                }
+            };
+            (0, stdout)
+        } else if request.args.iter().any(|arg| arg == "config") {
             (0, b"filter.fixture.clean\0filter.fixture.smudge\0filter.fixture.process\0filter.fixture.required\0merge.fixture.driver\0merge.fixture.recursive\0merge.union.driver\0".to_vec())
         } else {
             self.replies
@@ -287,6 +301,239 @@ impl mac_worker::test_support::host::process::ProcessRunner for PreflightRunner 
             stdout,
             stderr: vec![],
         })
+    }
+}
+
+#[test]
+fn submit_preflight_https_forwards_laptop_credentials() {
+    use mac_worker::test_support::host::rooted_fs::RootedDir;
+    let root = tempfile::tempdir().unwrap();
+    let repo = RootedDir::open(root.path()).unwrap();
+    let branch = validate_integration_target("main").unwrap();
+    let advertised = format!("{}\trefs/heads/main\n", "c".repeat(40)).into_bytes();
+    for (replies, expected) in [
+        (
+            vec![
+                (0, advertised.clone()),
+                (0, b"false\n".to_vec()),
+                (0, b"3\n".to_vec()),
+                (0, vec![]),
+            ],
+            Ok(IntegrationBasePreflight::Pass),
+        ),
+        (vec![(0, vec![])], Err("INTEGRATION_TARGET_MISSING")),
+        (
+            vec![
+                (0, advertised.clone()),
+                (0, b"false\n".to_vec()),
+                (0, b"3\n".to_vec()),
+                (1, vec![]),
+            ],
+            Err("INTEGRATION_BASE_NOT_ON_TARGET"),
+        ),
+    ] {
+        let runner = PreflightRunner::new(replies);
+        let result = preflight_integration_base(
+            &runner,
+            "https://github.com/fixture/repo.git",
+            &branch,
+            Some(&fixture_head()),
+            &repo,
+        )
+        .map_err(|error| error.public_code());
+        assert_eq!(result, expected.map_err(str::to_owned));
+        assert!(runner.replies.lock().unwrap().is_empty());
+        let requests = runner.requests.lock().unwrap();
+        let mut helper_keys = Vec::new();
+        for request in requests.iter() {
+            if request.args.iter().any(|arg| arg == "--global") {
+                helper_keys.push(request.args.last().unwrap().to_str().unwrap());
+                assert_eq!(request.policy.deadline, std::time::Duration::from_secs(5));
+                assert!(
+                    request
+                        .environment
+                        .iter()
+                        .any(|(key, value)| key == "GIT_TERMINAL_PROMPT" && value == "0")
+                );
+                assert!(
+                    !request
+                        .environment
+                        .iter()
+                        .any(|(key, _)| key == "GIT_CONFIG_GLOBAL")
+                );
+                assert!(
+                    request
+                        .environment_remove
+                        .iter()
+                        .any(|key| key == "GIT_CONFIG_GLOBAL")
+                );
+                continue;
+            }
+            let credentials: Vec<_> = request
+                .args
+                .windows(2)
+                .filter(|pair| {
+                    pair[0] == "-c" && pair[1].to_string_lossy().starts_with("credential.")
+                })
+                .map(|pair| pair[1].to_str().unwrap())
+                .collect();
+            if request.args.iter().any(|arg| arg == "ls-remote") {
+                assert_eq!(
+                    credentials,
+                    [
+                        "credential.helper=osxkeychain",
+                        "credential.helper=",
+                        "credential.helper=!fixture-helper",
+                        "credential.https://github.com.helper=",
+                        "credential.https://github.com.helper=!fixture-url-helper",
+                        "credential.useHttpPath=true",
+                    ]
+                );
+                assert!(request.args.ends_with(&[
+                    "ls-remote".into(),
+                    "https://github.com/fixture/repo.git".into(),
+                    "refs/heads/main".into()
+                ]));
+                assert_eq!(request.policy.deadline, std::time::Duration::from_secs(30));
+                for (key, value) in [
+                    ("GIT_TERMINAL_PROMPT", "0"),
+                    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+                    ("GIT_CONFIG_NOSYSTEM", "1"),
+                ] {
+                    assert!(
+                        request
+                            .environment
+                            .iter()
+                            .any(|(name, configured)| name == key && configured == value)
+                    );
+                }
+            } else {
+                assert!(
+                    credentials.is_empty(),
+                    "local reads need no origin credentials"
+                );
+            }
+        }
+        assert_eq!(
+            helper_keys,
+            [
+                "credential.helper",
+                "credential.https://github.com.helper",
+                "credential.useHttpPath"
+            ]
+        );
+    }
+}
+
+#[test]
+fn submit_preflight_process_failures_remain_unknown() {
+    use mac_worker::test_support::{
+        core::error::{ProcessError, WorkerError},
+        host::{
+            process::{ProcessRequest, ProcessResult, ProcessRunner},
+            rooted_fs::RootedDir,
+        },
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FailingRunner {
+        inner: PreflightRunner,
+        operation: &'static str,
+        failures: AtomicUsize,
+    }
+    impl ProcessRunner for FailingRunner {
+        fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            if request.args.iter().any(|arg| arg == self.operation) {
+                self.failures.fetch_add(1, Ordering::SeqCst);
+                Err(ProcessError::DeadlineExceeded {
+                    deadline: request.policy.deadline,
+                }
+                .into())
+            } else {
+                self.inner.run(request)
+            }
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let repo = RootedDir::open(root.path()).unwrap();
+    for operation in [
+        "--global",
+        "--get-regexp",
+        "ls-remote",
+        "rev-parse",
+        "rev-list",
+        "merge-base",
+    ] {
+        let replies = if operation == "--global" {
+            vec![(128, vec![])] // Private origin refuses the unauthenticated advertisement.
+        } else {
+            vec![
+                (
+                    0,
+                    format!("{}\trefs/heads/main\n", "c".repeat(40)).into_bytes(),
+                ),
+                (0, b"false\n".to_vec()),
+                (0, b"3\n".to_vec()),
+                (0, vec![]),
+            ]
+        };
+        let runner = FailingRunner {
+            inner: PreflightRunner::new(replies),
+            operation,
+            failures: AtomicUsize::new(0),
+        };
+        assert_eq!(
+            preflight_integration_base(
+                &runner,
+                "https://github.com/fixture/repo.git",
+                &validate_integration_target("main").unwrap(),
+                Some(&fixture_head()),
+                &repo,
+            )
+            .unwrap(),
+            IntegrationBasePreflight::Unknown,
+            "{operation}"
+        );
+        assert!(runner.failures.load(Ordering::SeqCst) > 0, "{operation}");
+    }
+}
+
+#[test]
+fn submit_preflight_non_https_skips_credential_lookup() {
+    use mac_worker::test_support::host::rooted_fs::RootedDir;
+    let root = tempfile::tempdir().unwrap();
+    let repo = RootedDir::open(root.path()).unwrap();
+    for origin in [
+        "git@github.com:fixture/repo.git",
+        "file:///private/tmp/fixture.git",
+    ] {
+        let runner = PreflightRunner::new(vec![
+            (
+                0,
+                format!("{}\trefs/heads/main\n", "c".repeat(40)).into_bytes(),
+            ),
+            (0, b"false\n".to_vec()),
+            (0, b"3\n".to_vec()),
+            (0, vec![]),
+        ]);
+        assert_eq!(
+            preflight_integration_base(
+                &runner,
+                origin,
+                &validate_integration_target("main").unwrap(),
+                Some(&fixture_head()),
+                &repo,
+            )
+            .unwrap(),
+            IntegrationBasePreflight::Pass,
+        );
+        assert!(runner.requests.lock().unwrap().iter().all(|request| {
+            !request
+                .args
+                .iter()
+                .any(|arg| arg == "--global" || arg.to_string_lossy().starts_with("credential."))
+        }));
     }
 }
 
@@ -359,6 +606,9 @@ fn submit_preflight_is_one_bounded_exact_branch_read_and_local_ancestry_only() {
         assert_eq!(remote[0].policy.stdout_limit, 8 * 1024 * 1024);
         assert_eq!(remote[0].policy.stderr_limit, 64 * 1024);
         for request in requests.iter() {
+            if request.args.iter().any(|arg| arg == "--global") {
+                continue; // Credential discovery is a separate, bounded global config read.
+            }
             for option in [
                 "gc.auto=0",
                 "core.hooksPath=/dev/null",
@@ -449,7 +699,7 @@ fn submit_preflight_is_one_bounded_exact_branch_read_and_local_ancestry_only() {
         .unwrap(),
         IntegrationBasePreflight::Unknown
     );
-    assert_eq!(runner.requests.lock().unwrap().len(), 2); // One local driver read and one advertisement.
+    assert_eq!(runner.requests.lock().unwrap().len(), 5); // Three credential reads, one driver read and one advertisement.
 }
 
 #[test]

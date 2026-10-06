@@ -627,6 +627,25 @@ impl<'a> OriginOutbox<'a> {
         idle_millis: u64,
         identity: &dyn BinaryIdentitySource,
     ) -> Result<(), WorkerError> {
+        self.run_watch_with_wait(
+            stop,
+            now,
+            idle_millis,
+            identity,
+            || self.store.validate_layout(),
+            interruptible_sleep,
+        )
+    }
+
+    fn run_watch_with_wait(
+        &self,
+        stop: &AtomicBool,
+        now: impl Fn() -> u64,
+        idle_millis: u64,
+        identity: &dyn BinaryIdentitySource,
+        mut validate: impl FnMut() -> Result<(), WorkerError>,
+        mut wait: impl FnMut(&AtomicBool, u64),
+    ) -> Result<(), WorkerError> {
         let Some(_pump) = self.try_pump_lock()? else {
             return Ok(());
         };
@@ -634,8 +653,21 @@ impl<'a> OriginOutbox<'a> {
         self.recover_due_index()?;
         let mut last_binary_check: Option<Instant> = None;
         while !watch_should_stop(stop) {
+            // Check the installation pinned by HostStore on every poll, even
+            // when idle. Mutable outbox files and directory timestamps are not
+            // installation identity: their disappearance or writes must not
+            // end a live watcher.
+            let validated = match validate() {
+                Ok(()) => true,
+                // Descriptor or memory pressure and interrupted calls prove
+                // nothing about the installation: skip this pump, check again.
+                Err(error) if transient_validation_error(&error) => false,
+                Err(_) => return Ok(()),
+            };
             let now_millis = now();
-            let _ = self.pump_due_locked(now_millis);
+            if validated {
+                let _ = self.pump_due_locked(now_millis);
+            }
             if watch_should_stop(stop) {
                 break;
             }
@@ -651,7 +683,7 @@ impl<'a> OriginOutbox<'a> {
             let sleep_for = self
                 .sleep_millis(now_millis, idle_millis.max(1))
                 .unwrap_or(idle_millis.max(1));
-            interruptible_sleep(stop, sleep_for);
+            wait(stop, sleep_for);
         }
         Ok(())
     }
@@ -1523,6 +1555,16 @@ fn watch_should_stop(stop: &AtomicBool) -> bool {
     stop.load(Ordering::SeqCst) || WATCH_STOP.load(Ordering::SeqCst)
 }
 
+fn transient_validation_error(error: &WorkerError) -> bool {
+    matches!(
+        error,
+        WorkerError::Io(error) if matches!(
+            error.raw_os_error(),
+            Some(libc::EMFILE | libc::ENFILE | libc::ENOMEM | libc::EINTR)
+        )
+    )
+}
+
 fn interruptible_sleep(stop: &AtomicBool, millis: u64) {
     let mut remaining = millis;
     while remaining > 0 && !watch_should_stop(stop) {
@@ -1742,4 +1784,256 @@ fn replace_json<T: Serialize>(
         .replace_private_regular_exact(name, &old, &new)
         .map_err(WorkerError::Io)?;
     directory.sync_root().map_err(WorkerError::Io)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        binary_identity::FixedBinaryIdentitySource,
+        process::{ProcessRequest, ProcessResult},
+    };
+
+    struct NoProcesses;
+
+    impl ProcessRunner for NoProcesses {
+        fn run(&self, _request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+            panic!("idle watcher must not launch a process");
+        }
+    }
+
+    fn fixture() -> (tempfile::TempDir, HostStore) {
+        let temp = tempfile::tempdir().unwrap();
+        let store = HostStore::open(&temp.path().join("host")).unwrap();
+        (temp, store)
+    }
+
+    fn watch(
+        outbox: &OriginOutbox<'_>,
+        stop: &AtomicBool,
+        wait: impl FnMut(&AtomicBool, u64),
+    ) -> Result<(), WorkerError> {
+        watch_validating(outbox, stop, || outbox.store.validate_layout(), wait)
+    }
+
+    fn watch_validating(
+        outbox: &OriginOutbox<'_>,
+        stop: &AtomicBool,
+        validate: impl FnMut() -> Result<(), WorkerError>,
+        wait: impl FnMut(&AtomicBool, u64),
+    ) -> Result<(), WorkerError> {
+        outbox.run_watch_with_wait(
+            stop,
+            || 1,
+            DEFAULT_WATCH_IDLE_MILLIS,
+            &FixedBinaryIdentitySource {
+                started: None,
+                installed: None,
+            },
+            validate,
+            wait,
+        )
+    }
+
+    #[test]
+    fn watch_keeps_polling_through_transient_validation_errors() {
+        for errno in [libc::EMFILE, libc::ENFILE, libc::ENOMEM, libc::EINTR] {
+            let (_temp, store) = fixture();
+            let outbox = OriginOutbox::new(&store, &NoProcesses);
+            let stop = AtomicBool::new(false);
+            let before = due_index_reads_for(store.root());
+            let mut validations = 0;
+            let mut polls = 0;
+
+            watch_validating(
+                &outbox,
+                &stop,
+                || {
+                    validations += 1;
+                    if validations == 1 {
+                        return Err(io::Error::from_raw_os_error(errno).into());
+                    }
+                    store.validate_layout()
+                },
+                |stop, _| {
+                    polls += 1;
+                    // Every poll reads the due index to size its sleep; only a
+                    // validated poll reads it again to pump.
+                    let reads = due_index_reads_for(store.root()) - before;
+                    match polls {
+                        1 => assert_eq!(reads, 1, "errno {errno}: unvalidated poll pumped"),
+                        2 => {
+                            assert_eq!(reads, 3, "errno {errno}: validated poll skipped the pump");
+                            stop.store(true, Ordering::SeqCst);
+                        }
+                        _ => panic!("watcher ignored the stop request"),
+                    }
+                },
+            )
+            .unwrap();
+
+            assert_eq!(polls, 2, "errno {errno}: transient error ended the watch");
+            assert_eq!(validations, 2, "errno {errno}");
+        }
+    }
+
+    #[test]
+    fn watch_exits_on_validation_errors_that_are_not_transient() {
+        let errors: [fn() -> WorkerError; 3] = [
+            || io::Error::from_raw_os_error(libc::ENOENT).into(),
+            || io::Error::from_raw_os_error(libc::ESTALE).into(),
+            || WorkerError::Protocol("canonical host layout record changed".into()),
+        ];
+        for error in errors {
+            let (_temp, store) = fixture();
+            let outbox = OriginOutbox::new(&store, &NoProcesses);
+            let stop = AtomicBool::new(false);
+
+            watch_validating(
+                &outbox,
+                &stop,
+                || Err(error()),
+                |_, _| panic!("watcher kept polling after a failed validation"),
+            )
+            .expect("a failed validation must be a clean exit");
+        }
+    }
+
+    #[test]
+    fn watch_exits_cleanly_when_idle_host_root_is_deleted() {
+        let (_temp, store) = fixture();
+        let outbox = OriginOutbox::new(&store, &NoProcesses);
+        let stop = AtomicBool::new(false);
+        let mut polls = 0;
+
+        watch(&outbox, &stop, |_, millis| {
+            polls += 1;
+            assert_eq!(millis, DEFAULT_WATCH_IDLE_MILLIS);
+            assert_eq!(
+                polls, 1,
+                "watcher kept polling after its host root was deleted"
+            );
+            fs::remove_dir_all(store.root()).unwrap();
+        })
+        .expect("host root deletion must be a clean exit");
+
+        assert_eq!(polls, 1);
+        assert!(!stop.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn watch_keeps_running_when_only_an_outbox_entry_vanishes() {
+        let (_temp, store) = fixture();
+        let outbox = OriginOutbox::new(&store, &NoProcesses);
+        let due = outbox.due_namespace(true).unwrap().unwrap();
+        let entry = DueEntry {
+            project_id: "a".repeat(64),
+            task_id: "00000000000040008000000000000001".parse().unwrap(),
+            turn_id: "00000000000040008000000000000002".parse().unwrap(),
+            next_attempt_at_millis: u64::MAX,
+        };
+        let name = due_name(entry.task_id, entry.turn_id);
+        write_json_once(&due, &name, &entry).unwrap();
+        let stop = AtomicBool::new(false);
+        let mut polls = 0;
+
+        watch(&outbox, &stop, |stop, _| {
+            polls += 1;
+            match polls {
+                1 => fs::remove_file(due.path().join(&name)).unwrap(),
+                2 => assert!(outbox.load_due_entries().unwrap().is_empty()),
+                3 => stop.store(true, Ordering::SeqCst),
+                _ => panic!("watcher ignored the stop request"),
+            }
+        })
+        .unwrap();
+
+        assert_eq!(polls, 3, "a missing outbox entry must not stop the watcher");
+        store.validate_layout().unwrap();
+    }
+
+    #[test]
+    fn watch_exits_cleanly_when_host_root_is_replaced() {
+        let (temp, store) = fixture();
+        let outbox = OriginOutbox::new(&store, &NoProcesses);
+        let stop = AtomicBool::new(false);
+        let mut polls = 0;
+
+        watch(&outbox, &stop, |_, _| {
+            polls += 1;
+            assert_eq!(polls, 1, "watcher kept polling a replacement host root");
+            fs::rename(store.root(), temp.path().join("detached-host")).unwrap();
+            fs::create_dir(store.root()).unwrap();
+            fs::set_permissions(store.root(), fs::Permissions::from_mode(0o700)).unwrap();
+        })
+        .expect("host root replacement must be a clean exit");
+
+        assert_eq!(polls, 1);
+        assert!(store.root().is_dir());
+        assert!(!stop.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn watch_exits_on_installation_refresh_and_can_restart() {
+        let (temp, store) = fixture();
+        let outbox = OriginOutbox::new(&store, &NoProcesses);
+        let candidate = temp.path().join("candidate-worker");
+        let installed = temp.path().join("worker");
+        fs::write(&candidate, b"new helper").unwrap();
+        fs::write(&installed, b"old helper").unwrap();
+        let stop = AtomicBool::new(false);
+        let mut polls = 0;
+
+        watch(&outbox, &stop, |_, _| {
+            polls += 1;
+            assert_eq!(polls, 1, "watcher kept polling an obsolete installation");
+            // Setup's upgrade path refreshes the installation identity while
+            // leaving the host root directory itself in place.
+            HostStore::complete_protocol_upgrade(store.root(), &candidate, &installed).unwrap();
+        })
+        .expect("installation refresh must be a clean exit");
+
+        assert_eq!(polls, 1);
+        assert!(!stop.load(Ordering::SeqCst));
+        let refreshed = HostStore::open(store.root()).unwrap();
+        let restarted = OriginOutbox::new(&refreshed, &NoProcesses);
+        polls = 0;
+        watch(&restarted, &stop, |stop, _| {
+            polls += 1;
+            if polls == 3 {
+                stop.store(true, Ordering::SeqCst);
+            }
+            assert!(polls <= 3, "restarted watcher ignored the stop request");
+        })
+        .unwrap();
+        assert_eq!(polls, 3, "a watcher must run on the refreshed installation");
+    }
+
+    #[test]
+    fn watch_keeps_running_while_live_root_is_written() {
+        let (_temp, store) = fixture();
+        let outbox = OriginOutbox::new(&store, &NoProcesses);
+        let stop = AtomicBool::new(false);
+        let mut polls = 0;
+
+        watch(&outbox, &stop, |stop, millis| {
+            polls += 1;
+            assert_eq!(millis, DEFAULT_WATCH_IDLE_MILLIS);
+            let scratch = store.root().join("scratch");
+            match polls {
+                1 => {
+                    fs::create_dir(&scratch).unwrap();
+                    fs::write(scratch.join("progress"), b"working").unwrap();
+                    outbox.enable_watch().unwrap();
+                }
+                2 => fs::remove_dir_all(scratch).unwrap(),
+                3 => stop.store(true, Ordering::SeqCst),
+                _ => panic!("watcher ignored the stop request"),
+            }
+        })
+        .unwrap();
+
+        assert_eq!(polls, 3, "ordinary writes must not stop the watcher");
+        store.validate_layout().unwrap();
+    }
 }

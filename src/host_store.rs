@@ -1242,8 +1242,19 @@ impl HostStore {
         }
         let namespaces = open_host_namespaces(&rooted, root_device, initialize || needs_migration)?;
         inject_open_fault(point, HostStoreWritePoint::AfterHostNamespaces)?;
+        // The construction installation lock is still held, as it is for
+        // job-owned cleanup. Resume only durable, identity-bound replace
+        // decisions; an unbound temp may belong to an in-flight facts writer.
+        // Best effort: evidence the engine refuses (an abandoned namespace
+        // probe, say) must not fail every open. Upgrade inspection below
+        // still refuses with the host-root drain reason.
+        if host_root_cleanup_residue(&rooted).unwrap_or(false) {
+            let _ = rooted.retry_pending_owned_regulars_matching(|component, _| {
+                std::str::from_utf8(component).is_ok_and(parse_replace_uuid_name)
+            });
+        }
         if (migrate || fence.is_some()) && !initialize {
-            match inspect_protocol_upgrade_namespaces(&namespaces) {
+            match inspect_protocol_upgrade_namespaces(&rooted, &namespaces) {
                 Ok(()) => {}
                 Err(_) if matches!(fence, Some(UpgradeFenceOp::Rollback { .. })) => {
                     drop(installation_lock);
@@ -2272,7 +2283,7 @@ impl HostStore {
 
     #[cfg(any(test, feature = "test-support"))]
     fn inspect_protocol_upgrade_locked(&self) -> Result<(), WorkerError> {
-        inspect_protocol_upgrade_namespaces(&self.inner.namespaces)
+        inspect_protocol_upgrade_namespaces(&self.inner.root, &self.inner.namespaces)
     }
 
     pub(crate) fn session_lock(&self) -> Result<SessionGuard, WorkerError> {
@@ -5354,9 +5365,25 @@ fn inventory_names(directory: &RootedDir, label: &str) -> Result<Vec<String>, Wo
         .collect()
 }
 
+fn host_root_cleanup_residue(root: &RootedDir) -> Result<bool, WorkerError> {
+    Ok(root.entry_exists(".mac-worker-rooted-fs")?
+        && !root
+            .open_child_directory(&relative(".mac-worker-rooted-fs")?, false)?
+            .list_names()?
+            .is_empty())
+}
+
 fn inspect_protocol_upgrade_namespaces(
+    root: &RootedDir,
     namespaces: &BTreeMap<&'static str, RootedDir>,
 ) -> Result<(), WorkerError> {
+    // Child namespace checks also inspect their parent. Identify host-root
+    // evidence first so the operator can distinguish it from job/lease work.
+    if host_root_cleanup_residue(root)? {
+        return Err(upgrade_drain_required(
+            "private cleanup residue in the host root",
+        ));
+    }
     let leases = namespaces
         .get("leases")
         .ok_or_else(|| upgrade_drain_required("leases namespace is missing"))?;
@@ -6747,6 +6774,322 @@ mod review_regression_tests {
                 b"winner-bytes",
                 "{directory}"
             );
+        }
+    }
+
+    fn plant_pending_host_root_replace(root: &Path) -> String {
+        let store =
+            HostStore::open_with_write_fault(root, HostStoreWritePoint::AfterCleanupIntentCommit)
+                .unwrap();
+        let replace = format!("replace-{}", uuid::Uuid::from_u128(91).hyphenated());
+        store
+            .inner
+            .root
+            .write_new_private_file("facts.json", b"current facts")
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        store
+            .inner
+            .root
+            .write_new_private_file(&replace, b"displaced facts")
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        store
+            .with_installation_lock(|| {
+                assert_eq!(
+                    store
+                        .remove_owned_regular_committed(&store.inner.root, &replace)
+                        .unwrap_err()
+                        .raw_os_error(),
+                    Some(libc::EIO)
+                );
+                Ok(())
+            })
+            .unwrap();
+        let names = fs::read_dir(root.join(".mac-worker-rooted-fs"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        for prefix in [
+            "cleanup-intent-v1-",
+            "cleanup-op-v1-",
+            "cleanup-regular-v1-",
+        ] {
+            assert!(
+                names.iter().any(|name| name.starts_with(prefix)),
+                "{names:?}"
+            );
+        }
+        assert_eq!(
+            store
+                .require_protocol_upgrade_drain()
+                .unwrap_err()
+                .public_code(),
+            "HOST_UPGRADE_DRAIN_REQUIRED"
+        );
+        replace
+    }
+
+    #[test]
+    fn host_root_replace_recovery_on_open_clears_bound_residue() {
+        for open_if_present in [false, true] {
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("host");
+            let replace = plant_pending_host_root_replace(&root);
+            let store = if open_if_present {
+                HostStore::open_if_present(&root).unwrap().unwrap()
+            } else {
+                HostStore::open(&root).unwrap()
+            };
+            assert!(!store.inner.root.has_private_cleanup_residue().unwrap());
+            assert!(!root.join(replace).exists());
+            assert_eq!(fs::read(root.join("facts.json")).unwrap(), b"current facts");
+            store.require_protocol_upgrade_drain().unwrap();
+            drop(store);
+            HostStore::open(&root)
+                .unwrap()
+                .require_protocol_upgrade_drain()
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn host_root_replace_recovery_precedes_upgrade_inspection() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let replace = plant_pending_host_root_replace(&root);
+        let (from, to) = helper_pair(temp.path(), "worker");
+        HostStore::complete_protocol_upgrade(&root, &from, &to).unwrap();
+        assert!(!from.exists());
+        assert_eq!(fs::read(to).unwrap(), b"candidate-helper");
+        assert!(!root.join(replace).exists());
+        let store = HostStore::open(&root).unwrap();
+        assert!(!store.inner.root.has_private_cleanup_residue().unwrap());
+        store.require_protocol_upgrade_drain().unwrap();
+    }
+
+    #[test]
+    fn host_root_replace_recovery_preserves_unbound_writer_temp() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let replace = format!("replace-{}", uuid::Uuid::from_u128(92).hyphenated());
+        let mut writer = store
+            .inner
+            .root
+            .write_new_private_file(&replace, b"in-flight facts")
+            .unwrap();
+        let before = store.inner.root.private_entry_identity(&replace).unwrap();
+        drop(store);
+        // Recover a different, bound stage while this writer still owns its
+        // unbound temp. Neither the open nor promotion may unlink the temp.
+        plant_pending_host_root_replace(&root);
+        let reopened = HostStore::open(&root).unwrap();
+        assert!(!reopened.inner.root.has_private_cleanup_residue().unwrap());
+        assert_eq!(
+            reopened
+                .inner
+                .root
+                .private_entry_identity(&replace)
+                .unwrap(),
+            before
+        );
+        reopened.require_protocol_upgrade_drain().unwrap();
+        drop(reopened);
+        let (from, to) = helper_pair(temp.path(), "worker");
+        HostStore::complete_protocol_upgrade(&root, &from, &to).unwrap();
+        use std::io::Write;
+        writer.write_all(b" completed").unwrap();
+        assert_eq!(
+            fs::read(root.join(replace)).unwrap(),
+            b"in-flight facts completed"
+        );
+    }
+
+    #[test]
+    fn host_root_cleanup_drain_reason_is_public() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        plant_pending_host_root_replace(&root);
+        let rooted = RootedDir::open(&root).unwrap();
+        let namespaces =
+            open_host_namespaces(&rooted, fs::metadata(&root).unwrap().dev(), false).unwrap();
+        let error = inspect_protocol_upgrade_namespaces(&rooted, &namespaces).unwrap_err();
+        assert_eq!(
+            error.public_message(),
+            "private cleanup residue in the host root"
+        );
+    }
+
+    #[test]
+    fn abandoned_host_root_namespace_probe_keeps_open_working_and_blocks_upgrade() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        drop(HostStore::open(&root).unwrap());
+        // A namespace probe killed before its cleanup leaves a private
+        // operation directory that the cleanup engine refuses to resume.
+        let namespace = root.join(".mac-worker-rooted-fs");
+        if !namespace.exists() {
+            fs::create_dir(&namespace).unwrap();
+        }
+        fs::set_permissions(&namespace, fs::Permissions::from_mode(0o700)).unwrap();
+        let probe = namespace.join(format!(
+            "operation-{}",
+            uuid::Uuid::from_u128(93).hyphenated()
+        ));
+        fs::create_dir(&probe).unwrap();
+        fs::set_permissions(&probe, fs::Permissions::from_mode(0o700)).unwrap();
+        let before = fs::metadata(&probe).unwrap();
+
+        drop(HostStore::open(&root).unwrap());
+        drop(HostStore::open_if_present(&root).unwrap().unwrap());
+        let after = fs::metadata(&probe).unwrap();
+        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+        assert_eq!(after.mode() & 0o7777, 0o700);
+        assert_eq!(fs::read_dir(&probe).unwrap().count(), 0);
+
+        let error = HostStore::migrate_layout(&root).unwrap_err();
+        assert_eq!(error.public_code(), "HOST_UPGRADE_DRAIN_REQUIRED");
+        assert_eq!(
+            error.public_message(),
+            "private cleanup residue in the host root"
+        );
+        assert_eq!(fs::metadata(&probe).unwrap().ino(), before.ino());
+    }
+
+    #[test]
+    fn upgrade_inspections_name_a_drain_reason_for_every_residue_family() {
+        // Each row plants one kind of residue. The protocol upgrade inspection,
+        // and the layout-2 promotion inspection where it looks at that kind,
+        // must name a fixed reason: a reworded inspection message must not
+        // silently become "host inventory requires draining".
+        const LEASE: &str = "live or partial lease remains";
+        const LEASE_INVENTORY: &str = "lease inventory is incomplete or unreadable";
+        const JOBS: &str = "job inventory is incomplete or unreadable";
+        const INDEX: &str = "job index is incomplete or inconsistent";
+        let file = |store: &HostStore, directory: &str, name: &str| {
+            store
+                .open_directory(directory, true)
+                .unwrap()
+                .write_new_private_file(name, b"residue")
+                .unwrap();
+        };
+        let job = |store: &HostStore, status: Option<JobStatus>| {
+            let request = request(400);
+            let material = request.material();
+            let job = store
+                .open_directory(
+                    &format!(
+                        "jobs/{}/{}/{}",
+                        material.project_id(),
+                        material.worktree_id(),
+                        material.job_id()
+                    ),
+                    true,
+                )
+                .unwrap();
+            if let Some(status) = status {
+                let meta = JobMeta::new(material, request.request_fingerprint().clone()).unwrap();
+                job.write_new_private_file("meta.json", &serde_json::to_vec(&meta).unwrap())
+                    .unwrap();
+                job.write_new_private_file("status.json", &serde_json::to_vec(&status).unwrap())
+                    .unwrap();
+            }
+            job
+        };
+        for (residue, protocol, layout2) in [
+            (
+                "host root cleanup",
+                "private cleanup residue in the host root",
+                None,
+            ),
+            (
+                "namespace cleanup",
+                "private cleanup residue remains in an upgrade-scoped namespace",
+                None,
+            ),
+            ("heavy lease", LEASE, Some(LEASE)),
+            ("unknown lease entry", LEASE_INVENTORY, Some(LEASE)),
+            ("live slot", LEASE, Some(LEASE)),
+            ("invalid slot", LEASE_INVENTORY, Some(LEASE)),
+            (
+                "incoming",
+                "incoming transfer remains",
+                Some("incoming transfer remains"),
+            ),
+            ("incomplete project", JOBS, Some(JOBS)),
+            ("unreadable job", JOBS, Some(JOBS)),
+            (
+                "non-terminal job",
+                "non-terminal job remains",
+                Some("non-terminal job remains"),
+            ),
+            (
+                "mutable job",
+                "job retains mutable execution evidence",
+                Some("job retains mutable execution evidence"),
+            ),
+            (
+                "accept staging",
+                "accepted job index staging residue remains",
+                Some("accepted job index staging residue remains"),
+            ),
+            ("incomplete index", INDEX, Some(INDEX)),
+            ("invalid index", INDEX, Some(INDEX)),
+            ("accepted index without its job", INDEX, Some(JOBS)),
+        ] {
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("host");
+            let store = HostStore::open(&root).unwrap();
+            match residue {
+                "host root cleanup" => plant_cleanup_residue(&root),
+                "namespace cleanup" => plant_cleanup_residue(&root.join("leases")),
+                "heavy lease" => drop(store.open_directory("leases/heavy", true).unwrap()),
+                "unknown lease entry" => file(&store, "leases", "stray"),
+                "live slot" => file(&store, "leases/slots/0", "holder"),
+                "invalid slot" => file(&store, "leases/slots", "x"),
+                "incoming" => file(&store, "incoming", ".partial"),
+                "incomplete project" => file(&store, "jobs", ".partial"),
+                "unreadable job" => drop(job(&store, None)),
+                "non-terminal job" => drop(job(&store, Some(JobStatus::accepted(10).unwrap()))),
+                "mutable job" => {
+                    let job = job(&store, Some(JobStatus::succeeded(10, 0, 0).unwrap()));
+                    job.write_new_private_file("execution.json", b"{}").unwrap();
+                }
+                "accept staging" => file(&store, "job-index", ".accept-deadbeef.json"),
+                "incomplete index" => file(&store, "job-index", ".partial"),
+                "invalid index" => file(&store, "job-index", "garbage.json"),
+                "accepted index without its job" => {
+                    let request = request(400);
+                    let material = request.material();
+                    store
+                        .write_new_disposition(&JobDisposition::Accepted {
+                            job_id: material.job_id(),
+                            client_id: material.client_id(),
+                            project_id: material.project_id().into(),
+                            worktree_id: material.worktree_id().into(),
+                            request_fingerprint: request.request_fingerprint().clone(),
+                            status: JobStatus::accepted(10).unwrap(),
+                            recorded_at_millis: 10,
+                        })
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let error = store.require_protocol_upgrade_drain().unwrap_err();
+            assert_eq!(error.public_code(), "HOST_UPGRADE_DRAIN_REQUIRED");
+            assert_eq!(error.public_message(), protocol, "{residue}: {error}");
+            if let Some(layout2) = layout2 {
+                let error = inspect_upgrade_drain(&store.inner.namespaces).unwrap_err();
+                assert_eq!(error.public_code(), "HOST_UPGRADE_DRAIN_REQUIRED");
+                assert_eq!(
+                    error.public_message(),
+                    layout2,
+                    "layout-2 {residue}: {error}"
+                );
+            }
         }
     }
 

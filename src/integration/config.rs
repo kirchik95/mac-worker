@@ -2,7 +2,7 @@
 use super::contracts::*;
 use crate::{
     error::WorkerError,
-    process::ProcessRunner,
+    process::{ProcessRequest, ProcessRunner},
     rooted_fs::RootedDir,
     task::{BaseOid, BranchName, ClosePolicy, TaskId},
 };
@@ -179,14 +179,37 @@ pub fn preflight_integration_base(
     base: Option<&BaseOid>,
     local_repo: &RootedDir,
 ) -> Result<IntegrationBasePreflight, WorkerError> {
+    preflight_integration_base_with(
+        runner,
+        origin,
+        branch,
+        base,
+        local_repo,
+        crate::git_transport::origin_ref_request,
+    )
+}
+
+fn preflight_integration_base_with(
+    runner: &dyn ProcessRunner,
+    origin: &str,
+    branch: &BranchName,
+    base: Option<&BaseOid>,
+    local_repo: &RootedDir,
+    origin_ref_request: impl FnOnce(String, &str) -> Result<ProcessRequest, WorkerError>,
+) -> Result<IntegrationBasePreflight, WorkerError> {
     use IntegrationBasePreflight::{Pass, Unknown};
     // Pure validation precedes even the advertisement. Use the existing
     // preflight bounds and integration-only hardening, not a target fetch/ref.
     let key = TargetKey::new(origin, branch.as_str())
         .map_err(|_| integration_error("TASK_CONFIG_INVALID"))?;
     let reference = format!("refs/heads/{}", key.branch.as_str());
-    let advertised = crate::git_transport::origin_ref_request(key.origin, &reference)?;
-    let Ok(mut request) = super::git::hardened_read_request(runner, local_repo, advertised.args)
+    let credentials =
+        crate::git_transport::GitTransport::new(runner).origin_credential_config(&key.origin);
+    let Ok(advertised) = origin_ref_request(key.origin, &reference) else {
+        return Ok(Unknown);
+    };
+    let Ok(mut request) =
+        super::git::hardened_read_request(runner, local_repo, advertised.args, &credentials)
     else {
         return Ok(Unknown);
     };
@@ -218,7 +241,7 @@ pub fn preflight_integration_base(
     };
 
     let run_local = |operation: Vec<std::ffi::OsString>| {
-        let request = super::git::hardened_read_request(runner, local_repo, operation)?;
+        let request = super::git::hardened_read_request(runner, local_repo, operation, &[])?;
         runner.run(&request)
     };
     // A negative answer in shallow/incomplete history is not a proof. Traverse
@@ -347,6 +370,38 @@ pub(crate) fn validate_batch_policy_inputs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn preflight_origin_ref_request_failure_is_unknown() {
+        struct NoProcesses;
+        impl ProcessRunner for NoProcesses {
+            fn run(
+                &self,
+                request: &ProcessRequest,
+            ) -> Result<crate::process::ProcessResult, WorkerError> {
+                panic!("preflight ran {:?} without an advertisement", request.args);
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let repo = RootedDir::open(root.path()).unwrap();
+        let base: BaseOid = "c".repeat(40).parse().unwrap();
+        let preflight = preflight_integration_base_with(
+            &NoProcesses,
+            "git@github.com:fixture/repo.git",
+            &validate_integration_target("main").unwrap(),
+            Some(&base),
+            &repo,
+            // What a debug build returns for an invalid MAC_WORKER_TEST_SSH.
+            |_, _| {
+                Err(WorkerError::Protocol(
+                    "CONTROLLER_UNAVAILABLE: MAC_WORKER_TEST_SSH must be an absolute executable path"
+                        .into(),
+                ))
+            },
+        )
+        .unwrap();
+        assert_eq!(preflight, IntegrationBasePreflight::Unknown);
+    }
+
     #[test]
     fn batch_inputs_survive_resolution_including_disabled_override() {
         let root = tempfile::tempdir().unwrap();
