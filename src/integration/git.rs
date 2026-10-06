@@ -35,6 +35,8 @@ const DRIVER_PATTERN: &str =
 
 /// Read-only laptop preflight uses the same overrides as host integration Git.
 /// Driver discovery is a bounded local config read; it never runs a driver.
+/// `credentials` are appended last, after the hardening and driver overrides,
+/// and only to `operation`'s request: the driver probe never sees them.
 pub(crate) fn hardened_read_request(
     runner: &dyn ProcessRunner,
     repo: &RootedDir,
@@ -1546,7 +1548,11 @@ fn native_regular_digest(
 fn push_failure_code(result: Result<ProcessResult, WorkerError>) -> IntegrationCode {
     match result {
         // GitHub can accompany a repository policy rejection with HTTP 403.
-        Ok(result) if crate::git_transport::origin_policy_rejected(&result.stderr) => {
+        // This push is --porcelain, so a declined hook is reported on stdout.
+        Ok(result)
+            if crate::git_transport::origin_policy_rejected(&result.stderr)
+                || crate::git_transport::origin_policy_rejected(&result.stdout) =>
+        {
             IntegrationCode::IntegrationPolicyRejected
         }
         Ok(result) if crate::git_transport::origin_auth_failed(&result.stderr) => {
@@ -1624,6 +1630,40 @@ mod tests {
                 })
                 .collect();
             assert_eq!(actual, ["INTEGRATION_POLICY_REJECTED"; 5], "{suffix}");
+        }
+    }
+
+    #[test]
+    fn push_failure_classifies_porcelain_and_ssh_policy_rejections() {
+        let oid = "e".repeat(40);
+        for (stdout, stderr) in [
+            // HTTPS push to a protected branch: the ref status is on stdout,
+            // GitHub's explanation on stderr.
+            (
+                format!(
+                    "To https://github.com/fixture/repo.git\n!\t{oid}:refs/heads/main\t[remote rejected] (protected branch hook declined)\n"
+                ),
+                "remote: error: GH006: Protected branch update failed for refs/heads/main.\nremote: error: Changes must be made through a pull request.\nerror: failed to push some refs to 'https://github.com/fixture/repo.git'\n".to_owned(),
+            ),
+            // SSH push to an archived repository is refused before any ref status.
+            (
+                String::new(),
+                "ERROR: This repository was archived so it is read-only.\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n".to_owned(),
+            ),
+            // A ref status proves the remote took the push, so a declined hook
+            // named only on stdout outranks auth-looking stderr.
+            (
+                format!("!\t{oid}:refs/heads/main\t[remote rejected] (pre-receive hook declined)\n"),
+                "fatal: unable to access 'https://github.com/fixture/repo.git/': The requested URL returned error: 403\n".to_owned(),
+            ),
+        ] {
+            assert_eq!(
+                push_failure_code(rejected_push(&stdout, &stderr))
+                    .error()
+                    .public_code(),
+                "INTEGRATION_POLICY_REJECTED",
+                "{stdout}{stderr}"
+            );
         }
     }
 
