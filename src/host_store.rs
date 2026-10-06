@@ -6960,6 +6960,140 @@ mod review_regression_tests {
     }
 
     #[test]
+    fn upgrade_inspections_name_a_drain_reason_for_every_residue_family() {
+        // Each row plants one kind of residue. The protocol upgrade inspection,
+        // and the layout-2 promotion inspection where it looks at that kind,
+        // must name a fixed reason: a reworded inspection message must not
+        // silently become "host inventory requires draining".
+        const LEASE: &str = "live or partial lease remains";
+        const LEASE_INVENTORY: &str = "lease inventory is incomplete or unreadable";
+        const JOBS: &str = "job inventory is incomplete or unreadable";
+        const INDEX: &str = "job index is incomplete or inconsistent";
+        let file = |store: &HostStore, directory: &str, name: &str| {
+            store
+                .open_directory(directory, true)
+                .unwrap()
+                .write_new_private_file(name, b"residue")
+                .unwrap();
+        };
+        let job = |store: &HostStore, status: Option<JobStatus>| {
+            let request = request(400);
+            let material = request.material();
+            let job = store
+                .open_directory(
+                    &format!(
+                        "jobs/{}/{}/{}",
+                        material.project_id(),
+                        material.worktree_id(),
+                        material.job_id()
+                    ),
+                    true,
+                )
+                .unwrap();
+            if let Some(status) = status {
+                let meta = JobMeta::new(material, request.request_fingerprint().clone()).unwrap();
+                job.write_new_private_file("meta.json", &serde_json::to_vec(&meta).unwrap())
+                    .unwrap();
+                job.write_new_private_file("status.json", &serde_json::to_vec(&status).unwrap())
+                    .unwrap();
+            }
+            job
+        };
+        for (residue, protocol, layout2) in [
+            (
+                "host root cleanup",
+                "private cleanup residue in the host root",
+                None,
+            ),
+            (
+                "namespace cleanup",
+                "private cleanup residue remains in an upgrade-scoped namespace",
+                None,
+            ),
+            ("heavy lease", LEASE, Some(LEASE)),
+            ("unknown lease entry", LEASE_INVENTORY, Some(LEASE)),
+            ("live slot", LEASE, Some(LEASE)),
+            ("invalid slot", LEASE_INVENTORY, Some(LEASE)),
+            (
+                "incoming",
+                "incoming transfer remains",
+                Some("incoming transfer remains"),
+            ),
+            ("incomplete project", JOBS, Some(JOBS)),
+            ("unreadable job", JOBS, Some(JOBS)),
+            (
+                "non-terminal job",
+                "non-terminal job remains",
+                Some("non-terminal job remains"),
+            ),
+            (
+                "mutable job",
+                "job retains mutable execution evidence",
+                Some("job retains mutable execution evidence"),
+            ),
+            (
+                "accept staging",
+                "accepted job index staging residue remains",
+                Some("accepted job index staging residue remains"),
+            ),
+            ("incomplete index", INDEX, Some(INDEX)),
+            ("invalid index", INDEX, Some(INDEX)),
+            ("accepted index without its job", INDEX, Some(JOBS)),
+        ] {
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("host");
+            let store = HostStore::open(&root).unwrap();
+            match residue {
+                "host root cleanup" => plant_cleanup_residue(&root),
+                "namespace cleanup" => plant_cleanup_residue(&root.join("leases")),
+                "heavy lease" => drop(store.open_directory("leases/heavy", true).unwrap()),
+                "unknown lease entry" => file(&store, "leases", "stray"),
+                "live slot" => file(&store, "leases/slots/0", "holder"),
+                "invalid slot" => file(&store, "leases/slots", "x"),
+                "incoming" => file(&store, "incoming", ".partial"),
+                "incomplete project" => file(&store, "jobs", ".partial"),
+                "unreadable job" => drop(job(&store, None)),
+                "non-terminal job" => drop(job(&store, Some(JobStatus::accepted(10).unwrap()))),
+                "mutable job" => {
+                    let job = job(&store, Some(JobStatus::succeeded(10, 0, 0).unwrap()));
+                    job.write_new_private_file("execution.json", b"{}").unwrap();
+                }
+                "accept staging" => file(&store, "job-index", ".accept-deadbeef.json"),
+                "incomplete index" => file(&store, "job-index", ".partial"),
+                "invalid index" => file(&store, "job-index", "garbage.json"),
+                "accepted index without its job" => {
+                    let request = request(400);
+                    let material = request.material();
+                    store
+                        .write_new_disposition(&JobDisposition::Accepted {
+                            job_id: material.job_id(),
+                            client_id: material.client_id(),
+                            project_id: material.project_id().into(),
+                            worktree_id: material.worktree_id().into(),
+                            request_fingerprint: request.request_fingerprint().clone(),
+                            status: JobStatus::accepted(10).unwrap(),
+                            recorded_at_millis: 10,
+                        })
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let error = store.require_protocol_upgrade_drain().unwrap_err();
+            assert_eq!(error.public_code(), "HOST_UPGRADE_DRAIN_REQUIRED");
+            assert_eq!(error.public_message(), protocol, "{residue}: {error}");
+            if let Some(layout2) = layout2 {
+                let error = inspect_upgrade_drain(&store.inner.namespaces).unwrap_err();
+                assert_eq!(error.public_code(), "HOST_UPGRADE_DRAIN_REQUIRED");
+                assert_eq!(
+                    error.public_message(),
+                    layout2,
+                    "layout-2 {residue}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn resume_job_replace_stages_converges_canonical_pending() {
         use crate::{
             job::LeaseAcquireResponse,

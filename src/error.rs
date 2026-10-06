@@ -319,6 +319,10 @@ fn host_upgrade_drain_public_detail(detail: &str) -> &'static str {
         ),
         ("layout-2 heavy lease ", "live or partial lease remains"),
         ("a live lease ", "live or partial lease remains"),
+        (
+            "lease namespace still has live or leftover entries",
+            "live or partial lease remains",
+        ),
         ("lease", "lease inventory is incomplete or unreadable"),
         ("incoming", "incoming transfer remains"),
         (
@@ -1094,6 +1098,10 @@ mod tests {
             ),
             (
                 "live or partial layout-3 slot PLANTED_USERNAME/PLANTED_SECRET remains",
+                "live or partial lease remains",
+            ),
+            (
+                "lease namespace still has live or leftover entries",
                 "live or partial lease remains",
             ),
             (
