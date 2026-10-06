@@ -1658,9 +1658,11 @@ impl<'a> IntegrationCoordinator<'a> {
         self.save(&mut record)?;
         Ok(record.snapshot)
     }
-    /// A stop retains the observed cycle as well as its revision. Auxiliary
-    /// retirement changes the revision/time without changing this snapshot's
-    /// phase, so it must not turn an otherwise confirmed stop into a CAS error.
+    /// A stop targets the observed cycle by its integration id and epoch, not
+    /// by its revision or phase. Auxiliary retirement, or a driver admitting
+    /// the next phase (Pending to Fetching, say), can move the record after the
+    /// caller read it; neither may skip the tombstone or turn the stop into a
+    /// CAS error. A new epoch or cycle is a different stop: unconfirmed.
     pub(crate) fn revoke_for_stop(
         &self,
         task: TaskId,
@@ -1673,15 +1675,6 @@ impl<'a> IntegrationCoordinator<'a> {
                 .ok_or_else(|| IntegrationCode::IntegrationStopUnconfirmed.error())?;
             if record.snapshot.integration_id != expected.integration_id
                 || record.snapshot.epoch != expected.epoch
-            {
-                return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
-            }
-            let mut observed = record.snapshot.clone();
-            observed.revision = expected.revision;
-            observed.updated_at_millis = expected.updated_at_millis;
-            if observed != *expected
-                && record.tombstone.is_none()
-                && record.snapshot.state != IntegrationStatus::Integrated
             {
                 return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
             }
@@ -2408,6 +2401,39 @@ mod stop_race_tests {
                 assert!(saved.tombstone.unwrap().acknowledged);
             }
         }
+    }
+
+    #[test]
+    fn stop_after_a_phase_advance_still_revokes_the_observed_cycle() {
+        let state = MemoryIntegrationState::default();
+        let record = sample_record(fixture_task(), fixture_source(), "main");
+        state
+            .publish_policy(record.task_id, &record.policy)
+            .unwrap();
+        assert!(
+            state
+                .replace(record.task_id, IntegrationRevision(0), &record)
+                .unwrap()
+        );
+        let turns = FakeIntegrationTurns::default();
+        let observer = FakeIntegrationObserver::default();
+        let clock = ManualIntegrationRuntime::default();
+        let coordinator =
+            IntegrationCoordinator::new(&state, &RevokeHost, &turns, &clock, &observer);
+        // The CLI read Pending; a driver then admitted the Fetch phase.
+        let observed = state.load(record.task_id).unwrap().unwrap().snapshot;
+        assert_eq!(observed.state, IntegrationStatus::Pending);
+        let mut next = state.load(record.task_id).unwrap().unwrap();
+        next.snapshot.state = IntegrationStatus::Fetching;
+        next.snapshot.attempts = 1;
+        persist_record(&state, &clock, &mut next).unwrap();
+        let stopped = coordinator
+            .revoke_for_stop(record.task_id, &observed)
+            .unwrap();
+        let saved = state.load(record.task_id).unwrap().unwrap();
+        assert_eq!(stopped, saved.snapshot);
+        assert_eq!(stopped.state, IntegrationStatus::Revoked);
+        assert!(saved.tombstone.unwrap().acknowledged);
     }
 
     #[test]

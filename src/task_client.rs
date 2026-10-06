@@ -1328,7 +1328,7 @@ impl<'a> TaskClient<'a> {
                 .before_integration_mutation(record, operation);
             }
         };
-        let snapshot = coordinator.snapshot(task)?;
+        let mut snapshot = coordinator.snapshot(task)?;
         if matches!(
             operation,
             IntegrationMutation::Cancel
@@ -1341,9 +1341,20 @@ impl<'a> TaskClient<'a> {
             && (snapshot.is_none()
                 || !coordinator.covers_latest_ordinary_work(record, snapshot.as_ref().unwrap())?)
         {
-            // The finalizer has not published an identity that can be stopped.
-            // Use the ordinary follow-up fence until that cycle is durable.
-            return Err(task_error("TASK_BUSY", "INTEGRATION_IN_PROGRESS"));
+            // A stop replays the finalizer's source CAS, then revokes that
+            // cycle before any phase. Say, and a source that cannot be
+            // published yet, use the ordinary follow-up fence.
+            if !matches!(operation, IntegrationMutation::Say { .. }) {
+                coordinator.on_terminal(task, last.turn_id())?;
+                snapshot = coordinator.snapshot(task)?;
+            }
+            let published = match &snapshot {
+                Some(snapshot) => coordinator.covers_latest_ordinary_work(record, snapshot)?,
+                None => false,
+            };
+            if !published {
+                return Err(task_error("TASK_BUSY", "INTEGRATION_IN_PROGRESS"));
+            }
         }
         let Some(snapshot) = snapshot else {
             return Ok(record.clone());

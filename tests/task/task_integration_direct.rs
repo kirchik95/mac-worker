@@ -2922,16 +2922,30 @@ impl IntegrationRuntime for FirstIntentBarrier {
 }
 
 #[test]
-fn native_cancel_in_done_before_first_intent_is_fenced() {
-    stop_before_first_intent("cancel");
+fn native_cancel_in_done_before_runner_retirement_is_fenced() {
+    stop_in_done_before_first_intent("cancel", false);
 }
 
 #[test]
-fn native_close_in_done_before_first_intent_is_fenced() {
-    stop_before_first_intent("close");
+fn native_close_in_done_before_runner_retirement_is_fenced() {
+    stop_in_done_before_first_intent("close", false);
 }
 
-fn stop_before_first_intent(operation: &str) {
+#[test]
+fn native_cancel_in_done_after_runner_retirement_stops_before_the_first_intent() {
+    stop_in_done_before_first_intent("cancel", true);
+}
+
+#[test]
+fn native_close_in_done_after_runner_retirement_stops_before_the_first_intent() {
+    stop_in_done_before_first_intent("close", true);
+}
+
+/// Stop a task while its finalizer sits between the Done turn and the first
+/// integration intent. Before runner retirement the source cannot be published
+/// yet, so the stop is fenced; after it, the stop replays the finalizer's
+/// source CAS and revokes that cycle before any phase.
+fn stop_in_done_before_first_intent(operation: &str, retired: bool) {
     use mac_worker::test_support::client_state::ClientStateStore;
     use std::sync::{Arc, Mutex, mpsc};
 
@@ -2950,10 +2964,8 @@ fn stop_before_first_intent(operation: &str) {
             .join(format!("integrations/tasks/{task}/record.json")),
     )
     .unwrap();
-    let ordinary = ClientStateStore::open(&paths.state)
-        .unwrap()
-        .load_task(task)
-        .unwrap();
+    let client = ClientStateStore::open(&paths.state).unwrap();
+    let ordinary = client.load_task(task).unwrap();
     assert_eq!(ordinary.status().state(), TaskState::Open);
     assert_eq!(ordinary.status().last_outcome(), Some(&TaskOutcome::Done));
     assert!(ordinary.runner().is_none());
@@ -2994,36 +3006,57 @@ fn stop_before_first_intent(operation: &str) {
             .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
             .unwrap();
         assert!(state.load(task).unwrap().is_none());
+        if !retired {
+            // A recorded runner keeps the source unpublishable, as it is
+            // before the finalizer retires that runner.
+            let runner =
+                ProcessIdentity::new(crate::support::fixture_pid(2_000_000_021), 9_999_999)
+                    .unwrap();
+            client
+                .record_runner(task, Some(RunnerIdentity::new(runner)))
+                .unwrap();
+        }
         let output = f.worker(&["--json", "task", operation, &task.to_string()]);
+        if !retired {
+            client.record_runner(task, None).unwrap();
+        }
         // Always release before checking the CLI result so a regression cannot
         // leave the scoped publisher blocked during assertion unwinding.
         release.send(()).unwrap();
         publisher.join().unwrap().unwrap();
         output
     });
-    assert_eq!(
-        output.status.code(),
-        Some(64),
-        "{}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-    let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(reply["code"], "TASK_BUSY", "{reply}");
-    assert_eq!(reply["message"], "INTEGRATION_IN_PROGRESS", "{reply}");
-    assert_eq!(target(), before);
-
-    // After publication the same command must acknowledge a durable revoke.
-    // Resume and reconcile afterwards to prove no later phase can push.
-    let stopped = f.worker(&["--json", "task", operation, &task.to_string()]);
-    assert!(
-        stopped.status.success(),
-        "{}",
-        String::from_utf8_lossy(&stopped.stdout)
-    );
+    if retired {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    } else {
+        assert_eq!(
+            output.status.code(),
+            Some(64),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(reply["code"], "TASK_BUSY", "{reply}");
+        assert_eq!(reply["message"], "INTEGRATION_IN_PROGRESS", "{reply}");
+        assert_eq!(target(), before);
+        // After publication the same command must acknowledge a durable revoke.
+        let stopped = f.worker(&["--json", "task", operation, &task.to_string()]);
+        assert!(
+            stopped.status.success(),
+            "{}",
+            String::from_utf8_lossy(&stopped.stdout)
+        );
+    }
     let record = state.load(task).unwrap().unwrap();
     assert_eq!(record.snapshot.state, IntegrationStatus::Revoked);
+    assert_eq!(record.snapshot.attempts, 0);
     assert!(record.tombstone.unwrap().acknowledged);
     assert_eq!(target(), before);
+    // Resume and reconcile afterwards to prove no later phase can push.
     assert!(f.worker(&["controller", "drain", "--off"]).status.success());
     assert!(f.worker(&["--json", "task", "reconcile"]).status.success());
     assert_eq!(target(), before, "push after acknowledged {operation}");
