@@ -5397,7 +5397,8 @@ impl<'a> TaskClient<'a> {
                 record.status().diff_stat().map(str::to_owned),
                 record.status().turns().to_vec(),
                 current_time_millis()?,
-            )?;
+            )?
+            .copying_reported_checks(record.status())?;
             let fenced_len = record.status().turns().len();
             if !self
                 .client_state
