@@ -1242,8 +1242,16 @@ impl HostStore {
         }
         let namespaces = open_host_namespaces(&rooted, root_device, initialize || needs_migration)?;
         inject_open_fault(point, HostStoreWritePoint::AfterHostNamespaces)?;
+        // The construction installation lock is still held, as it is for
+        // job-owned cleanup. Resume only durable, identity-bound replace
+        // decisions; an unbound temp may belong to an in-flight facts writer.
+        if rooted.entry_exists(".mac-worker-rooted-fs")? {
+            rooted.retry_pending_owned_regulars_matching(|component, _| {
+                std::str::from_utf8(component).is_ok_and(parse_replace_uuid_name)
+            })?;
+        }
         if (migrate || fence.is_some()) && !initialize {
-            match inspect_protocol_upgrade_namespaces(&namespaces) {
+            match inspect_protocol_upgrade_namespaces(&rooted, &namespaces) {
                 Ok(()) => {}
                 Err(_) if matches!(fence, Some(UpgradeFenceOp::Rollback { .. })) => {
                     drop(installation_lock);
@@ -2272,7 +2280,7 @@ impl HostStore {
 
     #[cfg(any(test, feature = "test-support"))]
     fn inspect_protocol_upgrade_locked(&self) -> Result<(), WorkerError> {
-        inspect_protocol_upgrade_namespaces(&self.inner.namespaces)
+        inspect_protocol_upgrade_namespaces(&self.inner.root, &self.inner.namespaces)
     }
 
     pub(crate) fn session_lock(&self) -> Result<SessionGuard, WorkerError> {
@@ -5355,8 +5363,21 @@ fn inventory_names(directory: &RootedDir, label: &str) -> Result<Vec<String>, Wo
 }
 
 fn inspect_protocol_upgrade_namespaces(
+    root: &RootedDir,
     namespaces: &BTreeMap<&'static str, RootedDir>,
 ) -> Result<(), WorkerError> {
+    // Child namespace checks also inspect their parent. Identify host-root
+    // evidence first so the operator can distinguish it from job/lease work.
+    if root.entry_exists(".mac-worker-rooted-fs")?
+        && !root
+            .open_child_directory(&relative(".mac-worker-rooted-fs")?, false)?
+            .list_names()?
+            .is_empty()
+    {
+        return Err(upgrade_drain_required(
+            "private cleanup residue in the host root",
+        ));
+    }
     let leases = namespaces
         .get("leases")
         .ok_or_else(|| upgrade_drain_required("leases namespace is missing"))?;
@@ -6748,6 +6769,152 @@ mod review_regression_tests {
                 "{directory}"
             );
         }
+    }
+
+    fn plant_pending_host_root_replace(root: &Path) -> String {
+        let store =
+            HostStore::open_with_write_fault(root, HostStoreWritePoint::AfterCleanupIntentCommit)
+                .unwrap();
+        let replace = format!("replace-{}", uuid::Uuid::from_u128(91).hyphenated());
+        store
+            .inner
+            .root
+            .write_new_private_file("facts.json", b"current facts")
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        store
+            .inner
+            .root
+            .write_new_private_file(&replace, b"displaced facts")
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        store
+            .with_installation_lock(|| {
+                assert_eq!(
+                    store
+                        .remove_owned_regular_committed(&store.inner.root, &replace)
+                        .unwrap_err()
+                        .raw_os_error(),
+                    Some(libc::EIO)
+                );
+                Ok(())
+            })
+            .unwrap();
+        let names = fs::read_dir(root.join(".mac-worker-rooted-fs"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        for prefix in [
+            "cleanup-intent-v1-",
+            "cleanup-op-v1-",
+            "cleanup-regular-v1-",
+        ] {
+            assert!(
+                names.iter().any(|name| name.starts_with(prefix)),
+                "{names:?}"
+            );
+        }
+        assert_eq!(
+            store
+                .require_protocol_upgrade_drain()
+                .unwrap_err()
+                .public_code(),
+            "HOST_UPGRADE_DRAIN_REQUIRED"
+        );
+        replace
+    }
+
+    #[test]
+    fn host_root_replace_recovery_on_open_clears_bound_residue() {
+        for open_if_present in [false, true] {
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("host");
+            let replace = plant_pending_host_root_replace(&root);
+            let store = if open_if_present {
+                HostStore::open_if_present(&root).unwrap().unwrap()
+            } else {
+                HostStore::open(&root).unwrap()
+            };
+            assert!(!store.inner.root.has_private_cleanup_residue().unwrap());
+            assert!(!root.join(replace).exists());
+            assert_eq!(fs::read(root.join("facts.json")).unwrap(), b"current facts");
+            store.require_protocol_upgrade_drain().unwrap();
+            drop(store);
+            HostStore::open(&root)
+                .unwrap()
+                .require_protocol_upgrade_drain()
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn host_root_replace_recovery_precedes_upgrade_inspection() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let replace = plant_pending_host_root_replace(&root);
+        let (from, to) = helper_pair(temp.path(), "worker");
+        HostStore::complete_protocol_upgrade(&root, &from, &to).unwrap();
+        assert!(!from.exists());
+        assert_eq!(fs::read(to).unwrap(), b"candidate-helper");
+        assert!(!root.join(replace).exists());
+        let store = HostStore::open(&root).unwrap();
+        assert!(!store.inner.root.has_private_cleanup_residue().unwrap());
+        store.require_protocol_upgrade_drain().unwrap();
+    }
+
+    #[test]
+    fn host_root_replace_recovery_preserves_unbound_writer_temp() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        let replace = format!("replace-{}", uuid::Uuid::from_u128(92).hyphenated());
+        let mut writer = store
+            .inner
+            .root
+            .write_new_private_file(&replace, b"in-flight facts")
+            .unwrap();
+        let before = store.inner.root.private_entry_identity(&replace).unwrap();
+        drop(store);
+        // Recover a different, bound stage while this writer still owns its
+        // unbound temp. Neither the open nor promotion may unlink the temp.
+        plant_pending_host_root_replace(&root);
+        let reopened = HostStore::open(&root).unwrap();
+        assert!(!reopened.inner.root.has_private_cleanup_residue().unwrap());
+        assert_eq!(
+            reopened
+                .inner
+                .root
+                .private_entry_identity(&replace)
+                .unwrap(),
+            before
+        );
+        reopened.require_protocol_upgrade_drain().unwrap();
+        drop(reopened);
+        let (from, to) = helper_pair(temp.path(), "worker");
+        HostStore::complete_protocol_upgrade(&root, &from, &to).unwrap();
+        use std::io::Write;
+        writer.write_all(b" completed").unwrap();
+        assert_eq!(
+            fs::read(root.join(replace)).unwrap(),
+            b"in-flight facts completed"
+        );
+    }
+
+    #[test]
+    fn host_root_cleanup_drain_reason_is_public() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        plant_pending_host_root_replace(&root);
+        let rooted = RootedDir::open(&root).unwrap();
+        let namespaces =
+            open_host_namespaces(&rooted, fs::metadata(&root).unwrap().dev(), false).unwrap();
+        let error = inspect_protocol_upgrade_namespaces(&rooted, &namespaces).unwrap_err();
+        assert_eq!(
+            error.public_message(),
+            "private cleanup residue in the host root"
+        );
     }
 
     #[test]

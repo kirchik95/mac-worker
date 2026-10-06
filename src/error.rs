@@ -204,6 +204,16 @@ impl WorkerError {
                 Cow::Owned(_) => "task error".into(),
             },
             Self::Config(_) => "configuration error".into(),
+            Self::Unavailable(message)
+                if coded_prefix(message) == Some("HOST_UPGRADE_DRAIN_REQUIRED") =>
+            {
+                host_upgrade_drain_public_detail(
+                    message
+                        .strip_prefix("HOST_UPGRADE_DRAIN_REQUIRED: ")
+                        .unwrap_or(""),
+                )
+                .into()
+            }
             Self::Unavailable(_) => "worker unavailable".into(),
             Self::Protocol(_) => "protocol error".into(),
             Self::HostControl { .. } => "host request failed".into(),
@@ -277,6 +287,60 @@ impl WorkerError {
             _ => None,
         }
     }
+}
+
+fn host_upgrade_drain_public_detail(detail: &str) -> &'static str {
+    // Inspection details can include arbitrary on-disk inventory names. Only
+    // return fixed vocabulary, never those names or an unrecognized suffix.
+    if detail == "private cleanup residue in the host root" {
+        return "private cleanup residue in the host root";
+    }
+    if detail == "accepted job is not a terminal archive"
+        || (detail.starts_with("accepted job ") && detail.contains(" is not terminal;"))
+    {
+        return "non-terminal job remains";
+    }
+    if detail == "accepted job still has mutable execution residue"
+        || (detail.starts_with("job ") && detail.contains(" retains mutable execution evidence "))
+    {
+        return "job retains mutable execution evidence";
+    }
+    for (prefix, reason) in [
+        (
+            "private cleanup residue",
+            "private cleanup residue remains in an upgrade-scoped namespace",
+        ),
+        ("non-terminal job ", "non-terminal job remains"),
+        ("a non-terminal job ", "non-terminal job remains"),
+        ("live layout-2 lease ", "live or partial lease remains"),
+        (
+            "live or partial layout-3 slot ",
+            "live or partial lease remains",
+        ),
+        ("layout-2 heavy lease ", "live or partial lease remains"),
+        ("a live lease ", "live or partial lease remains"),
+        ("lease", "lease inventory is incomplete or unreadable"),
+        ("incoming", "incoming transfer remains"),
+        (
+            "accepted-index staging residue",
+            "accepted job index staging residue remains",
+        ),
+        ("job-index", "job index is incomplete or inconsistent"),
+        ("job index ", "job index is incomplete or inconsistent"),
+        ("accepted index ", "job index is incomplete or inconsistent"),
+        (
+            "abandoned index ",
+            "job index is incomplete or inconsistent",
+        ),
+        ("accepted job ", "job inventory is incomplete or unreadable"),
+        ("job ", "job inventory is incomplete or unreadable"),
+        ("jobs ", "job inventory is incomplete or unreadable"),
+    ] {
+        if detail.starts_with(prefix) {
+            return reason;
+        }
+    }
+    "host inventory requires draining"
 }
 
 fn coded_prefix(message: &str) -> Option<&str> {
@@ -1019,6 +1083,48 @@ mod tests {
         assert_eq!(error.public_code(), "CAPACITY_BUSY");
         assert_eq!(error.public_message(), "capacity error");
         assert!(!error.public_message().contains(planted_path));
+    }
+
+    #[test]
+    fn host_upgrade_drain_public_detail_never_echoes_untrusted_content() {
+        for (detail, expected) in [
+            (
+                "private cleanup residue in the host root",
+                "private cleanup residue in the host root",
+            ),
+            (
+                "live or partial layout-3 slot PLANTED_USERNAME/PLANTED_SECRET remains",
+                "live or partial lease remains",
+            ),
+            (
+                "incoming transfer /Users/PLANTED_USERNAME/PLANTED_SECRET remains",
+                "incoming transfer remains",
+            ),
+            (
+                "non-terminal job PLANTED_SECRET remains",
+                "non-terminal job remains",
+            ),
+            (
+                "job-index contains incomplete entry PLANTED_SECRET",
+                "job index is incomplete or inconsistent",
+            ),
+            (
+                "unknown reason /Users/PLANTED_USERNAME/PLANTED_SECRET",
+                "host inventory requires draining",
+            ),
+            (
+                "private cleanup residue in the host root\n/Users/PLANTED_USERNAME/PLANTED_SECRET",
+                "private cleanup residue remains in an upgrade-scoped namespace",
+            ),
+        ] {
+            let error = WorkerError::Unavailable(format!("HOST_UPGRADE_DRAIN_REQUIRED: {detail}"));
+            assert_eq!(error.public_code(), "HOST_UPGRADE_DRAIN_REQUIRED");
+            assert_eq!(error.public_message(), expected);
+            let diagnostic = super::operator_diagnostic(&error);
+            for secret in ["/Users/", "PLANTED_USERNAME", "PLANTED_SECRET"] {
+                assert!(!diagnostic.contains(secret), "{diagnostic}");
+            }
+        }
     }
 
     #[test]
