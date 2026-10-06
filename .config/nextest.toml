@@ -8,6 +8,7 @@
 fail-fast = false
 retries = 0
 # A test that runs past 3 minutes is reported slow after 60 s and then killed.
+# A few inherently heavy cycles override terminate-after below; they stay bounded.
 slow-timeout = { period = "60s", terminate-after = 3 }
 
 [test-groups]
@@ -45,6 +46,32 @@ filter = '''
   ))
 '''
 test-group = 'native_integration'
+
+[[profile.default.overrides]]
+# Real git and worker cycles, plus one auxiliary case that must wait out a 60 s
+# timeout. Serial runs on a machine already at load 16–40 took 73–106 s
+# (fresh_operator_reconcile 90 s, never_receipt 106 s, a_running_auxiliary 102 s,
+# a_brief_helper_rollback 85 s, native_union 74 s, native_dag 73 s). The full
+# gate runs native_integration two at a time beside the rest of the suite and
+# killed fresh_operator_reconcile, and two other direct cycles, at 180 s.
+# The host matrices are the same shape: 24 and 28 real task-turn lifecycles,
+# 73 s and 39 s serial at load ~35–50, and both hit the 180 s kill in the gate
+# (idle reference 26 s and 58 s). Six 60 s periods is 360 s, still a hard kill.
+filter = '''
+  (binary(task) & (
+    test(/^task_integration_direct::never_receipt_is_idempotent_and_the_next_say_uses_its_accepted_head$/)
+    | test(/^task_integration_direct::a_running_auxiliary_times_out_while_the_native_owner_gate_is_drained$/)
+    | test(/^task_integration_direct::fresh_operator_reconcile_confirms_dead_integration_driver_and_retained_actor$/)
+    | test(/^task_integration_direct::a_brief_helper_rollback_parks_and_restores_the_same_open_source_cycle$/)
+    | test(/^task_integration_direct::native_union_uses_frozen_h_attributes_and_pinned_verification_before_receipt_import$/)
+    | test(/^task_integration_direct::native_dag_uses_the_imported_parent_merge_for_its_configured_child$/)
+  ))
+  | (binary(host) & (
+    test(/^job_queries::task_turn_ports::task_turn_acceptance_disconnect_matrix_preserves_all_24_boundary_order_classes$/)
+    | test(/^job_queries::task_turn_ports::task_turn_status_preserves_unsafe_or_conflicting_prelaunch_evidence$/)
+  ))
+'''
+slow-timeout = { period = "60s", terminate-after = 6 }
 
 [profile.ci]
 fail-fast = false

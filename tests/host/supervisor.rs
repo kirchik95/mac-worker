@@ -37,7 +37,10 @@ use mac_worker::test_support::{
         lease::{AdmissionFacts, LeaseService},
         process::SystemProcessRunner,
         store::{HostStore, HostStoreWritePoint, SupervisorGuard},
-        supervisor::{ProcessInspector, Supervisor, SupervisorFaultPoint, SystemProcessInspector},
+        supervisor::{
+            ProcessInspector, ProcessObservation, Supervisor, SupervisorFaultPoint,
+            SystemProcessInspector,
+        },
     },
     task::{
         model::{
@@ -2256,7 +2259,20 @@ fn task_turn_detaches_the_same_worker_and_inherited_lock_runs_supervisor() {
         .unwrap();
     drop(store);
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_worker"))
+    // Pay the worker binary's first-exec assessment before task-turn.
+    let worker = env!("CARGO_BIN_EXE_worker");
+    assert!(
+        Command::new(worker)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("warm the worker binary")
+            .success(),
+        "worker --version warm-up failed"
+    );
+
+    let mut child = Command::new(worker)
         .env_clear()
         .env("HOME", &home)
         .env("XDG_DATA_HOME", &data)
@@ -2280,44 +2296,40 @@ fn task_turn_detaches_the_same_worker_and_inherited_lock_runs_supervisor() {
         String::from_utf8_lossy(&output.stderr)
     );
     let response: TaskTurnResponse = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(response.submit().status().supervisor_identity().is_some());
+    let supervisor = response
+        .submit()
+        .status()
+        .supervisor_identity()
+        .expect("detached task-turn publishes a supervisor identity");
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let terminal = loop {
-        let status: JobStatus =
-            serde_json::from_slice(&fs::read(job.join("status.json")).unwrap()).unwrap();
-        if status.state().is_terminal() {
-            break status;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "detached supervisor did not finish"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    assert_eq!(terminal.state(), JobState::Succeeded);
-    while job.join("execution.json").exists() {
-        assert!(
-            Instant::now() < deadline,
-            "detached turn publication did not finish"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(!job.join("execution.json").exists());
+    // Production drains the turn logs for up to a second after the child
+    // exits, then publishes the terminal status, removes the execution
+    // payload, and releases the lease before this process goes away. Follow
+    // that identity (pid and start time). A hung supervisor is still killed
+    // by the suite slow-timeout; a 5s wall clock fails when the grace is
+    // only scheduled late.
     loop {
-        if LeaseService::new(&HostStore::open(&host_root).unwrap())
-            .load()
-            .unwrap()
-            .is_none()
-        {
-            break;
+        match SystemProcessInspector.observe(supervisor) {
+            ProcessObservation::Absent | ProcessObservation::Reused => break,
+            ProcessObservation::Matching { .. } | ProcessObservation::Ambiguous => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
-        assert!(
-            Instant::now() < deadline,
-            "detached cleanup did not release lease"
-        );
-        std::thread::sleep(Duration::from_millis(10));
     }
+    let terminal: JobStatus =
+        serde_json::from_slice(&fs::read(job.join("status.json")).unwrap()).unwrap();
+    assert_eq!(terminal.state(), JobState::Succeeded);
+    assert!(
+        !job.join("execution.json").exists(),
+        "detached turn publication did not finish"
+    );
+    assert_eq!(
+        LeaseService::new(&HostStore::open(&host_root).unwrap())
+            .load()
+            .unwrap(),
+        None,
+        "detached cleanup did not release lease"
+    );
 
     let rejected = Command::new(env!("CARGO_BIN_EXE_worker"))
         .env_clear()
