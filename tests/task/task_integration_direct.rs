@@ -3074,3 +3074,141 @@ fn stop_in_done_before_first_intent(operation: &str, retired: bool) {
         );
     }
 }
+
+#[test]
+fn native_cancel_while_owner_active_and_host_done_stops_before_push() {
+    stop_while_owner_status_lags_host_done("cancel");
+}
+
+#[test]
+fn native_close_while_owner_active_and_host_done_stops_before_push() {
+    stop_while_owner_status_lags_host_done("close");
+}
+
+/// The host turn is already terminal Done, but the owner has not imported that
+/// status yet. Cancel/close must stop the cycle before any push, the same way
+/// they do once the owner record itself is Open+Done.
+fn stop_while_owner_status_lags_host_done(operation: &str) {
+    use mac_worker::test_support::client_state::ClientStateStore;
+    use std::sync::{Arc, Mutex, mpsc};
+
+    let (f, task) = parked_source_fixture();
+    let paths = owner_paths(&f);
+    let state = RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+        .unwrap();
+    let parked = state.load(task).unwrap().unwrap();
+    assert_eq!(parked.snapshot.attempts, 0);
+    std::fs::remove_file(
+        paths
+            .state
+            .join(format!("integrations/tasks/{task}/record.json")),
+    )
+    .unwrap();
+    let client = ClientStateStore::open(&paths.state).unwrap();
+    let ordinary = client.load_task(task).unwrap();
+    assert_eq!(ordinary.status().state(), TaskState::Open);
+    assert_eq!(ordinary.status().last_outcome(), Some(&TaskOutcome::Done));
+    assert!(ordinary.runner().is_none());
+    let observer = FakeIntegrationObserver::default();
+    observer.insert(IntegrationTaskFacts {
+        cycle_base: parked.cycle_base,
+        ordinary,
+        result_imported: true,
+        session_import_complete: true,
+        continuation_pending: false,
+        runner_present: false,
+        stop_requested: false,
+        close_pending: false,
+        submission_pending: false,
+        auxiliary_purpose: None,
+    });
+    let host = FakeIntegrationHost::default();
+    let turns = FakeIntegrationTurns::default();
+    let (ready, reached) = mpsc::channel();
+    let (release, resume) = mpsc::channel();
+    let runtime = FirstIntentBarrier {
+        clock: ManualIntegrationRuntime::default(),
+        ready,
+        release: Mutex::new(resume),
+    };
+    let coordinator = IntegrationCoordinator::new(&state, &host, &turns, &runtime, &observer);
+    let origin = f.laptop.parent().unwrap().join("origin.git");
+    let target = || {
+        f.project
+            .git(&["--git-dir", origin.to_str().unwrap(), "rev-parse", "main"])
+            .stdout
+    };
+    let before = target();
+    let output = std::thread::scope(|scope| {
+        let publisher =
+            scope.spawn(|| coordinator.on_terminal(task, parked.snapshot.source_turn_id));
+        reached
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+            .unwrap();
+        assert!(state.load(task).unwrap().is_none());
+        let current = client.load_task(task).unwrap();
+        let lagged = owner_status_lagging_host_done(&current);
+        assert!(client.update_task_if_current(&current, lagged).unwrap());
+        let lagged = client.load_task(task).unwrap();
+        assert_eq!(lagged.status().state(), TaskState::Active);
+        assert!(
+            lagged
+                .status()
+                .turns()
+                .last()
+                .is_some_and(|turn| turn.terminal().is_none())
+        );
+        assert_eq!(lagged.fetched_head(), current.fetched_head());
+        let output = f.worker(&["--json", "task", operation, &task.to_string()]);
+        release.send(()).unwrap();
+        publisher.join().unwrap().unwrap();
+        output
+    });
+    assert!(
+        output.status.success(),
+        "{operation} while the owner still showed Active: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let record = state.load(task).unwrap().expect("integration cycle");
+    assert_eq!(
+        record.snapshot.state,
+        IntegrationStatus::Revoked,
+        "{operation} reported success without a durable stop"
+    );
+    assert_eq!(record.snapshot.attempts, 0);
+    assert!(record.tombstone.unwrap().acknowledged);
+    assert_eq!(target(), before);
+    assert!(f.worker(&["controller", "drain", "--off"]).status.success());
+    assert!(f.worker(&["--json", "task", "reconcile"]).status.success());
+    assert_eq!(target(), before, "push after acknowledged {operation}");
+    assert!(host.calls().is_empty());
+    let stored = ClientStateStore::open(&paths.state)
+        .unwrap()
+        .load_task(task)
+        .unwrap();
+    assert_eq!(stored.status().last_outcome(), Some(&TaskOutcome::Done));
+    assert_eq!(
+        stored.status().head_oid(),
+        Some(&parked.snapshot.source_head)
+    );
+    if operation == "close" {
+        assert_eq!(stored.status().state(), TaskState::Closed);
+    } else {
+        assert_eq!(stored.status().state(), TaskState::Open);
+    }
+}
+
+fn owner_status_lagging_host_done(record: &LocalTaskRecord) -> LocalTaskRecord {
+    let mut wire = serde_json::to_value(record).unwrap();
+    wire["status"]["state"] = json!("active");
+    wire["status"]["last_outcome"] = Value::Null;
+    let turn = wire["status"]["turns"]
+        .as_array_mut()
+        .unwrap()
+        .last_mut()
+        .unwrap();
+    turn["terminal"] = Value::Null;
+    turn["outcome"] = Value::Null;
+    turn["ended_at_millis"] = Value::Null;
+    serde_json::from_value(wire).unwrap()
+}

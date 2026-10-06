@@ -823,6 +823,101 @@ fn durable_cancel_retry_cannot_retarget_a_newer_integration_epoch() {
 }
 
 #[test]
+fn replayed_cancel_after_unbound_commit_is_already_committed() {
+    replayed_stop_after_unbound_commit("task.cancel", "00000000000000000000000000000071");
+}
+
+#[test]
+fn replayed_close_after_unbound_commit_is_already_committed() {
+    replayed_stop_after_unbound_commit("task.close", "00000000000000000000000000000072");
+}
+
+/// The frozen cancel/close was prepared before any integration record existed.
+/// A later imported commit must not settle as a final revision conflict.
+fn replayed_stop_after_unbound_commit(command: &str, request_id: &str) {
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        controller::{ControllerFault, ControllerStore, RequestPhase, TaskSubmitHandler},
+        task::model::{LocalTaskRecord, TaskOutcome},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let paths = isolated_paths(&temp.path().canonicalize().unwrap());
+    let config = fixture_config(&paths);
+    let tasks = ClientStateStore::open(&paths.state).unwrap();
+    let ordinary = sample_ordinary(fixture_task(), fixture_source());
+    tasks.create_task(ordinary.clone()).unwrap();
+    let state = RootedIntegrationState::open(
+        &paths,
+        std::sync::Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    let mut integration = sample_record(fixture_task(), fixture_source(), "main");
+    state
+        .publish_policy(fixture_task(), &integration.policy)
+        .unwrap();
+    let handler = TaskSubmitHandler::new(&NoProcesses, &config, &paths, &tasks);
+    let store = ControllerStore::open(&paths.controller_state_root()).unwrap();
+    let body = if command == "task.close" {
+        json!({"task_id": fixture_task(), "discard": false})
+    } else {
+        json!({"task_id": fixture_task()})
+    };
+    let request = parse_request(
+        &serde_json::to_vec(&json!({"protocol_version": 7,
+            "request_id": request_id, "command": command, "body": body}))
+        .unwrap(),
+    )
+    .unwrap();
+    store
+        .handle_with(&request, &handler, ControllerFault::StopAfterPublish)
+        .unwrap();
+    integration.snapshot.state = IntegrationStatus::Integrated;
+    integration.snapshot.disposition = Some(IntegrationDisposition::AlreadyIntegrated);
+    integration.snapshot.observed_target_oid = Some(fixture_head());
+    integration.receipt = Some(IntegrationReceipt {
+        integration_id: integration.snapshot.integration_id,
+        epoch: 0,
+        source_turn_id: fixture_source(),
+        source_head: fixture_head(),
+        target_head: fixture_head(),
+        merge_oid: None,
+        disposition: IntegrationDisposition::AlreadyIntegrated,
+        imported: true,
+        recorded_at_millis: 1001,
+    });
+    state
+        .replace(fixture_task(), IntegrationRevision(0), &integration)
+        .unwrap();
+    let mut wire = serde_json::to_value(&ordinary).unwrap();
+    wire["status"]["updated_at_millis"] = json!(1002);
+    let bumped: LocalTaskRecord = serde_json::from_value(wire).unwrap();
+    assert!(tasks.update_task_if_current(&ordinary, bumped).unwrap());
+    for _ in 0..2 {
+        assert_eq!(
+            store
+                .handle_with(&request, &handler, ControllerFault::None)
+                .unwrap_err()
+                .public_code(),
+            "INTEGRATION_ALREADY_COMMITTED"
+        );
+        assert_eq!(
+            store.load(request.request_id()).unwrap().unwrap().phase(),
+            RequestPhase::Acked
+        );
+        assert_eq!(
+            tasks
+                .load_task(fixture_task())
+                .unwrap()
+                .status()
+                .last_outcome(),
+            Some(&TaskOutcome::Done)
+        );
+        assert_eq!(state.load(fixture_task()).unwrap().unwrap(), integration);
+        assert!(tasks.queue_snapshot().unwrap().entries().is_empty());
+    }
+}
+
+#[test]
 fn controller_redrive_freezes_the_request_without_running_an_owner_phase() {
     use mac_worker::test_support::{
         client_state::ClientStateStore,
