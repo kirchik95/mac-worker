@@ -1504,6 +1504,19 @@ impl TaskStatus {
         }
     }
 
+    /// Replaces only the turn history. Every other field keeps its value,
+    /// including the activity timestamp and the agent-reported checks of the
+    /// last published result.
+    pub(crate) fn with_turns(mut self, turns: Vec<TurnSummary>) -> Result<Self, WorkerError> {
+        let boundary = RedactionBoundary::from_env();
+        self.turns = turns
+            .into_iter()
+            .map(|turn| turn.redact(&boundary))
+            .collect();
+        self.validate()?;
+        Ok(self)
+    }
+
     fn validate(&self) -> Result<(), WorkerError> {
         if let Some(worker) = &self.worker {
             validate_pinned_worker(worker)?;
