@@ -830,7 +830,8 @@ impl<'a> TurnRunner<'a> {
             record.status().diff_stat().map(str::to_owned),
             record.status().turns().to_vec(),
             now_millis()?,
-        )?;
+        )?
+        .copying_reported_checks(record.status())?;
         self.client_state.mutate_task(
             task_id,
             record.status().turns().last().map(TurnSummary::turn_id),
@@ -2347,7 +2348,8 @@ impl<'a> TurnRunner<'a> {
             record.status().diff_stat().map(str::to_owned),
             record.status().turns().to_vec(),
             now_millis()?,
-        )?;
+        )?
+        .copying_reported_checks(record.status())?;
         self.client_state.mutate_task(
             task_id,
             record.status().turns().last().map(TurnSummary::turn_id),
@@ -2439,6 +2441,7 @@ impl<'a> TurnRunner<'a> {
                 record.status().turns().to_vec(),
                 now_millis()?,
             )?
+            .copying_reported_checks(record.status())?
         };
         let abandoned = record.status().state() != TaskState::Active;
         self.client_state.mutate_task(
@@ -2767,7 +2770,8 @@ fn undrainable_failure_status(
         terminal.diff_stat().map(str::to_owned),
         turns,
         ended_at_millis,
-    )
+    )?
+    .copying_reported_checks(terminal)
 }
 
 /// Reserve a spawn permit, start only on [`RunnerSlotDecision::Acquired`], then
@@ -3209,7 +3213,8 @@ fn publication_failure_status(
         terminal.diff_stat().map(str::to_owned),
         turns,
         ended_at_millis,
-    )
+    )?
+    .copying_reported_checks(terminal)
 }
 
 fn cancelled_followup_status(status: &TaskStatus) -> Result<TaskStatus, WorkerError> {
@@ -3248,7 +3253,8 @@ fn cancelled_followup_status(status: &TaskStatus) -> Result<TaskStatus, WorkerEr
         status.diff_stat().map(str::to_owned),
         turns,
         ended_at,
-    )
+    )?
+    .copying_reported_checks(status)
 }
 
 fn verify_imported_session(
@@ -3624,6 +3630,65 @@ mod session_pin_cleanup_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn abandoned_turns_keep_the_last_result_reported_checks() {
+        use crate::agent::{ReportedCheck, ReportedCheckStatus};
+        let checks = vec![ReportedCheck::new(
+            "unit",
+            "cargo test",
+            ReportedCheckStatus::Fail,
+            "1 failed",
+        )];
+        let paths = ["handoff", "capacity", "cancel"];
+        let mut kept = Vec::new();
+        for path in paths {
+            let fixture = Fixture::new(false, false);
+            let record = fixture.store.load_task(fixture.task).unwrap();
+            let seeded = record
+                .with_status(
+                    record
+                        .status()
+                        .clone()
+                        .with_reported_checks(checks.clone())
+                        .unwrap(),
+                )
+                .unwrap();
+            assert!(
+                fixture
+                    .store
+                    .update_task_if_current(&record, seeded.clone())
+                    .unwrap()
+            );
+            let runner = fixture.turn_runner();
+            match path {
+                "handoff" => {
+                    runner.abandon_handoff_failure(fixture.task, fixture.turn, fixture.owner)
+                }
+                "capacity" => runner.abandon_capacity(&seeded, fixture.turn, fixture.owner, None),
+                _ => runner.cancel_before_acceptance(
+                    &seeded,
+                    fixture.task,
+                    fixture.turn,
+                    fixture.owner,
+                    None,
+                ),
+            }
+            .unwrap();
+            let abandoned = fixture.store.load_task(fixture.task).unwrap();
+            kept.push((
+                path,
+                abandoned.status().state(),
+                abandoned.status().reported_checks().to_vec(),
+            ));
+        }
+        assert_eq!(
+            kept,
+            paths
+                .map(|path| (path, TaskState::Abandoned, checks.clone()))
+                .to_vec()
+        );
     }
 
     #[test]
@@ -4299,6 +4364,88 @@ exited after acceptance: HOST_IO message=again workers=mini-1\n";
                 Some(crate::agent::ResultParseReason::NoResultJson)
             );
         }
+    }
+
+    #[test]
+    fn local_failure_and_cancel_rewrites_keep_the_reported_checks() {
+        // They keep the summary and files of the last result, as the
+        // owner's abandoned and cancelled statuses in task_client do.
+        use super::{
+            cancelled_followup_status, publication_failure_status, undrainable_failure_status,
+        };
+        use crate::agent::{ReportedCheck, ReportedCheckStatus};
+        use crate::task::{TaskState, TaskStatus, TurnId, TurnSummary, TurnTerminal};
+        let checks = vec![ReportedCheck::new(
+            "unit",
+            "cargo test",
+            ReportedCheckStatus::Fail,
+            "1 failed",
+        )];
+        let finished = TurnSummary::new(
+            1,
+            TurnId::new(uuid::Uuid::new_v4()),
+            Some(TurnTerminal::Succeeded),
+            Some(TaskOutcome::Done),
+            Some(true),
+            false,
+            Some(1),
+            Some(2),
+        );
+        let status = |state, turns| {
+            TaskStatus::new(
+                state,
+                Some(TaskOutcome::Done),
+                Some("mini-1".into()),
+                true,
+                None,
+                Some("done".into()),
+                Vec::new(),
+                vec!["src/lib.rs".into()],
+                None,
+                turns,
+                2,
+            )
+            .unwrap()
+            .with_reported_checks(checks.clone())
+            .unwrap()
+        };
+        let terminal = status(TaskState::Open, vec![finished.clone()]);
+        let pending = TurnSummary::new(
+            2,
+            TurnId::new(uuid::Uuid::new_v4()),
+            None,
+            None,
+            None,
+            false,
+            Some(3),
+            None,
+        );
+        let active = status(TaskState::Active, vec![finished.clone(), pending]);
+        let rewritten = [
+            (
+                "publication",
+                publication_failure_status(
+                    &terminal,
+                    TaskOutcome::failed("RESULT_FETCH_FAILED"),
+                    3,
+                )
+                .unwrap(),
+            ),
+            (
+                "undrainable",
+                undrainable_failure_status(&terminal, finished.turn_id(), 3).unwrap(),
+            ),
+            ("cancelled", cancelled_followup_status(&active).unwrap()),
+        ];
+        assert_eq!(
+            rewritten
+                .iter()
+                .map(|(name, status)| (*name, status.summary(), status.reported_checks()))
+                .collect::<Vec<_>>(),
+            ["publication", "undrainable", "cancelled"]
+                .map(|name| (name, Some("done"), checks.as_slice()))
+                .to_vec()
+        );
     }
 
     #[test]

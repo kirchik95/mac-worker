@@ -1482,8 +1482,34 @@ fn a_brief_helper_rollback_parks_and_restores_the_same_open_source_cycle() {
 
 #[test]
 fn native_wait_returns_the_blocked_code_after_successful_source_import() {
-    use mac_worker::test_support::session::SessionAgent;
+    failed_source_checks_block_native_integration(false);
+}
+
+#[test]
+fn herdr_reporting_worker_still_blocks_integration_on_a_failed_source_check() {
+    // Break caught: every pool worker reports turns to herdr, and recording
+    // the pane state dropped the checks from the host status. The owner
+    // imported that status, so a source turn reporting `fail` integrated.
+    failed_source_checks_block_native_integration(true);
+}
+
+fn failed_source_checks_block_native_integration(herdr: bool) {
+    use mac_worker::test_support::{
+        agents::agent::ReportedCheckStatus,
+        client_state::ClientStateStore,
+        host::{process::SystemProcessRunner, store::HostStore},
+        session::SessionAgent,
+        task::{model::HerdrTurnState, store::TaskStore},
+    };
     let f = integration_fixture(true);
+    if herdr {
+        // The fixture worker HOME has no herdr socket, so the reporter
+        // records `unavailable` on the turn after publication: the same
+        // status rewrite a pool worker makes with herdr running.
+        let mut config = std::fs::read_to_string(&f.config).unwrap();
+        config.push_str("herdr = true\n");
+        std::fs::write(&f.config, config).unwrap();
+    }
     f.capture_fixture(SessionAgent::Codex);
     f.install_agent(SessionAgent::Codex);
     let agent = f.host.join("bin/codex");
@@ -1525,10 +1551,43 @@ fn native_wait_returns_the_blocked_code_after_successful_source_import() {
         std::sync::Arc::new(ManualIntegrationRuntime::default()),
     )
     .unwrap();
+    let record = state.load(task).unwrap().unwrap();
     assert_eq!(
-        state.load(task).unwrap().unwrap().snapshot.blocked_code,
+        record.snapshot.blocked_code,
         Some(IntegrationCode::IntegrationChecksFailed)
     );
+    assert_eq!(
+        record
+            .source_checks
+            .iter()
+            .map(|check| (check.name(), check.status()))
+            .collect::<Vec<_>>(),
+        vec![("fixture-check", ReportedCheckStatus::Fail)]
+    );
+    let host = TaskStore::new(
+        &HostStore::open(&f.host_root()).unwrap(),
+        &SystemProcessRunner,
+    )
+    .load_status(&record.policy.project_id, task)
+    .unwrap();
+    assert_eq!(
+        host.turns()[0].herdr().map(|report| report.state),
+        herdr.then_some(HerdrTurnState::Unavailable)
+    );
+    let local = ClientStateStore::open(&owner_paths(&f).state)
+        .unwrap()
+        .load_task(task)
+        .unwrap();
+    for status in [&host, local.status()] {
+        assert_eq!(
+            status
+                .reported_checks()
+                .iter()
+                .map(|check| (check.name(), check.status()))
+                .collect::<Vec<_>>(),
+            vec![("fixture-check", ReportedCheckStatus::Fail)]
+        );
+    }
 }
 
 #[test]

@@ -2548,6 +2548,63 @@ fn herdr_reporter_marks_the_turn_unavailable_without_a_socket() {
 }
 
 #[test]
+fn herdr_report_keeps_the_agent_reported_checks_wrapper() {
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    support::agent_launch_fixture::assert_subprocess_success(
+        &crate::support::libtest_name(
+            module_path!(),
+            "herdr_report_keeps_the_agent_reported_checks",
+        ),
+        &[("HOME", home.to_str().unwrap())],
+        false,
+    );
+}
+
+#[test]
+#[ignore = "subprocess body: run by its *_wrapper test with the fixture environment"]
+fn herdr_report_keeps_the_agent_reported_checks() {
+    // Break caught: on every herdr host the pane report rewrote the published
+    // status without the checks, so status, dashboard and the integration gate
+    // never saw a reported `fail`.
+    use mac_worker::test_support::agents::agent::ReportedCheckStatus;
+    if support::agent_launch_fixture::skip_unless_subtest() {
+        return;
+    }
+    let script = HERDR_TURN_SCRIPT.replace(
+        r#"\"files_changed\":[]"#,
+        r#"\"files_changed\":[],\"checks\":[{\"name\":\"unit\",\"command\":\"cargo test\",\"status\":\"fail\",\"detail\":\"1 failed\"}]"#,
+    );
+    assert_ne!(script, HERDR_TURN_SCRIPT);
+    let (_temp, store, request, _cancel) = prepared_task_turn(&script);
+    let status = run_flagged_turn(&store, request);
+
+    assert_eq!(status.last_outcome(), Some(&TaskOutcome::Done));
+    assert_eq!(
+        status.turns()[0].herdr().map(|report| report.state),
+        Some(mac_worker::test_support::task::model::HerdrTurnState::Unavailable),
+        "the herdr report must be recorded on the turn"
+    );
+    let checks = status.reported_checks();
+    assert_eq!(checks.len(), 1, "{checks:?}");
+    assert_eq!(checks[0].name(), "unit");
+    assert_eq!(checks[0].command(), "cargo test");
+    assert_eq!(checks[0].status(), ReportedCheckStatus::Fail);
+    assert_eq!(checks[0].detail(), "1 failed");
+    assert_eq!(
+        TaskStore::new(
+            &store,
+            &mac_worker::test_support::host::process::SystemProcessRunner,
+        )
+        .load_status(PROJECT_ID, task_id())
+        .unwrap(),
+        status,
+        "the host status.json keeps what the turn response showed"
+    );
+}
+
+#[test]
 fn a_turn_without_the_flag_never_touches_herdr_wrapper() {
     let temp = tempdir().unwrap();
     let home = temp.path().join("home");
