@@ -307,6 +307,27 @@ impl TaskSubmitHandler<'_> {
         }
     }
 
+    /// Imported integration whose accepted head is already the owner head,
+    /// with no runner or queue row left to retire.
+    fn settled_imported_commit(&self, task_id: crate::task::TaskId) -> Result<bool, WorkerError> {
+        let current = self.client_state.load_task(task_id)?;
+        let (_, integration) =
+            crate::integration::store::RootedIntegrationState::read_task(self.paths, task_id)?;
+        Ok(integration.as_ref().is_some_and(|record| {
+            record.snapshot.state == crate::integration::contracts::IntegrationStatus::Integrated
+                && record.receipt.as_ref().is_some_and(|receipt| {
+                    let accepted = receipt.merge_oid.as_ref().unwrap_or(&receipt.target_head);
+                    receipt.imported
+                        && current.status().head_oid() == Some(accepted)
+                        && current.fetched_head() == Some(accepted)
+                })
+                && current.runner().is_none()
+        }) && self
+            .client_state
+            .queue_entry_for_task_turn(task_id)?
+            .is_none())
+    }
+
     fn execute_prepared_mutation(
         &self,
         record: &crate::controller::DurableRequest,
@@ -315,6 +336,17 @@ impl TaskSubmitHandler<'_> {
         if let PreparedTaskMutation::Close { expected, .. } = &prepared {
             let current = self.client_state.load_task(expected.meta().task_id())?;
             if let Err(error) = validate_close_target(&current, expected) {
+                // A close frozen before the integration record existed cannot
+                // be refreshed by decode. Once that cycle has imported, the
+                // stale revision is a committed result, not a final conflict.
+                if error.public_code() == "TASK_REVISION_CONFLICT"
+                    && self.settled_imported_commit(expected.meta().task_id())?
+                {
+                    return Ok(rejection_result(
+                        &crate::integration::contracts::IntegrationCode::IntegrationAlreadyCommitted
+                            .error(),
+                    ));
+                }
                 // Preserve the read-only close rejection, including terminal
                 // targets. Execution keeps unfinished effects retryable and
                 // the store settles definitive typed revision conflicts.
@@ -333,28 +365,7 @@ impl TaskSubmitHandler<'_> {
                 if error.public_code() == "INTEGRATION_ALREADY_COMMITTED"
                     && matches!(prepared, PreparedTaskMutation::Cancel { .. }) =>
             {
-                let current = self.client_state.load_task(prepared.task_id())?;
-                let (_, integration) =
-                    crate::integration::store::RootedIntegrationState::read_task(
-                        self.paths,
-                        prepared.task_id(),
-                    )?;
-                let settled = integration.as_ref().is_some_and(|record| {
-                    record.snapshot.state
-                        == crate::integration::contracts::IntegrationStatus::Integrated
-                        && record.receipt.as_ref().is_some_and(|receipt| {
-                            let accepted =
-                                receipt.merge_oid.as_ref().unwrap_or(&receipt.target_head);
-                            receipt.imported
-                                && current.status().head_oid() == Some(accepted)
-                                && current.fetched_head() == Some(accepted)
-                        })
-                        && current.runner().is_none()
-                }) && self
-                    .client_state
-                    .queue_entry_for_task_turn(prepared.task_id())?
-                    .is_none();
-                if !settled {
+                if !self.settled_imported_commit(prepared.task_id())? {
                     return Err(
                         crate::integration::contracts::IntegrationCode::IntegrationStopUnconfirmed
                             .error(),
@@ -375,6 +386,14 @@ impl TaskSubmitHandler<'_> {
                         Some(report) => report,
                         None => return Err(error),
                     }
+                } else if self.settled_imported_commit(prepared.task_id())? {
+                    // Same unbound freeze as close above: the store would
+                    // otherwise save this as a final "task changed before
+                    // cancel" and never surface the committed import.
+                    return Ok(rejection_result(
+                        &crate::integration::contracts::IntegrationCode::IntegrationAlreadyCommitted
+                            .error(),
+                    ));
                 } else {
                     return Err(error);
                 }
