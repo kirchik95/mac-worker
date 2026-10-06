@@ -1334,12 +1334,11 @@ impl<'a> TaskClient<'a> {
             IntegrationMutation::Cancel
                 | IntegrationMutation::Close
                 | IntegrationMutation::Say { new_turn: true }
-        ) && record.status().state() == TaskState::Open
-            && let Some(last) = record.status().turns().last()
-            && last.terminal().is_some()
-            && last.outcome() == Some(&TaskOutcome::Done)
-            && (snapshot.is_none()
-                || !coordinator.covers_latest_ordinary_work(record, snapshot.as_ref().unwrap())?)
+        ) && let Some(last) = record.status().turns().last()
+            && done_turn_awaits_integration(record, last, || match &snapshot {
+                Some(snapshot) => coordinator.covers_latest_ordinary_work(record, snapshot),
+                None => Ok(false),
+            })?
         {
             // A stop replays the finalizer's source CAS, then revokes that
             // cycle before any phase. Say, and a source that cannot be
@@ -7284,10 +7283,8 @@ impl<'a> TaskClient<'a> {
                 // Done is published before the finalizer stages integration.
                 // The frozen policy promises another cycle even if there is no
                 // intent yet, or the retained record covers older ordinary work.
-                if current.is_none()
-                    && latest.is_some_and(|turn| {
-                        turn.terminal().is_some() && turn.outcome() == Some(&TaskOutcome::Done)
-                    })
+                if let Some(turn) = latest
+                    && done_turn_awaits_integration(record, turn, || Ok(current.is_some()))?
                 {
                     return Ok(false);
                 }
@@ -7612,6 +7609,20 @@ fn submission_recovery_turn_id(record: &LocalTaskRecord) -> Option<TurnId> {
 fn submission_recovery_pending(record: &LocalTaskRecord) -> bool {
     record.abandon_code() == Some(SUBMISSION_ROLLBACK_INCOMPLETE)
         || submission_recovery_turn_id(record).is_some()
+}
+
+/// The finalizer stages integration only for an Open task whose turn ended
+/// Done. Until a record covers that turn, a stop replays the staging and a
+/// wait keeps waiting for its cycle. `covered` runs only for such a turn.
+fn done_turn_awaits_integration(
+    record: &LocalTaskRecord,
+    turn: &TurnSummary,
+    covered: impl FnOnce() -> Result<bool, WorkerError>,
+) -> Result<bool, WorkerError> {
+    Ok(record.status().state() == TaskState::Open
+        && turn.terminal().is_some()
+        && turn.outcome() == Some(&TaskOutcome::Done)
+        && !covered()?)
 }
 
 fn is_wait_terminal(state: TaskState) -> bool {
@@ -10197,21 +10208,6 @@ mod tests {
             } else {
                 ControllerWaitSelector::Task(fixture_task())
             };
-            let client =
-                TaskClient::new(&NoProcesses, &config, &paths, &store, &InlineRunnerExecutor);
-            let timeout = if controller {
-                wait_via_controller(
-                    &NoProcesses,
-                    &config.controller,
-                    remote_selector.clone(),
-                    Some(Duration::ZERO),
-                )
-            } else {
-                client.wait(selector, Some(Duration::ZERO))
-            }
-            .unwrap_err();
-            assert_eq!(timeout.public_code(), "WAIT_TIMEOUT");
-            assert_eq!(timeout.exit_code(), 70);
 
             std::thread::scope(|scope| {
                 let (events, received) = mpsc::channel();
@@ -10421,15 +10417,35 @@ mod tests {
             let state =
                 RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
                     .unwrap();
+            // The previous cycle integrated and its result was imported; a say
+            // then started newer ordinary work. (A Blocked cycle cannot stay
+            // current here: say revokes it before starting that work.)
             let mut record = sample_record(fixture_task(), fixture_source(), "main");
-            record.snapshot.state = IntegrationStatus::Blocked;
-            record.snapshot.blocked_code = Some(IntegrationCode::IntegrationChecksFailed);
+            let target: BaseOid = "c".repeat(40).parse().unwrap();
+            let merge: BaseOid = "d".repeat(40).parse().unwrap();
+            record.snapshot.state = IntegrationStatus::Integrated;
+            record.snapshot.disposition = Some(IntegrationDisposition::Merged);
+            record.snapshot.merge_oid = Some(merge.clone());
+            record.snapshot.observed_target_oid = Some(target.clone());
+            record.receipt = Some(IntegrationReceipt {
+                integration_id: record.snapshot.integration_id,
+                epoch: record.snapshot.epoch,
+                source_turn_id: fixture_source(),
+                source_head: fixture_head(),
+                target_head: target,
+                merge_oid: Some(merge),
+                disposition: IntegrationDisposition::Merged,
+                imported: true,
+                recorded_at_millis: 1002,
+            });
             state
                 .publish_policy(fixture_task(), &record.policy)
                 .unwrap();
-            state
-                .replace(fixture_task(), IntegrationRevision(0), &record)
-                .unwrap();
+            assert!(
+                state
+                    .replace(fixture_task(), IntegrationRevision(0), &record)
+                    .unwrap()
+            );
             let config = Config::parse("version = 1").unwrap();
             let client =
                 TaskClient::new(&NoProcesses, &config, &paths, &store, &InlineRunnerExecutor);
@@ -10449,6 +10465,47 @@ mod tests {
                 let later =
                     sample_ordinary_followup(fixture_task(), fixture_source(), Some(outcome));
                 assert!(client.tasks_are_quiescent(&[later]).unwrap());
+            }
+        }
+
+        #[test]
+        fn wait_for_an_unstaged_cycle_requires_an_open_task() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let paths = PathLayout {
+                config: root.join("config"),
+                state: root.join("state"),
+                cache: root.join("cache"),
+                data: root.join("data"),
+            };
+            let store = ClientStateStore::open(&paths.state).unwrap();
+            let state =
+                RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+                    .unwrap();
+            state
+                .publish_policy(fixture_task(), &sample_policy("main"))
+                .unwrap();
+            let config = Config::parse("version = 1").unwrap();
+            let client =
+                TaskClient::new(&NoProcesses, &config, &paths, &store, &InlineRunnerExecutor);
+            // A frozen policy, a Done latest turn and no integration record yet.
+            let open = sample_ordinary(fixture_task(), fixture_source());
+            assert!(
+                !client
+                    .tasks_are_quiescent(std::slice::from_ref(&open))
+                    .unwrap()
+            );
+            // The coordinator stages cycles only for Open tasks: the same
+            // history on a terminal task has no cycle left to wait for.
+            for terminal in ["closed", "abandoned", "lost"] {
+                let mut wire = serde_json::to_value(open.status()).unwrap();
+                wire["state"] = terminal.into();
+                let record = open
+                    .clone()
+                    .with_status(serde_json::from_value(wire).unwrap())
+                    .unwrap();
+                assert_eq!(record.status().last_outcome(), Some(&TaskOutcome::Done));
+                assert!(client.tasks_are_quiescent(&[record]).unwrap(), "{terminal}");
             }
         }
 
