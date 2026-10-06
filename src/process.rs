@@ -706,7 +706,8 @@ fn recover_after_killpg_eperm(child: &mut Child, error: io::Error) -> io::Result
     }
     // macOS can report EPERM while the group's last members exit or await
     // reaping. Reap our leader, then let the caller keep probing the saved
-    // group within the original kill budget. Reaping alone proves no absence.
+    // group within the original kill budget. Reaping the leader does not
+    // prove the saved group is gone.
     reap_owned_child(child)
 }
 
