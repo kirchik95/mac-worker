@@ -12,7 +12,7 @@ use std::{
 };
 
 use mac_worker::test_support::{
-    agents::agent::{AgentKind, PermissionPolicy},
+    agents::agent::{AgentKind, PermissionPolicy, ReportedCheck, ReportedCheckStatus},
     core::{error::WorkerError, protocol::MemoryPressure},
     host::{
         job::{
@@ -217,6 +217,31 @@ fn rewrite_status(store: &HostStore, task: TaskId, state: TaskState, updated_at_
         serde_json::to_vec(&replacement).unwrap(),
     )
     .unwrap();
+}
+
+/// Leaves the task Open with a published result that reported checks.
+fn rewrite_open_status_with_checks(store: &HostStore, task: TaskId) -> Vec<ReportedCheck> {
+    rewrite_status(store, task, TaskState::Open, 2);
+    let checks = vec![ReportedCheck::new(
+        "unit",
+        "cargo test",
+        ReportedCheckStatus::Fail,
+        "1 failed",
+    )];
+    let status = store
+        .task_status(PROJECT_ID, task)
+        .unwrap()
+        .with_reported_checks(checks.clone())
+        .unwrap();
+    fs::write(
+        store
+            .task_dir(PROJECT_ID, task)
+            .unwrap()
+            .join("status.json"),
+        serde_json::to_vec(&status).unwrap(),
+    )
+    .unwrap();
+    checks
 }
 
 fn write_head_oid(store: &HostStore, head: Option<BaseOid>) {
@@ -799,6 +824,63 @@ fn resume_reuses_the_published_workspace_and_appends_one_active_turn() {
         format!("task/{}", task_id())
     );
     assert_eq!(git(&workspace, &["rev-parse", "HEAD"]), base_oid.as_str());
+}
+
+#[test]
+fn resume_keeps_the_last_result_reported_checks_while_the_next_turn_runs() {
+    // The owner's follow-up record keeps them; the host's Active status
+    // dropped them, and the owner imports that status after acceptance.
+    let (_temp, store, base_oid) = store_with_mirror();
+    let (request, lease) = acquire_task_lease(&store);
+    prepare_task(&store, base_oid.clone());
+    TaskStore::new(&store, &SystemProcessRunner)
+        .publish_branch_into_mirror(PROJECT_ID, task_id())
+        .unwrap();
+    TaskStore::new(&store, &SystemProcessRunner)
+        .bind_session(
+            PROJECT_ID,
+            task_id(),
+            SessionBinding::new(AgentKind::Codex, "session-1", 101).unwrap(),
+        )
+        .unwrap();
+    let checks = rewrite_open_status_with_checks(&store, task_id());
+    retire_lease(&store, &request, &lease);
+    let next = job_id_for(11);
+    acquire_task_lease_request(
+        &store,
+        &task_lease_request(next, LeaseToken::new(Uuid::from_u128(31)), task_id()),
+    );
+
+    let (_, resumed) = TaskStore::new(&store, &SystemProcessRunner)
+        .prepare_resume(PROJECT_ID, task_id(), next, 2, "mini-1", &base_oid)
+        .unwrap();
+
+    assert_eq!(resumed.state(), TaskState::Active);
+    assert_eq!(resumed.turns().last().unwrap().turn_id(), next);
+    assert_eq!(resumed.reported_checks(), checks.as_slice());
+    assert_eq!(store.task_status(PROJECT_ID, task_id()).unwrap(), resumed);
+}
+
+#[test]
+fn reprepare_for_a_new_turn_keeps_the_last_result_reported_checks() {
+    let (_temp, store, base_oid) = store_with_mirror();
+    let (request, lease) = acquire_task_lease(&store);
+    prepare_task(&store, base_oid.clone());
+    let checks = rewrite_open_status_with_checks(&store, task_id());
+    retire_lease(&store, &request, &lease);
+    let next = job_id_for(11);
+    acquire_task_lease_request(
+        &store,
+        &task_lease_request(next, LeaseToken::new(Uuid::from_u128(31)), task_id()),
+    );
+
+    prepare_task_for(&store, task_id(), next, base_oid, &SystemProcessRunner);
+
+    let status = store.task_status(PROJECT_ID, task_id()).unwrap();
+    assert_eq!(status.state(), TaskState::Active);
+    assert_eq!(status.turns().len(), 2);
+    assert_eq!(status.turns()[1].turn_id(), next);
+    assert_eq!(status.reported_checks(), checks.as_slice());
 }
 
 #[test]

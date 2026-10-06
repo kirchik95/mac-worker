@@ -1491,7 +1491,8 @@ impl<'a> TaskStore<'a> {
             status.diff_stat().map(str::to_owned),
             status.turns().to_vec(),
             now_millis,
-        )?;
+        )?
+        .copying_reported_checks(&status)?;
         let next = replace_status_bytes(&task, status, next)?;
         if workspace_present {
             self.store
@@ -1807,6 +1808,9 @@ impl<'a> TaskStore<'a> {
             Some(now_millis()?),
             None,
         );
+        // The last result (summary, files and agent-reported checks) stays
+        // visible while the next turn runs, as on the owner's follow-up
+        // record; finish_turn replaces it with that turn's own result.
         let next = TaskStatus::new(
             TaskState::Active,
             current.last_outcome().cloned(),
@@ -1824,7 +1828,8 @@ impl<'a> TaskStore<'a> {
             current.diff_stat().map(str::to_owned),
             current.turns().iter().cloned().chain([pending]).collect(),
             now_millis()?,
-        )?;
+        )?
+        .copying_reported_checks(&current)?;
         replace_status_bytes(&task, current, next.clone())?;
         task.sync_root()?;
         Ok((meta, next))
@@ -1843,7 +1848,8 @@ impl<'a> TaskStore<'a> {
 
     /// Notes whether the worker's herdr shows a turn.  Purely informational:
     /// it touches only the turn's `herdr` field and never the task state,
-    /// outcome, or activity timestamp.
+    /// outcome, activity timestamp, or the agent-reported checks that the
+    /// integration gate reads.
     pub(crate) fn record_turn_herdr(
         &self,
         project_id: &str,
@@ -1861,19 +1867,7 @@ impl<'a> TaskStore<'a> {
             ));
         };
         turns[position] = turns[position].clone().with_herdr(Some(report));
-        let next = TaskStatus::new(
-            current.state(),
-            current.last_outcome().cloned(),
-            current.worker().map(str::to_owned),
-            current.session_present(),
-            current.head_oid().cloned(),
-            current.summary().map(str::to_owned),
-            current.questions().to_vec(),
-            current.files_changed().to_vec(),
-            current.diff_stat().map(str::to_owned),
-            turns,
-            current.updated_at_millis(),
-        )?;
+        let next = current.clone().with_turns(turns)?;
         replace_status_bytes(&task, current, next)?;
         Ok(())
     }
@@ -2468,7 +2462,8 @@ impl<'a> TaskStore<'a> {
                 status.diff_stat().map(str::to_owned),
                 status.turns().iter().cloned().chain([pending]).collect(),
                 status.updated_at_millis(),
-            )?;
+            )?
+            .copying_reported_checks(&status)?;
             replace_status_bytes(task, status, next)?;
             return Ok(());
         }
@@ -3399,6 +3394,148 @@ mod tests {
             reads <= 4,
             "continuous writers must not cause an unbounded read"
         );
+    }
+
+    #[test]
+    fn herdr_report_keeps_the_reported_checks_and_every_other_status_byte() {
+        // Break caught: every pool host has herdr, and recording the pane
+        // state rebuilt the status without the checks finish_turn had just
+        // stored, so the integration gate never saw a reported `fail`.
+        let temp = tempdir().unwrap();
+        let store = HostStore::open(&temp.path().join("host")).unwrap();
+        let task_id = TaskId::new(Uuid::from_u128(1));
+        let turn_id = JobId::new(Uuid::from_u128(2));
+        let task = store
+            .open_task_directory(PROJECT_ID, task_id, true)
+            .unwrap();
+        let active = TaskStatus::new(
+            TaskState::Active,
+            None,
+            Some("worker".into()),
+            true,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            vec![TurnSummary::new(
+                1,
+                turn_id,
+                None,
+                None,
+                None,
+                false,
+                Some(1),
+                None,
+            )],
+            1,
+        )
+        .unwrap();
+        write_record_once(&task, "status.json", &active).unwrap();
+        let checks = vec![
+            crate::agent::ReportedCheck::new(
+                "unit",
+                "cargo test",
+                crate::agent::ReportedCheckStatus::Fail,
+                "1 failed",
+            ),
+            crate::agent::ReportedCheck::new(
+                "lint",
+                "cargo clippy",
+                crate::agent::ReportedCheckStatus::Pass,
+                "",
+            ),
+        ];
+        let tasks = TaskStore::new(&store, &SystemProcessRunner);
+        let finished = tasks
+            .finish_turn(
+                PROJECT_ID,
+                task_id,
+                turn_id,
+                TurnTerminal::Succeeded,
+                TaskOutcome::Done,
+                true,
+                false,
+                None,
+                Some("done".into()),
+                Vec::new(),
+                vec!["src/lib.rs".into()],
+                None,
+                checks.clone(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(finished.reported_checks(), checks.as_slice());
+
+        let report = HerdrTurnReport {
+            state: crate::task::HerdrTurnState::Attached,
+            pane_id: Some("w9:p2".into()),
+        };
+        tasks
+            .record_turn_herdr(PROJECT_ID, task_id, turn_id, report.clone())
+            .unwrap();
+
+        let recorded = tasks.load_status(PROJECT_ID, task_id).unwrap();
+        assert_eq!(recorded.reported_checks(), checks.as_slice());
+        assert_eq!(recorded.turns()[0].herdr(), Some(&report));
+        let mut expected = serde_json::to_value(&finished).unwrap();
+        expected["turns"][0]["herdr"] = serde_json::to_value(&report).unwrap();
+        assert_eq!(serde_json::to_value(&recorded).unwrap(), expected);
+    }
+
+    #[test]
+    fn retention_close_keeps_the_reported_checks() {
+        // An explicit close already kept them; the GC close rebuilt the
+        // status without them and the retained result lost its checks.
+        let temp = tempdir().unwrap();
+        let store = HostStore::open(&temp.path().join("host")).unwrap();
+        let task_id = TaskId::new(Uuid::from_u128(1));
+        let task = store
+            .open_task_directory(PROJECT_ID, task_id, true)
+            .unwrap();
+        let checks = vec![crate::agent::ReportedCheck::new(
+            "unit",
+            "cargo test",
+            crate::agent::ReportedCheckStatus::Fail,
+            "1 failed",
+        )];
+        let open = TaskStatus::new(
+            TaskState::Open,
+            Some(TaskOutcome::Done),
+            Some("worker".into()),
+            true,
+            None,
+            Some("done".into()),
+            Vec::new(),
+            vec!["src/lib.rs".into()],
+            None,
+            vec![TurnSummary::new(
+                1,
+                JobId::new(Uuid::from_u128(2)),
+                Some(TurnTerminal::Succeeded),
+                Some(TaskOutcome::Done),
+                Some(true),
+                false,
+                Some(1),
+                Some(2),
+            )],
+            2,
+        )
+        .unwrap()
+        .with_reported_checks(checks.clone())
+        .unwrap();
+        write_record_once(&task, "status.json", &open).unwrap();
+
+        let tasks = TaskStore::new(&store, &SystemProcessRunner);
+        let closed = tasks
+            .close_for_retention(PROJECT_ID, task_id, 3)
+            .unwrap()
+            .expect("an idle open task closes for retention")
+            .status;
+        assert_eq!(closed.state(), TaskState::Closed);
+        assert_eq!(closed.updated_at_millis(), 3);
+        assert_eq!(closed.reported_checks(), checks.as_slice());
+        assert_eq!(tasks.load_status(PROJECT_ID, task_id).unwrap(), closed);
     }
 
     #[test]
