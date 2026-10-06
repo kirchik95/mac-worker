@@ -1345,12 +1345,11 @@ impl<'a> TaskClient<'a> {
             IntegrationMutation::Cancel
                 | IntegrationMutation::Close
                 | IntegrationMutation::Say { new_turn: true }
-        ) && record.status().state() == TaskState::Open
-            && let Some(last) = record.status().turns().last()
-            && last.terminal().is_some()
-            && last.outcome() == Some(&TaskOutcome::Done)
-            && (snapshot.is_none()
-                || !coordinator.covers_latest_ordinary_work(record, snapshot.as_ref().unwrap())?)
+        ) && let Some(last) = record.status().turns().last()
+            && done_turn_awaits_integration(record, last, || match &snapshot {
+                Some(snapshot) => coordinator.covers_latest_ordinary_work(record, snapshot),
+                None => Ok(false),
+            })?
         {
             // A stop replays the finalizer's source CAS, then revokes that
             // cycle before any phase. Say, and a source that cannot be
@@ -5860,7 +5859,11 @@ pub fn preview_batch_plan(
         dag: DagPreview {
             enforced: true,
             status: "enforced",
-            message: "Dependencies execute when parents are Closed and Done.",
+            message: if tasks.iter().any(|task| task.integration.is_some()) {
+                "Configured parents unlock children after integration success and current result import, including requested never parents that stay Open. Disabled parents must be Closed and Done."
+            } else {
+                "Dependencies execute when parents are Closed and Done."
+            },
         },
         setup: setup_preview(state.settings.setup.as_ref()),
         tasks,
@@ -7322,9 +7325,9 @@ impl<'a> TaskClient<'a> {
 
     fn tasks_are_quiescent(&self, records: &[LocalTaskRecord]) -> Result<bool, WorkerError> {
         for record in records {
-            if let Some(integration) =
-                RootedIntegrationState::read_task(self.paths, record.meta().task_id())?.1
-            {
+            let (policy, integration) =
+                RootedIntegrationState::read_task(self.paths, record.meta().task_id())?;
+            if policy.is_some() {
                 let mut latest = None;
                 for turn in record.status().turns().iter().rev() {
                     if RootedIntegrationState::read_auxiliary(
@@ -7338,7 +7341,18 @@ impl<'a> TaskClient<'a> {
                         break;
                     }
                 }
-                if latest.is_some_and(|turn| turn.turn_id() == integration.snapshot.source_turn_id)
+                let current = integration.as_ref().filter(|integration| {
+                    latest.is_some_and(|turn| turn.turn_id() == integration.snapshot.source_turn_id)
+                });
+                // Done is published before the finalizer stages integration.
+                // The frozen policy promises another cycle even if there is no
+                // intent yet, or the retained record covers older ordinary work.
+                if let Some(turn) = latest
+                    && done_turn_awaits_integration(record, turn, || Ok(current.is_some()))?
+                {
+                    return Ok(false);
+                }
+                if let Some(integration) = current
                     && (!matches!(
                         integration.snapshot.state,
                         IntegrationStatus::Integrated
@@ -7346,7 +7360,7 @@ impl<'a> TaskClient<'a> {
                             | IntegrationStatus::Revoked
                     ) || (record.status().state() == TaskState::Closed
                         && crate::integration::coordinator::closed_observation_pending(
-                            &integration,
+                            integration,
                         )))
                 {
                     return Ok(false);
@@ -7659,6 +7673,20 @@ fn submission_recovery_turn_id(record: &LocalTaskRecord) -> Option<TurnId> {
 fn submission_recovery_pending(record: &LocalTaskRecord) -> bool {
     record.abandon_code() == Some(SUBMISSION_ROLLBACK_INCOMPLETE)
         || submission_recovery_turn_id(record).is_some()
+}
+
+/// The finalizer stages integration only for an Open task whose turn ended
+/// Done. Until a record covers that turn, a stop replays the staging and a
+/// wait keeps waiting for its cycle. `covered` runs only for such a turn.
+fn done_turn_awaits_integration(
+    record: &LocalTaskRecord,
+    turn: &TurnSummary,
+    covered: impl FnOnce() -> Result<bool, WorkerError>,
+) -> Result<bool, WorkerError> {
+    Ok(record.status().state() == TaskState::Open
+        && turn.terminal().is_some()
+        && turn.outcome() == Some(&TaskOutcome::Done)
+        && !covered()?)
 }
 
 fn is_wait_terminal(state: TaskState) -> bool {
@@ -10121,6 +10149,521 @@ mod tests {
         );
         assert!(store.queue_entry_for_task_turn(task_id).unwrap().is_none());
         assert_eq!(store.load_task(task_id).unwrap().status().turns().len(), 1);
+    }
+
+    mod wait_regressions {
+        use super::*;
+        use crate::{
+            controller::lifecycle::{ControllerWaitSelector, wait_via_controller},
+            integration::{contracts::*, store::IntegrationRecovery, testing::*},
+            process::{ProcessRequest, ProcessResult},
+            turn_runner::InlineRunnerExecutor,
+        };
+        use std::{
+            os::unix::process::ExitStatusExt,
+            panic::{AssertUnwindSafe, catch_unwind},
+            process::ExitStatus,
+            sync::{Arc, Mutex, mpsc},
+        };
+
+        struct NoProcesses;
+        impl ProcessRunner for NoProcesses {
+            fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+                panic!("wait fixture must not launch a process: {:?}", request.args);
+            }
+        }
+
+        // Exercise the laptop loop through real controller frame parsing and
+        // serving, with no SSH or network and the same owner poll as production.
+        struct Controller<'a>(TaskClient<'a>);
+        impl ProcessRunner for Controller<'_> {
+            fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+                let request = crate::controller::protocol::parse_request(
+                    crate::controller::protocol::decode_frame(
+                        request.stdin.as_deref().expect("controller frame"),
+                    )?,
+                )?;
+                assert_eq!(request.command(), "task.wait.poll");
+                Ok(ProcessResult {
+                    status: ExitStatus::from_raw(0),
+                    stdout: crate::controller::lifecycle::serve_lifecycle_command(
+                        &request, &self.0,
+                    )?,
+                    stderr: vec![],
+                })
+            }
+        }
+
+        #[derive(Debug)]
+        enum WaitEvent {
+            Poll,
+            Returned(Result<WaitReport, WorkerError>),
+        }
+
+        fn wait_through_staging(controller: bool, run: bool, blocked: bool) {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let paths = PathLayout {
+                config: root.join("config.toml"),
+                state: root.join("state"),
+                cache: root.join("cache"),
+                data: root.join("data"),
+            };
+            let store = ClientStateStore::open(&paths.state).unwrap();
+            let ordinary = sample_ordinary(fixture_task(), fixture_source());
+            store.create_task(ordinary.clone()).unwrap();
+            let run_id = RunId::generate();
+            store
+                .create_run(
+                    RunRecord::new(
+                        run_id,
+                        Some("wait-fixture".into()),
+                        vec![fixture_task()],
+                        1,
+                        1000,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let runtime = Arc::new(ManualIntegrationRuntime::default());
+            let state = RootedIntegrationState::open(&paths, runtime.clone()).unwrap();
+            state
+                .publish_policy(fixture_task(), &sample_policy("main"))
+                .unwrap();
+            let observer = FakeIntegrationObserver::default();
+            observer.insert(IntegrationTaskFacts::from_record(&ordinary, false));
+            let host = FakeIntegrationHost::default();
+            let turns = FakeIntegrationTurns::default();
+            let coordinator =
+                IntegrationCoordinator::new(&state, &host, &turns, runtime.as_ref(), &observer);
+            // Stop the finalizer at the existing hook after Done/import/retirement
+            // but before its first intent. Recovery backoff holds that exact gap
+            // until the test explicitly resumes staging; no clock time is spent.
+            runtime.crash_at(IntegrationHook::AfterRunnerRetirement);
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| {
+                    coordinator
+                        .on_terminal(fixture_task(), fixture_source())
+                        .unwrap();
+                }))
+                .is_err()
+            );
+            runtime.restart();
+            assert!(state.load(fixture_task()).unwrap().is_none());
+            IntegrationRecovery::open_at(&paths.state)
+                .unwrap()
+                .failed(
+                    fixture_task(),
+                    1000,
+                    &IntegrationCode::IntegrationNetwork.error(),
+                )
+                .unwrap();
+            let config = Config::parse(&format!(
+                "version = 1\n[controller]\nenabled = {controller}\nssh = 'never-connect'\n"
+            ))
+            .unwrap();
+            let selector = if run {
+                WaitSelector::Run(run_id)
+            } else {
+                WaitSelector::Task(fixture_task())
+            };
+            let remote_selector = if run {
+                ControllerWaitSelector::Run("wait-fixture".into())
+            } else {
+                ControllerWaitSelector::Task(fixture_task())
+            };
+
+            std::thread::scope(|scope| {
+                let (events, received) = mpsc::channel();
+                let (release, resume) = mpsc::channel();
+                let resume = Mutex::new(resume);
+                let poll_events = events.clone();
+                let waiting_store = store
+                    .with_wait_deadline(WaitDeadline::default())
+                    .with_admission_clock(Arc::new(move || {
+                        poll_events.send(WaitEvent::Poll).unwrap();
+                        // The timeout is only a deadlock guard, not ordering evidence.
+                        resume
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(30))
+                            .map_err(|_| task_error("FIXTURE_STOPPED", "wait fixture stopped"))?;
+                        Ok(1000)
+                    }));
+                let config = &config;
+                let paths = &paths;
+                let waiting = scope.spawn(move || {
+                    let client = TaskClient::new(
+                        &NoProcesses,
+                        config,
+                        paths,
+                        &waiting_store,
+                        &InlineRunnerExecutor,
+                    );
+                    let result = if controller {
+                        wait_via_controller(
+                            &Controller(client),
+                            &config.controller,
+                            remote_selector,
+                            None,
+                        )
+                    } else {
+                        client.wait(selector, None)
+                    };
+                    events.send(WaitEvent::Returned(result)).unwrap();
+                });
+                let expect_poll = || {
+                    let event = received.recv_timeout(Duration::from_secs(30)).unwrap();
+                    assert!(
+                        matches!(event, WaitEvent::Poll),
+                        "wait returned before integration settled (controller={controller}, run={run}): {event:?}"
+                    );
+                };
+                expect_poll();
+                release.send(()).unwrap();
+                expect_poll(); // The pre-intent snapshot must have kept waiting.
+                coordinator
+                    .on_terminal(fixture_task(), fixture_source())
+                    .unwrap();
+                assert_eq!(
+                    state.load(fixture_task()).unwrap().unwrap().snapshot.state,
+                    IntegrationStatus::Pending
+                );
+                release.send(()).unwrap();
+                expect_poll(); // Pending integration must keep waiting.
+                coordinator
+                    .park_for_runtime(
+                        fixture_task(),
+                        IntegrationPauseEvidence {
+                            reason: IntegrationPauseReason::ControllerDrained,
+                            effective_at_millis: 1000,
+                        },
+                    )
+                    .unwrap();
+                release.send(()).unwrap();
+                expect_poll(); // Parked integration must keep waiting.
+                let mut record = state.load(fixture_task()).unwrap().unwrap();
+                let previous = record.snapshot.revision;
+                record.snapshot.revision = previous.next().unwrap();
+                record.snapshot.resume_state = None;
+                record.snapshot.pause_reason = None;
+                record.pause = None;
+                if blocked {
+                    record.snapshot.state = IntegrationStatus::Blocked;
+                    record.snapshot.blocked_code = Some(IntegrationCode::IntegrationChecksFailed);
+                } else {
+                    let accepted: BaseOid = "e".repeat(40).parse().unwrap();
+                    record.snapshot.state = IntegrationStatus::Integrated;
+                    record.snapshot.observed_target_oid = Some(accepted.clone());
+                    record.snapshot.disposition = Some(IntegrationDisposition::AlreadyIntegrated);
+                    record.receipt = Some(IntegrationReceipt {
+                        integration_id: record.snapshot.integration_id,
+                        epoch: record.snapshot.epoch,
+                        source_turn_id: fixture_source(),
+                        source_head: fixture_head(),
+                        target_head: accepted.clone(),
+                        merge_oid: None,
+                        disposition: IntegrationDisposition::AlreadyIntegrated,
+                        imported: true,
+                        recorded_at_millis: 1000,
+                    });
+                    let mut wire = serde_json::to_value(ordinary.status()).unwrap();
+                    wire["head_oid"] = accepted.as_str().into();
+                    let imported = ordinary
+                        .clone()
+                        .with_status(serde_json::from_value(wire).unwrap())
+                        .unwrap()
+                        .with_fetched_head(Some(accepted))
+                        .unwrap();
+                    assert!(store.update_task_if_current(&ordinary, imported).unwrap());
+                }
+                assert!(state.replace(fixture_task(), previous, &record).unwrap());
+                store
+                    .record_runner(
+                        fixture_task(),
+                        Some(crate::task::RunnerIdentity::new(
+                            current_process_identity().unwrap(),
+                        )),
+                    )
+                    .unwrap();
+                release.send(()).unwrap();
+                expect_poll(); // Settlement still requires runner retirement.
+                store.record_runner(fixture_task(), None).unwrap();
+                release.send(()).unwrap();
+                let event = received.recv_timeout(Duration::from_secs(30)).unwrap();
+                let WaitEvent::Returned(result) = event else {
+                    panic!("settled integration still waits: {event:?}");
+                };
+                let report = result.unwrap();
+                assert_eq!(report.task_ids(), &[fixture_task()]);
+                assert_eq!(
+                    report.exit_code(),
+                    if blocked {
+                        IntegrationCode::IntegrationChecksFailed.error().exit_code()
+                    } else {
+                        0
+                    }
+                );
+                assert_eq!(
+                    store.load_task(fixture_task()).unwrap().status().state(),
+                    TaskState::Open
+                );
+                waiting.join().unwrap();
+            });
+            assert!(host.calls().is_empty());
+        }
+
+        #[test]
+        fn wait_covers_unstaged_integration_until_imported_success() {
+            for controller in [false, true] {
+                for run in [false, true] {
+                    wait_through_staging(controller, run, false);
+                }
+            }
+        }
+
+        #[test]
+        fn wait_covers_unstaged_integration_until_blocked() {
+            for controller in [false, true] {
+                for run in [false, true] {
+                    wait_through_staging(controller, run, true);
+                }
+            }
+        }
+
+        #[test]
+        fn wait_disabled_done_keeps_ordinary_bytes_and_creates_no_integration() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let paths = PathLayout {
+                config: root.join("config"),
+                state: root.join("state"),
+                cache: root.join("cache"),
+                data: root.join("data"),
+            };
+            let store = ClientStateStore::open(&paths.state).unwrap();
+            let ordinary = sample_ordinary(fixture_task(), fixture_source());
+            store.create_task(ordinary.clone()).unwrap();
+            let run = RunId::generate();
+            store
+                .create_run(RunRecord::new(run, None, vec![fixture_task()], 1, 1000).unwrap())
+                .unwrap();
+            let config = Config::parse("version = 1").unwrap();
+            let client =
+                TaskClient::new(&NoProcesses, &config, &paths, &store, &InlineRunnerExecutor);
+            for selector in [WaitSelector::Task(fixture_task()), WaitSelector::Run(run)] {
+                let report = client.wait(selector, None).unwrap();
+                assert_eq!(report.task_ids(), &[fixture_task()]);
+                assert_eq!(report.exit_code(), 0);
+            }
+            assert_eq!(
+                store
+                    .load_task(fixture_task())
+                    .unwrap()
+                    .canonical_bytes()
+                    .unwrap(),
+                ordinary.canonical_bytes().unwrap()
+            );
+            assert!(!paths.state.join("integrations").exists());
+        }
+
+        #[test]
+        fn wait_old_integration_does_not_cover_a_new_done_turn() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let paths = PathLayout {
+                config: root.join("config"),
+                state: root.join("state"),
+                cache: root.join("cache"),
+                data: root.join("data"),
+            };
+            let store = ClientStateStore::open(&paths.state).unwrap();
+            let state =
+                RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+                    .unwrap();
+            // The previous cycle integrated and its result was imported; a say
+            // then started newer ordinary work. (A Blocked cycle cannot stay
+            // current here: say revokes it before starting that work.)
+            let mut record = sample_record(fixture_task(), fixture_source(), "main");
+            let target: BaseOid = "c".repeat(40).parse().unwrap();
+            let merge: BaseOid = "d".repeat(40).parse().unwrap();
+            record.snapshot.state = IntegrationStatus::Integrated;
+            record.snapshot.disposition = Some(IntegrationDisposition::Merged);
+            record.snapshot.merge_oid = Some(merge.clone());
+            record.snapshot.observed_target_oid = Some(target.clone());
+            record.receipt = Some(IntegrationReceipt {
+                integration_id: record.snapshot.integration_id,
+                epoch: record.snapshot.epoch,
+                source_turn_id: fixture_source(),
+                source_head: fixture_head(),
+                target_head: target,
+                merge_oid: Some(merge),
+                disposition: IntegrationDisposition::Merged,
+                imported: true,
+                recorded_at_millis: 1002,
+            });
+            state
+                .publish_policy(fixture_task(), &record.policy)
+                .unwrap();
+            assert!(
+                state
+                    .replace(fixture_task(), IntegrationRevision(0), &record)
+                    .unwrap()
+            );
+            let config = Config::parse("version = 1").unwrap();
+            let client =
+                TaskClient::new(&NoProcesses, &config, &paths, &store, &InlineRunnerExecutor);
+            let done =
+                sample_ordinary_followup(fixture_task(), fixture_source(), Some(TaskOutcome::Done));
+            assert!(
+                !client.tasks_are_quiescent(&[done]).unwrap(),
+                "old settlement cannot cover newer Done work"
+            );
+            for outcome in [
+                TaskOutcome::NeedsInput,
+                TaskOutcome::Cancelled,
+                TaskOutcome::Failed {
+                    reason: "fixture failed".into(),
+                },
+            ] {
+                let later =
+                    sample_ordinary_followup(fixture_task(), fixture_source(), Some(outcome));
+                assert!(client.tasks_are_quiescent(&[later]).unwrap());
+            }
+        }
+
+        #[test]
+        fn wait_for_an_unstaged_cycle_requires_an_open_task() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let paths = PathLayout {
+                config: root.join("config"),
+                state: root.join("state"),
+                cache: root.join("cache"),
+                data: root.join("data"),
+            };
+            let store = ClientStateStore::open(&paths.state).unwrap();
+            let state =
+                RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+                    .unwrap();
+            state
+                .publish_policy(fixture_task(), &sample_policy("main"))
+                .unwrap();
+            let config = Config::parse("version = 1").unwrap();
+            let client =
+                TaskClient::new(&NoProcesses, &config, &paths, &store, &InlineRunnerExecutor);
+            // A frozen policy, a Done latest turn and no integration record yet.
+            let open = sample_ordinary(fixture_task(), fixture_source());
+            assert!(
+                !client
+                    .tasks_are_quiescent(std::slice::from_ref(&open))
+                    .unwrap()
+            );
+            // The coordinator stages cycles only for Open tasks: the same
+            // history on a terminal task has no cycle left to wait for.
+            for terminal in ["closed", "abandoned", "lost"] {
+                let mut wire = serde_json::to_value(open.status()).unwrap();
+                wire["state"] = terminal.into();
+                let record = open
+                    .clone()
+                    .with_status(serde_json::from_value(wire).unwrap())
+                    .unwrap();
+                assert_eq!(record.status().last_outcome(), Some(&TaskOutcome::Done));
+                assert!(client.tasks_are_quiescent(&[record]).unwrap(), "{terminal}");
+            }
+        }
+
+        struct PreviewProject(PathBuf);
+        impl ProcessRunner for PreviewProject {
+            fn run(&self, request: &ProcessRequest) -> Result<ProcessResult, WorkerError> {
+                let args: Vec<_> = request.args.iter().map(|a| a.to_str().unwrap()).collect();
+                let stdout = if args.contains(&"--show-toplevel")
+                    || args.contains(&"--git-dir")
+                    || args.contains(&"--git-common-dir")
+                {
+                    self.0.to_str().unwrap().to_owned()
+                } else if args.contains(&"status") {
+                    String::new()
+                } else if args.contains(&"symbolic-ref") {
+                    "main".into()
+                } else if args.contains(&"config") {
+                    "https://example.test/repo.git".into()
+                } else {
+                    assert!(
+                        args.contains(&"rev-parse"),
+                        "unexpected fixture request: {args:?}"
+                    );
+                    "a".repeat(40)
+                };
+                Ok(ProcessResult {
+                    status: ExitStatus::from_raw(0),
+                    stdout: stdout.into_bytes(),
+                    stderr: vec![],
+                })
+            }
+        }
+
+        fn preview_dag(project: &str, batch: &str, child: &str) -> BatchPreview {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            std::fs::write(root.join(".worker.toml"), project).unwrap();
+            std::fs::write(root.join("batch.toml"), format!("{batch}\n[[tasks]]\nid = 'parent'\nprompt = 'parent'\nclose_on = 'never'\n[[tasks]]\nid = 'child'\nprompt = 'child'\ndepends_on = ['parent']\n{child}\n")).unwrap();
+            let config = Config::parse("version = 1").unwrap();
+            let preview = preview_batch_plan(
+                &PreviewProject(root.clone()),
+                &config,
+                &root.join("batch.toml"),
+                &root,
+            )
+            .unwrap();
+            assert!(!preview.has_config_errors(), "{:?}", preview.issues);
+            assert_eq!(preview.tasks.len(), 2);
+            assert_eq!(preview.tasks[1].depends_on, ["parent"]);
+            preview
+        }
+
+        #[test]
+        fn preview_enabled_dag_explains_integration_and_disabled_parent_rules() {
+            for (project, batch, child, enabled) in [
+                ("", "integrate = 'main'", "", [true, true]),
+                (
+                    "[task]\nintegrate = 'main'",
+                    "",
+                    "integrate = false",
+                    [true, false],
+                ),
+                ("", "", "integrate = 'main'", [false, true]),
+            ] {
+                let preview = preview_dag(project, batch, child);
+                assert_eq!(
+                    preview
+                        .tasks
+                        .iter()
+                        .map(|t| t.integration.is_some())
+                        .collect::<Vec<_>>(),
+                    enabled
+                );
+                assert_eq!(
+                    preview.dag.message,
+                    "Configured parents unlock children after integration success and current result import, including requested never parents that stay Open. Disabled parents must be Closed and Done."
+                );
+            }
+        }
+
+        #[test]
+        fn preview_disabled_dag_keeps_legacy_wording() {
+            for (project, batch) in [
+                ("", ""),
+                ("[task]\nintegrate = 'main'", "integrate = false"),
+            ] {
+                let preview = preview_dag(project, batch, "");
+                assert!(preview.tasks.iter().all(|t| t.integration.is_none()));
+                assert_eq!(
+                    preview.dag.message,
+                    "Dependencies execute when parents are Closed and Done."
+                );
+            }
+        }
     }
 
     #[test]
