@@ -17,7 +17,7 @@ use crate::{
         NOTIFY_PENDING_CAPACITY, Notice, NoticeChannel, NotifyOptions, NotifyState,
         PendingCandidate, READ_DEFAULT_LIMIT, READ_FOLLOW_WAIT_MS, RECONNECT_BACKOFF,
         REPAIR_INTERVAL, RPC_BUDGET, ReadQuery, ReconcileInput, RepairProgress, TaskAddressQuery,
-        TaskFactsBatch, TaskRepairPage, TaskRepairQuery,
+        TaskFactsBatch, TaskRepairPage, TaskRepairQuery, foreground::FollowHeartbeat,
     },
     error::WorkerError,
 };
@@ -42,11 +42,22 @@ pub struct NotifyLoop<'a> {
 impl NotifyLoop<'_> {
     #[cfg(any(test, feature = "test-support"))]
     pub fn run(self, diagnostics: &mut dyn Write) -> Result<NotifyExit, WorkerError> {
+        self.run_beating(diagnostics, &FollowHeartbeat::default())
+    }
+
+    /// `run` that advances `heartbeat` once per pass, as the command does for
+    /// its stall watchdog.
+    #[cfg(any(test, feature = "test-support"))]
+    fn run_beating(
+        self,
+        diagnostics: &mut dyn Write,
+        heartbeat: &FollowHeartbeat,
+    ) -> Result<NotifyExit, WorkerError> {
         if self.runtime.cancelled() {
             return Ok(NotifyExit::Cancelled);
         }
         let (saved, suppress) = load_baseline(self.cache, diagnostics)?;
-        self.run_with_state(diagnostics, saved, suppress)
+        self.run_with_state(diagnostics, saved, suppress, heartbeat)
     }
 
     fn run_with_state(
@@ -54,6 +65,7 @@ impl NotifyLoop<'_> {
         diagnostics: &mut dyn Write,
         saved: NotifyState,
         mut suppress: bool,
+        heartbeat: &FollowHeartbeat,
     ) -> Result<NotifyExit, WorkerError> {
         let stop_at = if self.options.follow {
             self.stop_at
@@ -91,6 +103,7 @@ impl NotifyLoop<'_> {
         let mut retry = 0usize;
         let mut state_only_reported = false;
         loop {
+            heartbeat.beat();
             if stopped(self.runtime.as_ref(), stop_at) {
                 return finish_stopped(self.options, cold, self.runtime.cancelled(), diagnostics);
             }
@@ -728,6 +741,12 @@ pub(crate) fn run_command(
         let cache = NotifyCache::open(&paths, &config.controller)?;
         let (saved, suppress) = load_baseline(&cache, stderr)?;
         let runtime = super::super::foreground::ForegroundRuntime::install()?;
+        let heartbeat = Arc::new(FollowHeartbeat::default());
+        // A one-shot run ends at its own 30 s deadline; only follow restarts.
+        let _watchdog = options
+            .follow
+            .then(|| runtime.arm_follow_watchdog(heartbeat.clone(), "notification follow stalled"))
+            .transpose()?;
         let runner: Arc<dyn crate::process::ProcessRunner> =
             Arc::new(crate::process::SystemProcessRunner);
         let source = super::super::foreground::event_client(
@@ -771,7 +790,7 @@ pub(crate) fn run_command(
             runtime,
             stop_at: None,
         }
-        .run_with_state(stderr, saved, suppress)
+        .run_with_state(stderr, saved, suppress, &heartbeat)
     })();
     match result {
         Ok(NotifyExit::Incomplete) => crate::error::ExitKind::Unavailable as u8,
@@ -2103,5 +2122,131 @@ mod tests {
         assert_eq!(notices[0].0.title, "Tasks finished");
         assert_eq!(notices[0].0.body, "1 task");
         assert_eq!(h.cache.load().unwrap().consumed_after, Some(cursor(5)));
+    }
+
+    fn warm() -> Reconciliation {
+        Reconciliation {
+            baseline: BaselineKind::Warm,
+            repair: RepairProgress::NotStarted,
+            ..complete()
+        }
+    }
+
+    /// Injects `count` watchdog ticks through a channel.
+    fn ticks(count: u32) -> std::sync::mpsc::Receiver<()> {
+        let (tick, ticks) = std::sync::mpsc::channel();
+        for _ in 0..count {
+            tick.send(()).unwrap();
+        }
+        ticks
+    }
+
+    /// Runs a follow loop on its own thread. The cold pass commits, then each
+    /// later pass parks in its journal read until the test releases it, the
+    /// way a lost timer parked the notifier. `body` gets the loop's heartbeat
+    /// once the first read is entered; the loop is cancelled afterwards.
+    fn with_parked_follow(
+        h: &mut Fixture,
+        reads: Vec<EventReadResult>,
+        body: impl FnOnce(
+            &FollowHeartbeat,
+            &std::sync::mpsc::Receiver<()>,
+            &std::sync::mpsc::Sender<()>,
+        ),
+    ) {
+        let (source, entered, release) =
+            crate::controller::events::testing::GatedEventSource::new();
+        source
+            .inner
+            .queue_discovery(Ok(EventSupport::Supported))
+            .unwrap();
+        for read in reads {
+            source.inner.queue_read(Ok(read)).unwrap();
+        }
+        let channels: Vec<Arc<dyn NoticeChannel>> = vec![h.channel.clone()];
+        let options = NotifyOptions {
+            follow: true,
+            ..NotifyOptions::default()
+        };
+        let heartbeat = FollowHeartbeat::default();
+        let runtime = h.runtime.clone();
+        std::thread::scope(|scope| {
+            // Unwinding drops these before the scope joins the loop: a failed
+            // assertion cancels, then releases the parked read, never hangs.
+            let release = release;
+            let _cancel = crate::test_support::on_drop(|| runtime.cancel());
+            let follow = scope.spawn(|| {
+                NotifyLoop {
+                    source: &source,
+                    reconciler: &mut h.reconciler,
+                    cache: &h.cache,
+                    channels: &channels,
+                    options: &options,
+                    runtime: runtime.clone(),
+                    stop_at: None,
+                }
+                .run_beating(&mut Vec::new(), &heartbeat)
+            });
+            entered
+                .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+                .expect("the follow loop never reached its journal read");
+            body(&heartbeat, &entered, &release);
+            runtime.cancel();
+            drop(release);
+            assert_eq!(follow.join().unwrap().unwrap(), NotifyExit::Cancelled);
+        });
+    }
+
+    #[test]
+    fn watchdog_fires_once_for_a_follow_pass_parked_in_a_read() {
+        use crate::controller::events::foreground::{FOLLOW_STALL_TICKS, StallWatch};
+        let mut h = Fixture::new();
+        h.reconciler.queue(Ok(complete())).unwrap();
+        let cache = cache_file(h._root.path());
+        with_parked_follow(&mut h, Vec::new(), |heartbeat, _, _| {
+            let committed = std::fs::read(&cache).unwrap();
+            let mut watch = StallWatch::new(heartbeat, FOLLOW_STALL_TICKS);
+            let mut stalls = 0;
+            assert!(!watch.watch(ticks(FOLLOW_STALL_TICKS - 1), || stalls += 1));
+            assert_eq!(stalls, 0);
+            let last = ticks(2);
+            assert!(watch.watch(&last, || stalls += 1));
+            assert_eq!(stalls, 1);
+            assert_eq!(last.try_iter().count(), 1, "the watch ends at the stall");
+            // A restart resumes from exactly what the parked pass left saved.
+            assert_eq!(std::fs::read(&cache).unwrap(), committed);
+        });
+        assert_eq!(h.cache.load().unwrap().consumed_after, Some(cursor(5)));
+        assert!(h.channel.records().is_empty());
+    }
+
+    #[test]
+    fn watchdog_restarts_its_count_when_a_parked_read_returns() {
+        use crate::controller::events::foreground::{FOLLOW_STALL_TICKS, StallWatch};
+        let mut h = Fixture::new();
+        h.reconciler.queue(Ok(complete())).unwrap();
+        h.reconciler.queue(Ok(warm())).unwrap();
+        with_parked_follow(
+            &mut h,
+            vec![batch(5, false)],
+            |heartbeat, entered, release| {
+                let mut watch = StallWatch::new(heartbeat, FOLLOW_STALL_TICKS);
+                let mut stalls = 0;
+                assert!(!watch.watch(ticks(FOLLOW_STALL_TICKS - 1), || stalls += 1));
+                // The read returns between ticks; the next pass parks again.
+                let parked = heartbeat.passes();
+                release.send(()).unwrap();
+                entered
+                    .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+                    .unwrap();
+                assert!(heartbeat.passes() > parked);
+                assert!(!watch.watch(ticks(1), || stalls += 1));
+                assert!(!watch.watch(ticks(FOLLOW_STALL_TICKS - 1), || stalls += 1));
+                assert_eq!(stalls, 0);
+                // The count restarted at the new pass and still catches this park.
+                assert!(watch.watch(ticks(1), || stalls += 1));
+                assert_eq!(stalls, 1);
+            },
+        );
     }
 }

@@ -1,5 +1,6 @@
 //! Safe debugging of future committed events; no task projection or local state.
 
+use super::foreground::FollowHeartbeat;
 use super::notify::follow::{millis, operation_deadline, pause, stopped};
 use super::{
     CONTROLLER_EVENTS_UNSUPPORTED, EventReadResult, EventRuntime, EventSource, EventSupport,
@@ -16,7 +17,18 @@ pub(crate) struct TailLoop<'a> {
 }
 
 impl TailLoop<'_> {
+    #[cfg(test)]
     pub(crate) fn run(self, output: &mut dyn Write) -> Result<(), WorkerError> {
+        self.run_beating(output, &FollowHeartbeat::default())
+    }
+
+    /// Follows the journal, advancing `heartbeat` once per pass for the
+    /// command's stall watchdog.
+    pub(crate) fn run_beating(
+        self,
+        output: &mut dyn Write,
+        heartbeat: &FollowHeartbeat,
+    ) -> Result<(), WorkerError> {
         if stopped(self.runtime.as_ref(), self.stop_at) {
             return Ok(());
         }
@@ -33,6 +45,7 @@ impl TailLoop<'_> {
         }
         let mut after = None;
         loop {
+            heartbeat.beat();
             if stopped(self.runtime.as_ref(), self.stop_at) {
                 return Ok(());
             }
@@ -157,6 +170,8 @@ pub(crate) fn run_command(
     let result = (|| {
         let (paths, config) = super::foreground::configuration(cli, context)?;
         let runtime = super::foreground::ForegroundRuntime::install()?;
+        let heartbeat = Arc::new(FollowHeartbeat::default());
+        let _watchdog = runtime.arm_follow_watchdog(heartbeat.clone(), "event follow stalled")?;
         let source = super::foreground::event_client(
             Arc::new(crate::process::SystemProcessRunner),
             crate::controller::channel::ReadLoopScope::EventsFollow,
@@ -171,7 +186,7 @@ pub(crate) fn run_command(
             json: cli.json,
             stop_at: None,
         }
-        .run(stdout)
+        .run_beating(stdout, &heartbeat)
     })();
     match result {
         Ok(()) => 0,
@@ -489,6 +504,60 @@ mod tests {
         let text = String::from_utf8(out.bytes).unwrap();
         assert_eq!(text.lines().count(), 1);
         assert!(!text.contains("private-secret"));
+    }
+
+    #[test]
+    fn heartbeat_moves_once_per_pass_and_a_parked_read_trips_the_watchdog() {
+        use crate::controller::events::{
+            foreground::{FOLLOW_STALL_TICKS, StallWatch},
+            testing::GatedEventSource,
+        };
+        let (source, entered, release) = GatedEventSource::new();
+        source
+            .inner
+            .queue_discovery(Ok(EventSupport::Supported))
+            .unwrap();
+        source
+            .inner
+            .queue_read(Ok(control("bootstrap", 5)))
+            .unwrap();
+        let clock = Arc::new(ManualEventRuntime::new());
+        let heartbeat = FollowHeartbeat::default();
+        let ticks = |count: u32| std::iter::repeat_n((), count as usize);
+        std::thread::scope(|scope| {
+            // Unwinding drops these before the scope joins the loop: a failed
+            // assertion cancels, then releases the parked read, never hangs.
+            let release = release;
+            let _cancel = crate::test_support::on_drop(|| clock.cancel());
+            let tail = scope.spawn(|| {
+                TailLoop {
+                    source: &source,
+                    runtime: clock.clone(),
+                    json: true,
+                    stop_at: None,
+                }
+                .run_beating(&mut Vec::new(), &heartbeat)
+            });
+            let wait_for_read = || {
+                entered
+                    .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+                    .unwrap()
+            };
+            wait_for_read();
+            assert_eq!(heartbeat.passes(), 1, "parked in the bootstrap read");
+            let mut watch = StallWatch::new(&heartbeat, FOLLOW_STALL_TICKS);
+            let mut stalls = 0;
+            assert!(!watch.watch(ticks(FOLLOW_STALL_TICKS - 1), || stalls += 1));
+            release.send(()).unwrap();
+            wait_for_read();
+            assert_eq!(heartbeat.passes(), 2, "parked in the first follow read");
+            assert!(!watch.watch(ticks(FOLLOW_STALL_TICKS), || stalls += 1));
+            assert!(watch.watch(ticks(1), || stalls += 1));
+            assert_eq!(stalls, 1);
+            clock.cancel();
+            drop(release);
+            tail.join().unwrap().unwrap();
+        });
     }
 
     #[test]

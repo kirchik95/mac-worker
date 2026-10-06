@@ -493,6 +493,65 @@ impl EventSource for ScriptedEventSource {
         self.repair.pop()
     }
 }
+/// Scripted source whose every read first reports entry, then waits for the
+/// test to release it; it then answers from `inner`. Dropping the release
+/// sender lets every later read through. Stands in for a loop stuck in a read.
+#[cfg(test)]
+pub(crate) struct GatedEventSource {
+    pub(crate) inner: ScriptedEventSource,
+    entered: std::sync::mpsc::Sender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+#[cfg(test)]
+impl GatedEventSource {
+    /// Returns the source, its entry signals and its release sender.
+    pub(crate) fn new() -> (
+        Self,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (entered, entries) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let source = Self {
+            inner: ScriptedEventSource::new(),
+            entered,
+            release: Mutex::new(gate),
+        };
+        (source, entries, release)
+    }
+}
+#[cfg(test)]
+impl EventSource for GatedEventSource {
+    fn integrations(
+        &self,
+        task_ids: &[TaskId],
+        deadline: Duration,
+    ) -> Result<crate::integration::contracts::IntegrationReadResult, WorkerError> {
+        self.inner.integrations(task_ids, deadline)
+    }
+    fn discover(&self, deadline: Duration) -> Result<EventSupport, WorkerError> {
+        self.inner.discover(deadline)
+    }
+    fn read(&self, query: ReadQuery, deadline: Duration) -> Result<EventReadResult, WorkerError> {
+        let _ = self.entered.send(());
+        let _ = self.release.lock().unwrap().recv();
+        self.inner.read(query, deadline)
+    }
+    fn tasks(
+        &self,
+        query: TaskAddressQuery,
+        deadline: Duration,
+    ) -> Result<TaskFactsBatch, WorkerError> {
+        self.inner.tasks(query, deadline)
+    }
+    fn repair(
+        &self,
+        query: TaskRepairQuery,
+        deadline: Duration,
+    ) -> Result<TaskRepairPage, WorkerError> {
+        self.inner.repair(query, deadline)
+    }
+}
 /// Standalone scripted JournalReader including batches and reset controls.
 #[cfg(test)]
 struct FakeJournalReader {
