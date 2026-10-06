@@ -76,7 +76,7 @@ Stable `task_id` and first `turn_id` are persisted on every node before `create_
 
 `worker task reconcile` re-owns dead runners and re-enqueues orphans, then advances eligible DAG nodes. It does not submit work the operator did not already freeze in that run. Close after durable Closed, and a finished turn after this-turn import, also advance pending nodes.
 
-List rows for not-yet-submitted nodes may show `DAG_WAITING` or `DAG_CLAIMED`.
+List rows for not-yet-submitted nodes may show `DAG_WAITING` or `DAG_CLAIMED`. One display-only exception applies to integration-configured graphs: a Waiting child shows `INTEGRATION_DEPENDENCY_BLOCKED` while any configured parent has Blocked integration and that parent is not Closed, Abandoned, or Lost. The DAG node remains Waiting; this projection does not persist a terminal block or change eligibility, and a parent re-drive clears the displayed code.
 
 ## Remote controller
 
