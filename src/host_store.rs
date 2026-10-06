@@ -1245,10 +1245,13 @@ impl HostStore {
         // The construction installation lock is still held, as it is for
         // job-owned cleanup. Resume only durable, identity-bound replace
         // decisions; an unbound temp may belong to an in-flight facts writer.
-        if rooted.entry_exists(".mac-worker-rooted-fs")? {
-            rooted.retry_pending_owned_regulars_matching(|component, _| {
+        // Best effort: evidence the engine refuses (an abandoned namespace
+        // probe, say) must not fail every open. Upgrade inspection below
+        // still refuses with the host-root drain reason.
+        if host_root_cleanup_residue(&rooted).unwrap_or(false) {
+            let _ = rooted.retry_pending_owned_regulars_matching(|component, _| {
                 std::str::from_utf8(component).is_ok_and(parse_replace_uuid_name)
-            })?;
+            });
         }
         if (migrate || fence.is_some()) && !initialize {
             match inspect_protocol_upgrade_namespaces(&rooted, &namespaces) {
@@ -5362,18 +5365,21 @@ fn inventory_names(directory: &RootedDir, label: &str) -> Result<Vec<String>, Wo
         .collect()
 }
 
+fn host_root_cleanup_residue(root: &RootedDir) -> Result<bool, WorkerError> {
+    Ok(root.entry_exists(".mac-worker-rooted-fs")?
+        && !root
+            .open_child_directory(&relative(".mac-worker-rooted-fs")?, false)?
+            .list_names()?
+            .is_empty())
+}
+
 fn inspect_protocol_upgrade_namespaces(
     root: &RootedDir,
     namespaces: &BTreeMap<&'static str, RootedDir>,
 ) -> Result<(), WorkerError> {
     // Child namespace checks also inspect their parent. Identify host-root
     // evidence first so the operator can distinguish it from job/lease work.
-    if root.entry_exists(".mac-worker-rooted-fs")?
-        && !root
-            .open_child_directory(&relative(".mac-worker-rooted-fs")?, false)?
-            .list_names()?
-            .is_empty()
-    {
+    if host_root_cleanup_residue(root)? {
         return Err(upgrade_drain_required(
             "private cleanup residue in the host root",
         ));
@@ -6915,6 +6921,42 @@ mod review_regression_tests {
             error.public_message(),
             "private cleanup residue in the host root"
         );
+    }
+
+    #[test]
+    fn abandoned_host_root_namespace_probe_keeps_open_working_and_blocks_upgrade() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        drop(HostStore::open(&root).unwrap());
+        // A namespace probe killed before its cleanup leaves a private
+        // operation directory that the cleanup engine refuses to resume.
+        let namespace = root.join(".mac-worker-rooted-fs");
+        if !namespace.exists() {
+            fs::create_dir(&namespace).unwrap();
+        }
+        fs::set_permissions(&namespace, fs::Permissions::from_mode(0o700)).unwrap();
+        let probe = namespace.join(format!(
+            "operation-{}",
+            uuid::Uuid::from_u128(93).hyphenated()
+        ));
+        fs::create_dir(&probe).unwrap();
+        fs::set_permissions(&probe, fs::Permissions::from_mode(0o700)).unwrap();
+        let before = fs::metadata(&probe).unwrap();
+
+        drop(HostStore::open(&root).unwrap());
+        drop(HostStore::open_if_present(&root).unwrap().unwrap());
+        let after = fs::metadata(&probe).unwrap();
+        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+        assert_eq!(after.mode() & 0o7777, 0o700);
+        assert_eq!(fs::read_dir(&probe).unwrap().count(), 0);
+
+        let error = HostStore::migrate_layout(&root).unwrap_err();
+        assert_eq!(error.public_code(), "HOST_UPGRADE_DRAIN_REQUIRED");
+        assert_eq!(
+            error.public_message(),
+            "private cleanup residue in the host root"
+        );
+        assert_eq!(fs::metadata(&probe).unwrap().ino(), before.ino());
     }
 
     #[test]
