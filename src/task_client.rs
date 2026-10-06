@@ -1328,7 +1328,7 @@ impl<'a> TaskClient<'a> {
                 .before_integration_mutation(record, operation);
             }
         };
-        let mut snapshot = coordinator.snapshot(task)?;
+        let snapshot = coordinator.snapshot(task)?;
         if matches!(
             operation,
             IntegrationMutation::Cancel
@@ -1341,17 +1341,9 @@ impl<'a> TaskClient<'a> {
             && (snapshot.is_none()
                 || !coordinator.covers_latest_ordinary_work(record, snapshot.as_ref().unwrap())?)
         {
-            // Retirement can precede the finalizer's intent publication. Use
-            // the same source CAS before a stop or ordinary follow-up. Say
-            // must observe the cycle's normal busy/revoke rules in this window.
-            coordinator.on_terminal(task, last.turn_id())?;
-            snapshot = coordinator.snapshot(task)?;
-            if snapshot
-                .as_ref()
-                .is_none_or(|s| s.source_turn_id != last.turn_id())
-            {
-                return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
-            }
+            // The finalizer has not published an identity that can be stopped.
+            // Use the ordinary follow-up fence until that cycle is durable.
+            return Err(task_error("TASK_BUSY", "INTEGRATION_IN_PROGRESS"));
         }
         let Some(snapshot) = snapshot else {
             return Ok(record.clone());
@@ -1384,7 +1376,7 @@ impl<'a> TaskClient<'a> {
         if matches!(operation, IntegrationMutation::Say { new_turn: true }) {
             coordinator.check_ordinary_followup_allowance(record)?;
         }
-        match coordinator.revoke(task, snapshot.revision) {
+        match coordinator.revoke_for_stop(task, &snapshot) {
             Ok(_) => {}
             Err(e)
                 if e.public_code() == "INTEGRATION_ALREADY_COMMITTED"
@@ -3153,7 +3145,9 @@ impl<'a> TaskClient<'a> {
 
     pub fn close(&self, task_id: TaskId, discard: bool) -> Result<TaskReport, WorkerError> {
         if self.integration_enabled(task_id)? {
-            return self.close_from_expected(&self.client_state.load_task(task_id)?, discard);
+            return self.retry_integration_stop(task_id, |record| {
+                self.close_from_expected(record, discard)
+            });
         }
         self.reconcile_runners()?;
         let record = self.client_state.load_task(task_id)?;
@@ -5299,7 +5293,8 @@ impl<'a> TaskClient<'a> {
     pub fn cancel(&self, task_id: TaskId) -> Result<TaskReport, WorkerError> {
         let record = self.client_state.load_task(task_id)?;
         if self.integration_enabled(task_id)? {
-            return self.cancel_from_expected(&record);
+            return self
+                .retry_integration_stop(task_id, |record| self.cancel_from_expected(record));
         }
         if record.auto_continue_intent().is_some() {
             return self.cancel_from_expected(&record);
@@ -5307,6 +5302,30 @@ impl<'a> TaskClient<'a> {
         self.reconcile_runners()?;
         let record = self.client_state.load_task(task_id)?;
         self.cancel_from_expected(&record)
+    }
+
+    fn retry_integration_stop(
+        &self,
+        task: TaskId,
+        mutation: impl Fn(&LocalTaskRecord) -> Result<TaskReport, WorkerError>,
+    ) -> Result<TaskReport, WorkerError> {
+        let mut record = self.client_state.load_task(task)?;
+        for _ in 0..3 {
+            match mutation(&record) {
+                Err(error) if error.public_code() == "TASK_REVISION_CONFLICT" => {
+                    let current = self.client_state.load_task(task)?;
+                    // CLI stops have no caller-supplied revision. Retirement
+                    // can update the same turn; a new turn or head still fences
+                    // the request, as do the public *_from_expected methods.
+                    if !same_close_target(&current, &record) {
+                        return Err(error);
+                    }
+                    record = current;
+                }
+                result => return result,
+            }
+        }
+        Err(IntegrationCode::IntegrationStopUnconfirmed.error())
     }
 
     pub fn cancel_from_expected(
