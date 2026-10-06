@@ -1,6 +1,188 @@
 use mac_worker::test_support::integration::*;
 
 #[test]
+fn direct_followup_repairs_failed_checks_and_integrates_both_turns() {
+    use mac_worker::test_support::{
+        agents::agent::ReportedCheckStatus,
+        client_state::ClientStateStore,
+        core::paths::PathLayout,
+        session::SessionAgent,
+        task::model::{TaskId, TaskOutcome},
+    };
+    use std::{fs, os::unix::fs::PermissionsExt, sync::Arc};
+
+    let f = super::session_import_e2e::Fixture::new();
+    let origin = f.laptop.parent().unwrap().join("origin.git");
+    f.project
+        .git(&["clone", "--bare", ".", origin.to_str().unwrap()]);
+    f.project.git(&[
+        "remote",
+        "add",
+        "origin",
+        &format!("file://{}", origin.display()),
+    ]);
+    let mut config = fs::read_to_string(&f.config).unwrap();
+    config.push_str("capabilities = ['origin:file']\n");
+    fs::write(&f.config, config).unwrap();
+    let tools = f.host_root().join("tool-capabilities.json");
+    fs::write(&tools, br#"{"tools":["git"]}"#).unwrap();
+    fs::set_permissions(tools, fs::Permissions::from_mode(0o600)).unwrap();
+    f.capture_fixture(SessionAgent::Codex);
+    f.install_agent(SessionAgent::Codex);
+    let agent = f.host.join("bin/codex");
+    let script = fs::read_to_string(&agent).unwrap();
+    let install_turn = |file: &str, check: &str| {
+        let script = script
+            .replace(
+                "printf '%s\\n' \"$@\" > \"$HOME/argv\"",
+                &format!("printf '{file}\\n' > {file}\nprintf '%s\\n' \"$@\" > \"$HOME/argv\""),
+            )
+            .replace(
+                r#"\"files_changed\":[]"#,
+                &format!(r#"\"files_changed\":[],\"checks\":[{{\"name\":\"fixture-check\",\"command\":\"fixture-check\",\"status\":\"{check}\"}}]"#),
+            );
+        fs::write(&agent, script).unwrap();
+        super::session_import_e2e::warm_executable(&agent);
+    };
+    install_turn("first-turn.txt", "fail");
+    let submitted = f.worker(&[
+        "--json",
+        "task",
+        "submit",
+        "--from-session",
+        "codex",
+        "--prompt",
+        "produce work with a failing check",
+        "--integrate",
+        "main",
+        "--close-on",
+        "never",
+        "--worker",
+        "fixture",
+        "--wait",
+    ]);
+    assert!(submitted.status.success(), "{submitted:?}");
+    let task: TaskId = String::from_utf8_lossy(&submitted.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .rfind(|value| value.get("session_import").is_some())
+        .unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let paths = PathLayout {
+        config: f.config.clone(),
+        state: f.laptop.join(".local/state/mac-worker"),
+        cache: f.laptop.join(".cache/mac-worker"),
+        data: f.laptop.join(".local/share/mac-worker"),
+    };
+    let state = RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+        .unwrap();
+    let wait = || {
+        f.worker(&[
+            "--json",
+            "task",
+            "wait",
+            "--task-id",
+            &task.to_string(),
+            "--timeout",
+            "120s",
+        ])
+    };
+    let blocked = wait();
+    assert_eq!(
+        blocked.status.code(),
+        Some(i32::from(
+            IntegrationCode::IntegrationChecksFailed.error().exit_code()
+        )),
+        "{blocked:?}"
+    );
+    let first = state.load(task).unwrap().unwrap();
+    assert_eq!(first.snapshot.state, IntegrationStatus::Blocked);
+    assert_eq!(
+        first.snapshot.blocked_code,
+        Some(IntegrationCode::IntegrationChecksFailed)
+    );
+    assert_eq!(first.source_checks[0].status(), ReportedCheckStatus::Fail);
+    let origin_git = |args: &[&str]| {
+        let mut command = vec!["--git-dir", origin.to_str().unwrap()];
+        command.extend_from_slice(args);
+        let output = f.project.git(&command);
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    let target = origin_git(&["rev-parse", "main"]);
+    assert_eq!(first.cycle_base.as_str(), target);
+
+    install_turn("second-turn.txt", "pass");
+    let followup = f.worker(&[
+        "--json",
+        "task",
+        "say",
+        &task.to_string(),
+        "--message",
+        "repair the failing check",
+        "--wait",
+    ]);
+    assert!(followup.status.success(), "{followup:?}");
+    let integrated = wait();
+    let second = state.load(task).unwrap().unwrap();
+    assert!(
+        integrated.status.success(),
+        "{integrated:?}; snapshot={:?}",
+        second.snapshot
+    );
+    assert_eq!(second.snapshot.state, IntegrationStatus::Integrated);
+    assert_eq!(second.source_checks[0].status(), ReportedCheckStatus::Pass);
+    assert_eq!(second.cycle_base, first.cycle_base);
+    assert_ne!(
+        second.snapshot.source_turn_id,
+        first.snapshot.source_turn_id
+    );
+    let receipt = second.receipt.unwrap();
+    assert!(receipt.imported);
+    assert_eq!(receipt.disposition, IntegrationDisposition::Merged);
+    let merge = receipt.merge_oid.unwrap();
+    assert_eq!(origin_git(&["rev-parse", "main"]), merge.as_str());
+    assert_eq!(
+        origin_git(&["rev-list", "--parents", "-n", "1", merge.as_str()]),
+        format!("{merge} {target} {}", second.snapshot.source_head)
+    );
+    assert_eq!(
+        origin_git(&[
+            "rev-list",
+            "--count",
+            "--merges",
+            &format!("{target}..{merge}")
+        ]),
+        "1"
+    );
+    assert_eq!(
+        origin_git(&[
+            "merge-base",
+            first.snapshot.source_head.as_str(),
+            second.snapshot.source_head.as_str()
+        ]),
+        first.snapshot.source_head.as_str()
+    );
+    assert_ne!(first.snapshot.source_head, second.snapshot.source_head);
+    for file in ["first-turn.txt", "second-turn.txt"] {
+        assert_eq!(
+            origin_git(&["show", &format!("{}:{file}", second.snapshot.source_head)]),
+            file
+        );
+    }
+    let ordinary = ClientStateStore::open(&paths.state)
+        .unwrap()
+        .load_task(task)
+        .unwrap();
+    assert_eq!(ordinary.status().turns().len(), 2);
+    assert_eq!(ordinary.status().last_outcome(), Some(&TaskOutcome::Done));
+    assert_eq!(ordinary.status().head_oid(), Some(&merge));
+}
+
+#[test]
 fn review_native_target_movement_after_resolve_invalidates_the_old_evidence() {
     native_target_movement_after(IntegrationTurnPurpose::Resolve);
 }

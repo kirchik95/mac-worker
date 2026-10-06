@@ -1127,22 +1127,59 @@ fn private_lock(
 }
 pub(crate) fn record_source_base(
     paths: &PathLayout,
-    task: TaskId,
+    ordinary: &crate::task::LocalTaskRecord,
     turn: TurnId,
     base: &BaseOid,
 ) -> Result<(), WorkerError> {
-    if super::store::RootedIntegrationState::read_task(paths, task)?
-        .0
-        .is_none()
+    let task = ordinary.meta().task_id();
+    let (policy, previous) = super::store::RootedIntegrationState::read_task(paths, task)?;
+    if policy.is_none()
         || super::store::RootedIntegrationState::read_auxiliary(paths, task, turn)?.is_some()
     {
         return Ok(());
     }
+    // Freeze the integration base before launch. A replay must keep that exact
+    // value even if the task head or integration receipt has since advanced.
+    if read_source_base(paths, task, turn)?.is_some() {
+        return Ok(());
+    }
+    let receipt = previous.as_ref().and_then(|record| {
+        record
+            .receipt
+            .iter()
+            .chain(record.archived_receipts.iter().rev())
+            .find(|receipt| receipt.imported)
+    });
+    let source_base = if let Some(receipt) = receipt {
+        receipt
+            .merge_oid
+            .as_ref()
+            .unwrap_or(&receipt.target_head)
+            .clone()
+    } else {
+        // Blocked/revoked cycles and turns that never staged a cycle leave an
+        // unintegrated task head. Carry the earliest durable source base across
+        // all of them; the submit base covers histories without a sidecar.
+        let mut source_base = base.clone();
+        for prior in ordinary
+            .status()
+            .turns()
+            .iter()
+            .take_while(|prior| prior.turn_id() != turn)
+        {
+            source_base = ordinary.meta().base_oid().clone();
+            if let Some(recorded) = read_source_base(paths, task, prior.turn_id())? {
+                source_base = recorded;
+                break;
+            }
+        }
+        source_base
+    };
     let root = task_root(paths, task)?.open_child_directory(&relative("sources")?, true)?;
     write(
         &root,
         &format!("{turn}.json"),
-        &serde_json::to_vec(base).map_err(|_| invalid())?,
+        &serde_json::to_vec(&source_base).map_err(|_| invalid())?,
         true,
     )
 }
@@ -1921,6 +1958,152 @@ pub(crate) mod native_launch_tests {
         ) -> Result<crate::process::ProcessResult, WorkerError> {
             panic!("a saved redrive result must not contact Git or the helper")
         }
+    }
+
+    #[test]
+    fn source_base_uses_imported_receipts_or_the_earliest_source_base() {
+        for previous in [
+            "first",
+            "no_cycle",
+            "blocked",
+            "revoked",
+            "merged",
+            "already_integrated",
+            "blocked_after_integrated",
+            "revoked_after_integrated",
+            "unimported_receipt",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let paths = paths(&root.path().canonicalize().unwrap());
+            let state = super::super::store::RootedIntegrationState::open(
+                &paths,
+                Arc::new(ManualIntegrationRuntime::default()),
+            )
+            .unwrap();
+            let mut record = sample_record(fixture_task(), fixture_source(), "main");
+            state
+                .publish_policy(record.task_id, &record.policy)
+                .unwrap();
+            let base = record.cycle_base.clone();
+            let ordinary = sample_ordinary(record.task_id, fixture_source());
+            record_source_base(&paths, &ordinary, fixture_source(), &base).unwrap();
+            assert_eq!(
+                read_source_base(&paths, record.task_id, fixture_source()).unwrap(),
+                Some(base.clone())
+            );
+            if previous == "first" {
+                continue;
+            }
+            let target: BaseOid = "c".repeat(40).parse().unwrap();
+            let merge: BaseOid = "e".repeat(40).parse().unwrap();
+            let receipt = IntegrationReceipt {
+                integration_id: record.snapshot.integration_id,
+                epoch: 0,
+                source_turn_id: fixture_source(),
+                source_head: fixture_head(),
+                target_head: target.clone(),
+                merge_oid: (previous != "already_integrated").then_some(merge.clone()),
+                disposition: if previous == "already_integrated" {
+                    IntegrationDisposition::AlreadyIntegrated
+                } else {
+                    IntegrationDisposition::Merged
+                },
+                imported: previous != "unimported_receipt",
+                recorded_at_millis: 1002,
+            };
+            let expected = match previous {
+                "merged" | "already_integrated" => {
+                    record.snapshot.state = IntegrationStatus::Integrated;
+                    record.snapshot.disposition = Some(receipt.disposition);
+                    record.snapshot.merge_oid = receipt.merge_oid.clone();
+                    record.snapshot.observed_target_oid = Some(target.clone());
+                    record.receipt = Some(receipt);
+                    if previous == "merged" { merge } else { target }
+                }
+                "blocked_after_integrated" | "revoked_after_integrated" => {
+                    let mut older = receipt.clone();
+                    older.merge_oid = Some(target.clone());
+                    record.archived_receipts.push(older);
+                    record.archived_receipts.push(receipt);
+                    // Even a later unintegrated head must not replace the receipt head.
+                    record.cycle_base = fixture_head();
+                    merge
+                }
+                "unimported_receipt" => {
+                    record.receipt = Some(receipt);
+                    base.clone()
+                }
+                _ => base.clone(),
+            };
+            if previous.starts_with("blocked") {
+                record.snapshot.state = IntegrationStatus::Blocked;
+                record.snapshot.blocked_code = Some(IntegrationCode::IntegrationChecksFailed);
+            } else if previous.starts_with("revoked") {
+                record.snapshot.state = IntegrationStatus::Revoked;
+            }
+            if previous != "no_cycle" {
+                state
+                    .replace(record.task_id, IntegrationRevision(0), &record)
+                    .unwrap();
+            }
+            let followup = TurnId::new(uuid::Uuid::from_u128(8));
+            let ordinary = sample_ordinary_followup(record.task_id, fixture_source(), None);
+            record_source_base(&paths, &ordinary, followup, &fixture_head()).unwrap();
+            assert_eq!(
+                read_source_base(&paths, record.task_id, followup).unwrap(),
+                Some(expected.clone()),
+                "{previous}"
+            );
+            // Re-entering an old launch after receipt import must not rebind
+            // its durable base, even when the proposed launch head changes.
+            record_source_base(&paths, &ordinary, fixture_source(), &fixture_head()).unwrap();
+            assert_eq!(
+                read_source_base(&paths, record.task_id, fixture_source()).unwrap(),
+                Some(base),
+                "replay: {previous}"
+            );
+            let third = TurnId::new(uuid::Uuid::from_u128(9));
+            record_source_base(&paths, &ordinary, third, &fixture_head()).unwrap();
+            assert_eq!(
+                read_source_base(&paths, record.task_id, third).unwrap(),
+                Some(expected.clone()),
+                "transitive: {previous}"
+            );
+            let client = ClientStateStore::open(&paths.state).unwrap();
+            assert_eq!(
+                owner_facts(&paths, &client, ordinary).unwrap().cycle_base,
+                expected,
+                "facts: {previous}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_base_recording_skips_disabled_tasks_and_auxiliary_turns() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = paths(&root.path().canonicalize().unwrap());
+        let ordinary = sample_ordinary(fixture_task(), fixture_source());
+        record_source_base(&paths, &ordinary, fixture_source(), &fixture_head()).unwrap();
+        assert!(!paths.state.join("integrations").exists());
+
+        let state = super::super::store::RootedIntegrationState::open(
+            &paths,
+            Arc::new(ManualIntegrationRuntime::default()),
+        )
+        .unwrap();
+        let mut record = sample_record(fixture_task(), fixture_source(), "main");
+        record.candidates.push(sample_candidate(&record));
+        state
+            .publish_policy(record.task_id, &record.policy)
+            .unwrap();
+        let prepared = sample_prepared_turn(&record, IntegrationTurnPurpose::Resolve, 1, 1);
+        state.publish_prepared(record.task_id, &prepared).unwrap();
+        let turn = prepared.followup.turn_id();
+        record_source_base(&paths, &ordinary, turn, &fixture_head()).unwrap();
+        assert_eq!(
+            read_source_base(&paths, record.task_id, turn).unwrap(),
+            None
+        );
     }
 
     #[test]
