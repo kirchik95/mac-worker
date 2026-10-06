@@ -1,0 +1,7 @@
+# Pool workers: fetch and unpack every locked crate before the agent starts.
+# The agent sandbox can read ~/.cargo but cannot download into it.
+[setup]
+timeout = "10m"
+commands = ["cargo fetch --locked"]
+check = "cargo fetch --locked --offline"
+lockfiles = ["Cargo.lock"]
