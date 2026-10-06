@@ -1491,7 +1491,8 @@ impl<'a> TaskStore<'a> {
             status.diff_stat().map(str::to_owned),
             status.turns().to_vec(),
             now_millis,
-        )?;
+        )?
+        .copying_reported_checks(&status)?;
         let next = replace_status_bytes(&task, status, next)?;
         if workspace_present {
             self.store
@@ -1807,6 +1808,9 @@ impl<'a> TaskStore<'a> {
             Some(now_millis()?),
             None,
         );
+        // The last result (summary, files and agent-reported checks) stays
+        // visible while the next turn runs, as on the owner's follow-up
+        // record; finish_turn replaces it with that turn's own result.
         let next = TaskStatus::new(
             TaskState::Active,
             current.last_outcome().cloned(),
@@ -1824,7 +1828,8 @@ impl<'a> TaskStore<'a> {
             current.diff_stat().map(str::to_owned),
             current.turns().iter().cloned().chain([pending]).collect(),
             now_millis()?,
-        )?;
+        )?
+        .copying_reported_checks(&current)?;
         replace_status_bytes(&task, current, next.clone())?;
         task.sync_root()?;
         Ok((meta, next))
@@ -2457,7 +2462,8 @@ impl<'a> TaskStore<'a> {
                 status.diff_stat().map(str::to_owned),
                 status.turns().iter().cloned().chain([pending]).collect(),
                 status.updated_at_millis(),
-            )?;
+            )?
+            .copying_reported_checks(&status)?;
             replace_status_bytes(task, status, next)?;
             return Ok(());
         }
@@ -3475,6 +3481,61 @@ mod tests {
         let mut expected = serde_json::to_value(&finished).unwrap();
         expected["turns"][0]["herdr"] = serde_json::to_value(&report).unwrap();
         assert_eq!(serde_json::to_value(&recorded).unwrap(), expected);
+    }
+
+    #[test]
+    fn retention_close_keeps_the_reported_checks() {
+        // An explicit close already kept them; the GC close rebuilt the
+        // status without them and the retained result lost its checks.
+        let temp = tempdir().unwrap();
+        let store = HostStore::open(&temp.path().join("host")).unwrap();
+        let task_id = TaskId::new(Uuid::from_u128(1));
+        let task = store
+            .open_task_directory(PROJECT_ID, task_id, true)
+            .unwrap();
+        let checks = vec![crate::agent::ReportedCheck::new(
+            "unit",
+            "cargo test",
+            crate::agent::ReportedCheckStatus::Fail,
+            "1 failed",
+        )];
+        let open = TaskStatus::new(
+            TaskState::Open,
+            Some(TaskOutcome::Done),
+            Some("worker".into()),
+            true,
+            None,
+            Some("done".into()),
+            Vec::new(),
+            vec!["src/lib.rs".into()],
+            None,
+            vec![TurnSummary::new(
+                1,
+                JobId::new(Uuid::from_u128(2)),
+                Some(TurnTerminal::Succeeded),
+                Some(TaskOutcome::Done),
+                Some(true),
+                false,
+                Some(1),
+                Some(2),
+            )],
+            2,
+        )
+        .unwrap()
+        .with_reported_checks(checks.clone())
+        .unwrap();
+        write_record_once(&task, "status.json", &open).unwrap();
+
+        let tasks = TaskStore::new(&store, &SystemProcessRunner);
+        let closed = tasks
+            .close_for_retention(PROJECT_ID, task_id, 3)
+            .unwrap()
+            .expect("an idle open task closes for retention")
+            .status;
+        assert_eq!(closed.state(), TaskState::Closed);
+        assert_eq!(closed.updated_at_millis(), 3);
+        assert_eq!(closed.reported_checks(), checks.as_slice());
+        assert_eq!(tasks.load_status(PROJECT_ID, task_id).unwrap(), closed);
     }
 
     #[test]
