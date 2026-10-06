@@ -15,6 +15,14 @@ use crate::error::{ProcessError, ProcessStream, WorkerError};
 const PROCESS_GROUP_KILL_BUDGET: Duration = Duration::from_secs(2);
 // Escaped descendants can retain pipe FDs even after the owned group is gone.
 const TERMINATED_DRAIN_GRACE: Duration = Duration::from_secs(2);
+// Capture, stdin and exit events wake the poll loop at once and its waits end
+// at the deadline, so this interval only sets how soon a `should_stop` that
+// turned true is noticed: far below the 2 s kill and drain budgets and any
+// Ctrl-C delay an operator notices, with 20 timers a second instead of 500.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+// Status polling once every event sender is gone, which only happens when the
+// exit watcher could not start: then nothing else wakes the loop on exit.
+const DISCONNECTED_STATUS_POLL: Duration = Duration::from_millis(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessPolicy {
@@ -234,6 +242,34 @@ impl ProcessRunner for InheritProcessGroupRunner {
     }
 }
 
+/// Wait policy of the poll loop. Unit tests stand in a lost timer wakeup with
+/// a much longer interval and observe the loop right before each wait.
+struct PollControl {
+    interval: Duration,
+    #[cfg(test)]
+    before_wait: Option<Arc<dyn Fn(PollObservation) + Send + Sync>>,
+}
+
+impl PollControl {
+    fn production() -> Self {
+        Self {
+            interval: POLL_INTERVAL,
+            #[cfg(test)]
+            before_wait: None,
+        }
+    }
+}
+
+/// What the poll loop has observed when it is about to wait.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+struct PollObservation {
+    status: bool,
+    stdout: bool,
+    stderr: bool,
+    stdin: bool,
+}
+
 impl SystemProcessRunner {
     fn run_with_session(
         &self,
@@ -241,10 +277,21 @@ impl SystemProcessRunner {
         session: SessionKind,
         should_stop: &dyn Fn() -> bool,
     ) -> ProcessCompletion {
+        self.run_with_poll(request, session, should_stop, &PollControl::production())
+    }
+
+    fn run_with_poll(
+        &self,
+        request: &ProcessRequest,
+        session: SessionKind,
+        should_stop: &dyn Fn() -> bool,
+        control: &PollControl,
+    ) -> ProcessCompletion {
         // A spawn failure proves that no child or I/O threads existed. Once a
         // child exists, only observed reap/group absence AND joins restore it.
         let mut cleanup = CleanupState::Completed;
-        let outcome = self.run_with_session_inner(request, session, should_stop, &mut cleanup);
+        let outcome =
+            self.run_with_session_inner(request, session, should_stop, control, &mut cleanup);
         ProcessCompletion { outcome, cleanup }
     }
 
@@ -253,6 +300,7 @@ impl SystemProcessRunner {
         request: &ProcessRequest,
         session: SessionKind,
         should_stop: &dyn Fn() -> bool,
+        control: &PollControl,
         cleanup: &mut CleanupState,
     ) -> Result<ProcessResult, WorkerError> {
         let mut command = Command::new(&request.program);
@@ -334,7 +382,9 @@ impl SystemProcessRunner {
         } else {
             None
         };
-        drop(sender);
+        // The watcher takes the last sender: the channel disconnects only
+        // once it and every I/O thread are done.
+        spawn_exit_watcher(child.id(), sender);
 
         let started = Instant::now();
         let mut status = None;
@@ -342,9 +392,10 @@ impl SystemProcessRunner {
         let mut stderr = None;
         let mut stdin_complete = stdin_handle.is_none();
         let mut stdin_error = None;
+        let mut woken_by = None;
 
         loop {
-            while let Ok(event) = receiver.try_recv() {
+            while let Some(event) = woken_by.take().or_else(|| receiver.try_recv().ok()) {
                 match event {
                     ProcessEvent::Captured(stream, Ok(CaptureOutcome::Complete(bytes))) => {
                         match stream {
@@ -383,6 +434,8 @@ impl SystemProcessRunner {
                         stdin_complete = true;
                     }
                     ProcessEvent::Stdin(Ok(())) => stdin_complete = true,
+                    // Only a wakeup: `try_wait` below still reaps the child.
+                    ProcessEvent::Exited => {}
                 }
             }
 
@@ -405,7 +458,8 @@ impl SystemProcessRunner {
                 return Err(ProcessError::Cancelled.into());
             }
 
-            if started.elapsed() >= request.policy.deadline {
+            let elapsed = started.elapsed();
+            if elapsed >= request.policy.deadline {
                 *cleanup = cleanup_terminated_child(
                     &mut child,
                     process_group,
@@ -420,7 +474,21 @@ impl SystemProcessRunner {
                 .into());
             }
 
-            thread::sleep(Duration::from_millis(2));
+            #[cfg(test)]
+            if let Some(observe) = &control.before_wait {
+                observe(PollObservation {
+                    status: status.is_some(),
+                    stdout: stdout.is_some(),
+                    stderr: stderr.is_some(),
+                    stdin: stdin_complete,
+                });
+            }
+            woken_by = wait_for_event(
+                &receiver,
+                control
+                    .interval
+                    .min(request.policy.deadline.saturating_sub(elapsed)),
+            );
         }
 
         join_threads(stdout_handle, stderr_handle, stdin_handle)?;
@@ -444,6 +512,51 @@ impl SystemProcessRunner {
 enum ProcessEvent {
     Captured(ProcessStream, io::Result<CaptureOutcome>),
     Stdin(io::Result<()>),
+    /// The exit watcher returned: the child exited, or it can no longer wait.
+    Exited,
+}
+
+/// Blocks until the next event or `timeout`. Every completion event wakes the
+/// loop directly, so finishing a run never depends on a timer firing; a timer
+/// lost across system sleep can only delay cancellation and the deadline.
+fn wait_for_event(
+    receiver: &mpsc::Receiver<ProcessEvent>,
+    timeout: Duration,
+) -> Option<ProcessEvent> {
+    match receiver.recv_timeout(timeout) {
+        Ok(event) => Some(event),
+        Err(mpsc::RecvTimeoutError::Timeout) => None,
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            thread::sleep(DISCONNECTED_STATUS_POLL.min(timeout));
+            None
+        }
+    }
+}
+
+/// Sends `Exited` once `pid` has exited, without reaping it: WNOWAIT leaves
+/// the status for `try_wait`, which stays the only reaper, so the status and
+/// every cleanup path are unchanged. The thread holds nothing of the child and
+/// is never joined: after the reap `waitid` fails at once with ECHILD. If the
+/// thread cannot start, the loop still wakes on its bounded interval.
+fn spawn_exit_watcher(pid: u32, sender: mpsc::Sender<ProcessEvent>) {
+    let _ = thread::Builder::new().spawn(move || {
+        loop {
+            let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+            // SAFETY: `info` is a writable siginfo_t for the duration of the call.
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    info.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if result == 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                break;
+            }
+        }
+        let _ = sender.send(ProcessEvent::Exited);
+    });
 }
 
 enum CaptureOutcome {
@@ -809,6 +922,124 @@ mod tests {
             assert_eq!(tracked.stdout, legacy.stdout);
             assert_eq!(tracked.stderr, legacy.stderr);
         }
+    }
+
+    /// Stands in for a timer wakeup lost across system sleep: the production
+    /// loop waits a bounded interval, these runs would wait an hour.
+    const LOST_WAKEUP: Duration = Duration::from_secs(3600);
+
+    /// Runs `request` with an hour-long poll interval on a helper thread, so a
+    /// loop that waits on its timer instead of an event fails the test after
+    /// the coordination timeout rather than hanging it.
+    fn run_with_lost_wakeup(
+        mut request: ProcessRequest,
+        before_wait: impl Fn(PollObservation) + Send + Sync + 'static,
+    ) -> ProcessCompletion {
+        request.policy.deadline = LOST_WAKEUP;
+        let control = PollControl {
+            interval: LOST_WAKEUP,
+            before_wait: Some(Arc::new(before_wait)),
+        };
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let completion = SystemProcessRunner.run_with_poll(
+                &request,
+                SessionKind::NewProcessGroup,
+                &|| false,
+                &control,
+            );
+            let _ = sender.send(completion);
+        });
+        receiver
+            .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)
+            .expect("the poll loop waited on its timer instead of a process event")
+    }
+
+    fn fixture_fifo(temp: &tempfile::TempDir) -> std::path::PathBuf {
+        let fifo = temp.path().join("gate");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        fifo
+    }
+
+    /// Opens `fifo` for writing once `observed` fires, writes `bytes` and
+    /// closes it; the blocked reader then sees them followed by EOF.
+    fn release_fifo_after(
+        observed: mpsc::Receiver<()>,
+        fifo: std::path::PathBuf,
+        bytes: &'static [u8],
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            observed
+                .recv()
+                .expect("the poll loop never reached the observed state");
+            let mut writer = std::fs::OpenOptions::new().write(true).open(fifo).unwrap();
+            writer.write_all(bytes).unwrap();
+        })
+    }
+
+    #[test]
+    fn written_stdin_and_captures_complete_without_a_timer_wakeup() {
+        // Drain stdin first so the one-byte write cannot race the exit.
+        let mut request = cleanup_request("cat >/dev/null; printf out; printf err >&2");
+        request.stdin = Some(b"x".to_vec());
+        let completion = run_with_lost_wakeup(request, |_| {});
+        assert_eq!(completion.cleanup, CleanupState::Completed);
+        let result = completion.outcome.unwrap();
+        assert!(result.status.success());
+        assert_eq!(result.stdout, b"out");
+        assert_eq!(result.stderr, b"err");
+    }
+
+    #[test]
+    fn capture_after_an_observed_exit_completes_without_a_timer_wakeup() {
+        // The incident state: stdin written and the exit reaped while both
+        // captures are still pending. An exec'd grandchild holds the output
+        // pipes until the FIFO is released after the loop saw that state.
+        let temp = tempfile::tempdir().unwrap();
+        let fifo = fixture_fifo(&temp);
+        let mut request = cleanup_request(&format!(
+            "cat >/dev/null; printf out; printf err >&2; /bin/cat '{}' & exit 0",
+            fifo.display()
+        ));
+        request.stdin = Some(b"x".to_vec());
+        let (observed, gate) = mpsc::channel();
+        let release = release_fifo_after(gate, fifo, b"late");
+        let completion = run_with_lost_wakeup(request, move |seen| {
+            if seen.status && seen.stdin && !seen.stdout && !seen.stderr {
+                let _ = observed.send(());
+            }
+        });
+        release.join().unwrap();
+        let result = completion.outcome.unwrap();
+        assert!(result.status.success());
+        assert_eq!(result.stdout, b"outlate");
+        assert_eq!(result.stderr, b"err");
+    }
+
+    #[test]
+    fn exit_after_observed_captures_completes_without_a_timer_wakeup() {
+        // Both captures finish first; only the child's later exit is left.
+        let temp = tempfile::tempdir().unwrap();
+        let fifo = fixture_fifo(&temp);
+        let request = cleanup_request(&format!(
+            "printf out; printf err >&2; exec >/dev/null 2>&1; read line <'{}'; exit 7",
+            fifo.display()
+        ));
+        let (observed, gate) = mpsc::channel();
+        let release = release_fifo_after(gate, fifo, b"");
+        let completion = run_with_lost_wakeup(request, move |seen| {
+            if seen.stdout && seen.stderr && !seen.status {
+                let _ = observed.send(());
+            }
+        });
+        release.join().unwrap();
+        assert_eq!(completion.cleanup, CleanupState::Completed);
+        let result = completion.outcome.unwrap();
+        // try_wait still reaps the exit status the watcher only observed.
+        assert_eq!(result.status.code(), Some(7));
+        assert_eq!(result.stdout, b"out");
+        assert_eq!(result.stderr, b"err");
     }
 
     #[test]
