@@ -978,6 +978,8 @@ The human ready line is `ready journal_id=<uuid> oldest_seq=<n> head_seq=<n>`. E
 
 When the journal is replaced, the cursor falls before the retained window, or the cursor is ahead of the head, the command prints `snapshot_required reason=journal_changed`, `cursor_expired`, or `cursor_ahead`, then a new ready line, and continues from that head. It does not backfill. Ctrl-C stops the tail and exits 0.
 
+If one read cycle makes no progress for 150 seconds of awake time, the command prints `event follow stalled; restarting` on stderr and restarts itself with the same arguments in the same process. The restart prints a new ready line and does not backfill the gap. If Ctrl-C was already pressed, it exits 0 instead. If the restart fails, it exits 69.
+
 Both `worker events` and `worker notify` require `[controller] enabled = true`. Otherwise they exit 64. The public line is `CONFIG: configuration error`, followed by the catalog hint to check configuration syntax; that line does not itself say "controller mode". Against a controller that does not advertise `controller.events` — including an older helper whose feature list is missing — `worker events -f` prints `CONTROLLER_EVENTS_UNSUPPORTED: worker unavailable` and exits 69. It does not emulate the feed. A tail batch that does not follow its cursor exits 70 (`CONTROLLER_EVENTS_INVALID: protocol error`).
 
 ### Laptop notifications
@@ -990,6 +992,7 @@ Confirm the installed grammar with `worker notify --help`. `worker notify` turns
 
 - `worker notify` reconciles the current attention set once and exits. It allows 30 seconds. Exit 0 means that baseline finished. Exit 69 means it did not, with one explicit line: `eligibility unknown: controller events unsupported`, `eligibility unknown: controller discovery unavailable; baseline incomplete`, `notification baseline incomplete: confirmation or repair unavailable`, or `notification baseline incomplete: deadline exhausted`.
 - `worker notify --follow` keeps running until Ctrl-C. Ctrl-C stops further reads and new banners and exits 0, including when the baseline is not finished yet. A banner already being handed to a channel can use the rest of its 2 second budget.
+- If one confirmation cycle makes no progress for 150 seconds of awake time, `worker notify --follow` prints `notification follow stalled; restarting` and restarts itself with the same arguments in the same process. Saved decisions are not shown again. If Ctrl-C was already pressed, it prints `notification follow stalled; exiting after Ctrl-C` and exits 0. If the restart fails, it exits 69.
 - One notifier owns a given controller. A second copy prints `CONTROLLER_EVENTS_NOTIFY_LOCK_HELD: protocol error` and exits 70 instead of posting a second set of banners.
 - Diagnostics are text on stderr. Global `--json` is accepted and does not change that text.
 - There is no reset and no delete command for the notifier cache.

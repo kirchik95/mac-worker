@@ -12,9 +12,9 @@ use std::{
 use crate::error::{ProcessError, ProcessStream, WorkerError};
 
 // A fork racing killpg can survive the first signal in the owned group.
-const PROCESS_GROUP_KILL_BUDGET: Duration = Duration::from_secs(2);
+pub(crate) const PROCESS_GROUP_KILL_BUDGET: Duration = Duration::from_secs(2);
 // Escaped descendants can retain pipe FDs even after the owned group is gone.
-const TERMINATED_DRAIN_GRACE: Duration = Duration::from_secs(2);
+pub(crate) const TERMINATED_DRAIN_GRACE: Duration = Duration::from_secs(2);
 // Capture, stdin and exit events wake the poll loop at once and its waits end
 // at the deadline, so this interval only sets how soon a `should_stop` that
 // turned true is noticed: far below the 2 s kill and drain budgets and any
