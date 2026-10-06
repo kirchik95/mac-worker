@@ -215,7 +215,7 @@ pub(crate) fn log_auto_continue_failure(
 /// Host cancel/status already shows this turn finished `done`. The call did
 /// not cancel it; the owner record had simply not imported that status yet.
 fn host_turn_finished_done(status: &TaskStatus, turn_id: TurnId) -> bool {
-    status.state() != TaskState::Active
+    status.state() == TaskState::Open
         && status.turns().last().is_some_and(|turn| {
             turn.turn_id() == turn_id
                 && turn.terminal().is_some()
@@ -3304,20 +3304,21 @@ impl<'a> TaskClient<'a> {
             && record.status().worker().is_some()
         {
             let worker = task_worker(self.config, record.status())?;
-            let observed = RemoteJobClient::new(self.runner)
-                .task_status(
-                    worker,
-                    &crate::task_store::TaskStatusRequest::new(record.meta().project_id(), task_id),
-                )?
-                .status()
-                .clone();
-            if host_turn_finished_done(&observed, turn_id) {
-                let stopped = self.commit_observed_terminal_done(
-                    &record,
-                    observed,
-                    IntegrationMutation::Close,
-                )?;
-                return self.close_settled(stopped.clone(), &stopped, discard);
+            // A dead transport is the same Active owner the operator already
+            // sees: TASK_BUSY, not an SSH error after the timeout.
+            if let Ok(response) = RemoteJobClient::new(self.runner).task_status(
+                worker,
+                &crate::task_store::TaskStatusRequest::new(record.meta().project_id(), task_id),
+            ) {
+                let observed = response.status().clone();
+                if host_turn_finished_done(&observed, turn_id) {
+                    let stopped = self.commit_observed_terminal_done(
+                        &record,
+                        observed,
+                        IntegrationMutation::Close,
+                    )?;
+                    return self.close_settled(stopped.clone(), &stopped, discard);
+                }
             }
         }
         if let Some(reason) = self.operator_busy_reason(task_id, &record)?

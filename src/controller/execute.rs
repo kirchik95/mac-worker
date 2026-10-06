@@ -307,13 +307,69 @@ impl TaskSubmitHandler<'_> {
         }
     }
 
-    /// Imported integration whose accepted head is already the owner head,
-    /// with no runner or queue row left to retire.
-    fn settled_imported_commit(&self, task_id: crate::task::TaskId) -> Result<bool, WorkerError> {
+    /// Latest ordinary (non-auxiliary) turn: the only turn a cycle covers.
+    fn latest_ordinary_turn(
+        &self,
+        record: &crate::task::LocalTaskRecord,
+    ) -> Result<Option<crate::task::TurnId>, WorkerError> {
+        for turn in record.status().turns().iter().rev() {
+            if crate::integration::store::RootedIntegrationState::read_auxiliary(
+                self.paths,
+                record.meta().task_id(),
+                turn.turn_id(),
+            )?
+            .is_none()
+            {
+                return Ok(Some(turn.turn_id()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The cycle of the frozen request's own latest ordinary turn, while no
+    /// newer ordinary turn exists. A different turn's cycle is a real conflict.
+    fn frozen_turn_cycle(
+        &self,
+        expected: &crate::task::LocalTaskRecord,
+    ) -> Result<
+        Option<(
+            crate::task::LocalTaskRecord,
+            crate::integration::contracts::IntegrationRecord,
+        )>,
+        WorkerError,
+    > {
+        let task_id = expected.meta().task_id();
         let current = self.client_state.load_task(task_id)?;
         let (_, integration) =
             crate::integration::store::RootedIntegrationState::read_task(self.paths, task_id)?;
-        Ok(integration.as_ref().is_some_and(|record| {
+        let Some(record) = integration else {
+            return Ok(None);
+        };
+        let source = Some(record.snapshot.source_turn_id);
+        if self.latest_ordinary_turn(expected)? != source
+            || self.latest_ordinary_turn(&current)? != source
+        {
+            return Ok(None);
+        }
+        Ok(Some((current, record)))
+    }
+
+    /// Imported integration whose accepted head is already the owner head,
+    /// with no runner or queue row left to retire. An unbound freeze has no
+    /// stored epoch, so only epoch 0 is that freeze's cycle; a later epoch is
+    /// a different cycle. Bound replays already fenced the epoch in decode.
+    fn settled_imported_commit(
+        &self,
+        expected: &crate::task::LocalTaskRecord,
+        initial_epoch_only: bool,
+    ) -> Result<bool, WorkerError> {
+        let Some((current, record)) = self.frozen_turn_cycle(expected)? else {
+            return Ok(false);
+        };
+        if initial_epoch_only && record.snapshot.epoch != 0 {
+            return Ok(false);
+        }
+        Ok(
             record.snapshot.state == crate::integration::contracts::IntegrationStatus::Integrated
                 && record.receipt.as_ref().is_some_and(|receipt| {
                     let accepted = receipt.merge_oid.as_ref().unwrap_or(&receipt.target_head);
@@ -322,36 +378,87 @@ impl TaskSubmitHandler<'_> {
                         && current.fetched_head() == Some(accepted)
                 })
                 && current.runner().is_none()
-        }) && self
-            .client_state
-            .queue_entry_for_task_turn(task_id)?
-            .is_none())
+                && self
+                    .client_state
+                    .queue_entry_for_task_turn(expected.meta().task_id())?
+                    .is_none(),
+        )
+    }
+
+    /// Receipt recorded for this freeze's cycle, not yet imported and settled.
+    /// The replay must stay resumable instead of revoking or saving a conflict.
+    fn pending_unimported_receipt(
+        &self,
+        expected: &crate::task::LocalTaskRecord,
+        initial_epoch_only: bool,
+    ) -> Result<bool, WorkerError> {
+        if self.settled_imported_commit(expected, initial_epoch_only)? {
+            return Ok(false);
+        }
+        let Some((_, record)) = self.frozen_turn_cycle(expected)? else {
+            return Ok(false);
+        };
+        if initial_epoch_only && record.snapshot.epoch != 0 {
+            return Ok(false);
+        }
+        Ok(record.receipt.is_some())
+    }
+
+    fn prepared_expected(prepared: &PreparedTaskMutation) -> Option<&crate::task::LocalTaskRecord> {
+        match prepared {
+            PreparedTaskMutation::Cancel { expected, .. }
+            | PreparedTaskMutation::Close { expected, .. } => Some(expected),
+            PreparedTaskMutation::Say { .. } => None,
+        }
     }
 
     fn execute_prepared_mutation(
         &self,
         record: &crate::controller::DurableRequest,
     ) -> Result<Value, WorkerError> {
-        let prepared = decode_prepared_mutation(self.paths, self.client_state, record.prepared())?;
-        if let PreparedTaskMutation::Close { expected, .. } = &prepared {
+        let unbound = record.prepared().get("integration_id").is_none();
+        let mut prepared =
+            decode_prepared_mutation(self.paths, self.client_state, record.prepared())?;
+        if unbound
+            && let Some(expected) = Self::prepared_expected(&prepared)
+            && self.pending_unimported_receipt(expected, true)?
+        {
+            return Err(
+                crate::integration::contracts::IntegrationCode::IntegrationStopUnconfirmed.error(),
+            );
+        }
+        // An unbound close frozen before the record existed cannot be
+        // refreshed by a binding. Once that same turn's commit is imported,
+        // refresh like the bound path and close. Cancel of the same state
+        // stays a committed refusal below.
+        let refreshed_close = if let PreparedTaskMutation::Close { expected, .. } = &prepared {
             let current = self.client_state.load_task(expected.meta().task_id())?;
-            if let Err(error) = validate_close_target(&current, expected) {
-                // A close frozen before the integration record existed cannot
-                // be refreshed by decode. Once that cycle has imported, the
-                // stale revision is a committed result, not a final conflict.
-                if error.public_code() == "TASK_REVISION_CONFLICT"
-                    && self.settled_imported_commit(expected.meta().task_id())?
+            match validate_close_target(&current, expected) {
+                Ok(()) => None,
+                Err(error)
+                    if error.public_code() == "TASK_REVISION_CONFLICT"
+                        && self.settled_imported_commit(expected, unbound)? =>
                 {
-                    return Ok(rejection_result(
-                        &crate::integration::contracts::IntegrationCode::IntegrationAlreadyCommitted
-                            .error(),
-                    ));
+                    Some(current)
                 }
-                // Preserve the read-only close rejection, including terminal
-                // targets. Execution keeps unfinished effects retryable and
-                // the store settles definitive typed revision conflicts.
-                return Ok(rejection_result(&error));
+                Err(error)
+                    if error.public_code() == "TASK_REVISION_CONFLICT"
+                        && self.pending_unimported_receipt(expected, unbound)? =>
+                {
+                    return Err(
+                        crate::integration::contracts::IntegrationCode::IntegrationStopUnconfirmed
+                            .error(),
+                    );
+                }
+                Err(error) => return Ok(rejection_result(&error)),
             }
+        } else {
+            None
+        };
+        if let Some(current) = refreshed_close
+            && let PreparedTaskMutation::Close { expected, .. } = &mut prepared
+        {
+            *expected = current;
         }
         let client = TaskClient::new(
             self.runner,
@@ -361,11 +468,11 @@ impl TaskSubmitHandler<'_> {
             &DETACHED_EXECUTOR,
         );
         let report = match execute_task_mutation(&client, &prepared) {
-            Err(error)
-                if error.public_code() == "INTEGRATION_ALREADY_COMMITTED"
-                    && matches!(prepared, PreparedTaskMutation::Cancel { .. }) =>
-            {
-                if !self.settled_imported_commit(prepared.task_id())? {
+            Err(error) if error.public_code() == "INTEGRATION_ALREADY_COMMITTED" => {
+                let PreparedTaskMutation::Cancel { expected, .. } = &prepared else {
+                    return Err(error);
+                };
+                if !self.settled_imported_commit(expected, false)? {
                     return Err(
                         crate::integration::contracts::IntegrationCode::IntegrationStopUnconfirmed
                             .error(),
@@ -386,15 +493,22 @@ impl TaskSubmitHandler<'_> {
                         Some(report) => report,
                         None => return Err(error),
                     }
-                } else if self.settled_imported_commit(prepared.task_id())? {
-                    // Same unbound freeze as close above: the store would
-                    // otherwise save this as a final "task changed before
-                    // cancel" and never surface the committed import.
-                    return Ok(rejection_result(
-                        &crate::integration::contracts::IntegrationCode::IntegrationAlreadyCommitted
-                            .error(),
-                    ));
                 } else {
+                    let expected = Self::prepared_expected(&prepared).expect("cancel or close");
+                    if matches!(prepared, PreparedTaskMutation::Cancel { .. })
+                        && self.settled_imported_commit(expected, unbound)?
+                    {
+                        return Ok(rejection_result(
+                            &crate::integration::contracts::IntegrationCode::IntegrationAlreadyCommitted
+                                .error(),
+                        ));
+                    }
+                    if self.pending_unimported_receipt(expected, unbound)? {
+                        return Err(
+                            crate::integration::contracts::IntegrationCode::IntegrationStopUnconfirmed
+                                .error(),
+                        );
+                    }
                     return Err(error);
                 }
             }

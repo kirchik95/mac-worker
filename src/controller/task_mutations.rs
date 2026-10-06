@@ -15,7 +15,7 @@ use crate::{
     integration::{contracts::*, store::RootedIntegrationState},
     paths::PathLayout,
     prepared_followup::PreparedFollowup,
-    task::{LocalTaskRecord, TaskId, TurnId, TurnSummary},
+    task::{LocalTaskRecord, TaskId, TaskOutcome, TaskState, TurnId, TurnSummary},
     task_client::{TaskClient, TaskReport, task_error},
 };
 
@@ -49,6 +49,85 @@ struct IntegrationMutationBinding {
     integration_id: IntegrationId,
     epoch: u32,
     mutation: PreparedTaskMutation,
+}
+
+fn latest_ordinary_turn(
+    paths: &PathLayout,
+    record: &LocalTaskRecord,
+) -> Result<Option<TurnId>, WorkerError> {
+    for turn in record.status().turns().iter().rev() {
+        if RootedIntegrationState::read_auxiliary(paths, record.meta().task_id(), turn.turn_id())?
+            .is_none()
+        {
+            return Ok(Some(turn.turn_id()));
+        }
+    }
+    Ok(None)
+}
+
+/// Unbound cancel/close has no cycle binding, so decode never refreshed it.
+/// Importing this freeze's own Active turn as terminal Done, with a policy
+/// already published, is the stop's allowed progress. A new turn, a different
+/// meta, or a later epoch stays stale and conflicts at execution.
+fn refresh_unbound_done_import(
+    paths: &PathLayout,
+    store: &ClientStateStore,
+    mutation: &mut PreparedTaskMutation,
+) -> Result<(), WorkerError> {
+    let task = match &*mutation {
+        PreparedTaskMutation::Cancel { expected, .. }
+        | PreparedTaskMutation::Close { expected, .. } => expected.meta().task_id(),
+        PreparedTaskMutation::Say { .. } => return Ok(()),
+    };
+    let current = match store.load_task(task) {
+        Ok(current) => current,
+        Err(_) => return Ok(()),
+    };
+    let refresh = match &*mutation {
+        PreparedTaskMutation::Cancel { expected, .. }
+        | PreparedTaskMutation::Close { expected, .. } => {
+            let same_identity = current.meta() == expected.meta()
+                && current
+                    .status()
+                    .turns()
+                    .iter()
+                    .map(TurnSummary::turn_id)
+                    .eq(expected.status().turns().iter().map(TurnSummary::turn_id));
+            let imported_done = expected.status().state() == TaskState::Active
+                && expected
+                    .status()
+                    .turns()
+                    .last()
+                    .is_some_and(|turn| turn.terminal().is_none())
+                && current.status().state() == TaskState::Open
+                && current.status().turns().last().is_some_and(|turn| {
+                    turn.terminal().is_some() && turn.outcome() == Some(&TaskOutcome::Done)
+                });
+            if !same_identity || !imported_done {
+                false
+            } else {
+                let (policy, record) = RootedIntegrationState::read_task(paths, task)?;
+                if policy.is_none() {
+                    false
+                } else if let Some(record) = record.as_ref() {
+                    record.snapshot.epoch == 0
+                        && latest_ordinary_turn(paths, &current)?
+                            == Some(record.snapshot.source_turn_id)
+                } else {
+                    true
+                }
+            }
+        }
+        PreparedTaskMutation::Say { .. } => false,
+    };
+    if refresh {
+        match mutation {
+            PreparedTaskMutation::Cancel { expected, .. }
+            | PreparedTaskMutation::Close { expected, .. } => *expected = current,
+            PreparedTaskMutation::Say { .. } => {}
+        }
+    }
+    Ok(())
 }
 
 fn expected_record(mutation: &PreparedTaskMutation) -> &LocalTaskRecord {
@@ -91,8 +170,10 @@ pub(super) fn decode_prepared_mutation(
     value: &Value,
 ) -> Result<PreparedTaskMutation, WorkerError> {
     if value.get("integration_id").is_none() {
-        return serde_json::from_value(value.clone())
-            .map_err(|_| invalid_request("prepared mutation is invalid"));
+        let mut mutation = serde_json::from_value(value.clone())
+            .map_err(|_| invalid_request("prepared mutation is invalid"))?;
+        refresh_unbound_done_import(paths, store, &mut mutation)?;
+        return Ok(mutation);
     }
     let mut bound: IntegrationMutationBinding = serde_json::from_value(value.clone())
         .map_err(|_| IntegrationCode::IntegrationStateInvalid.error())?;
