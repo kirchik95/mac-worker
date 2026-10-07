@@ -593,12 +593,12 @@ pub(crate) fn terminate_exact_recorded_group(
         }
     }
 
-    runtime.signal_process_group(child.pid(), libc::SIGTERM)?;
+    let _ = signal_group_while_draining(runtime, child.pid(), libc::SIGTERM)?;
     wait_full_reconciliation_grace(runtime)?;
     match runtime.observe(child) {
         ProcessObservation::Absent => require_absent_group(runtime, child.pid()),
         ProcessObservation::Matching { process_group } if process_group == child.pid() => {
-            runtime.signal_process_group(child.pid(), libc::SIGKILL)?;
+            let _ = signal_group_while_draining(runtime, child.pid(), libc::SIGKILL)?;
             prove_killed_group_absent(runtime, child)
         }
         ProcessObservation::Matching { .. }
@@ -635,7 +635,7 @@ fn require_absent_group(
                 .monotonic_now()
                 .checked_add(TERM_GRACE)
                 .ok_or_else(|| reconciliation_ambiguous("TERM grace deadline overflowed"))?;
-            match poll_while_group_ambiguous(runtime, process_group, deadline)? {
+            match poll_while_group_ambiguous(runtime, process_group, deadline, libc::SIGTERM)? {
                 ResolvedLeaderlessGroup::Absent => Ok(()),
                 ResolvedLeaderlessGroup::Present => drain_leaderless_group(runtime, process_group),
             }
@@ -647,11 +647,11 @@ fn drain_leaderless_group(
     runtime: &dyn ReconciliationRuntime,
     process_group: u32,
 ) -> Result<(), WorkerError> {
-    runtime.signal_process_group(process_group, libc::SIGTERM)?;
+    let _ = signal_group_while_draining(runtime, process_group, libc::SIGTERM)?;
     if poll_leaderless_group_absent(runtime, process_group, DrainPhase::Term)? {
         return Ok(());
     }
-    runtime.signal_process_group(process_group, libc::SIGKILL)?;
+    let _ = signal_group_while_draining(runtime, process_group, libc::SIGKILL)?;
     if poll_leaderless_group_absent(runtime, process_group, DrainPhase::Kill)? {
         return Ok(());
     }
@@ -679,6 +679,13 @@ impl DrainPhase {
             Self::Kill => "KILL grace deadline overflowed",
         }
     }
+
+    fn signal(self) -> i32 {
+        match self {
+            Self::Term => libc::SIGTERM,
+            Self::Kill => libc::SIGKILL,
+        }
+    }
 }
 
 fn poll_leaderless_group_absent(
@@ -699,7 +706,8 @@ fn poll_leaderless_group_absent(
                 }
             }
             ProcessGroupObservation::Ambiguous => {
-                match poll_while_group_ambiguous(runtime, process_group, deadline)? {
+                match poll_while_group_ambiguous(runtime, process_group, deadline, phase.signal())?
+                {
                     ResolvedLeaderlessGroup::Absent => return Ok(true),
                     ResolvedLeaderlessGroup::Present => {
                         if !sleep_until_group_deadline(runtime, deadline) {
@@ -712,23 +720,63 @@ fn poll_leaderless_group_absent(
     }
 }
 
-/// Poll `observe_group` without signaling while the sample stays `Ambiguous`.
-/// Returns as soon as the group is `Absent` or `Present`; if it is still
-/// `Ambiguous` when `deadline` elapses, fail closed with the after-grace error.
+/// Poll `observe_group` while the sample stays `Ambiguous`.
+///
+/// Absence is only `ESRCH` from `kill(-pgid, 0)`, which the runtime reports as
+/// [`ProcessGroupObservation::Absent`]. `EPERM` (the macOS zombie-only answer)
+/// and any other probe errno stay ambiguous: keep probing until `ESRCH` or
+/// `deadline`. A member `observe_group_members` still reports as alive is
+/// signalled again with `resignal`; a zombie is not. The grace is unchanged.
 fn poll_while_group_ambiguous(
     runtime: &dyn ReconciliationRuntime,
     process_group: u32,
     deadline: Duration,
+    resignal: i32,
 ) -> Result<ResolvedLeaderlessGroup, WorkerError> {
+    let mut last_signal_errno = None;
     loop {
         if !sleep_until_group_deadline(runtime, deadline) {
-            return Err(group_not_proven_absent());
+            return Err(group_not_proven_absent(last_signal_errno));
         }
         match runtime.observe_group(process_group) {
             ProcessGroupObservation::Absent => return Ok(ResolvedLeaderlessGroup::Absent),
             ProcessGroupObservation::Present => return Ok(ResolvedLeaderlessGroup::Present),
-            ProcessGroupObservation::Ambiguous => {}
+            ProcessGroupObservation::Ambiguous => {
+                if runtime.observe_group_members(process_group)
+                    == ProcessGroupMembership::OtherMembers
+                {
+                    last_signal_errno =
+                        signal_group_while_draining(runtime, process_group, resignal)?;
+                }
+            }
         }
+    }
+}
+
+/// `EPERM` is the draining answer (zombies, or a member exiting). `ESRCH` on
+/// the signal itself is not proof the group is gone; the caller still has to
+/// observe `kill(-pgid, 0)`. Every other errno still fails the reconciliation.
+fn group_signal_is_draining(error: &WorkerError) -> bool {
+    match error {
+        WorkerError::Io(source) => {
+            matches!(source.raw_os_error(), Some(libc::EPERM) | Some(libc::ESRCH))
+        }
+        _ => false,
+    }
+}
+
+fn signal_group_while_draining(
+    runtime: &dyn ReconciliationRuntime,
+    process_group: u32,
+    signal: i32,
+) -> Result<Option<i32>, WorkerError> {
+    match runtime.signal_process_group(process_group, signal) {
+        Ok(()) => Ok(None),
+        Err(error) if group_signal_is_draining(&error) => match &error {
+            WorkerError::Io(source) => Ok(source.raw_os_error()),
+            _ => Ok(None),
+        },
+        Err(error) => Err(error),
     }
 }
 
@@ -744,12 +792,20 @@ fn sleep_until_group_deadline(runtime: &dyn ReconciliationRuntime, deadline: Dur
     true
 }
 
-fn group_not_proven_absent() -> WorkerError {
-    reconciliation_ambiguous(
-        "child leader is absent but its exact process group is not proven absent after grace",
-    )
+fn group_not_proven_absent(last_signal_errno: Option<i32>) -> WorkerError {
+    match last_signal_errno {
+        Some(errno) => reconciliation_ambiguous(&format!(
+            "child leader is absent but its exact process group is not proven absent after grace (last group signal errno {errno})"
+        )),
+        None => reconciliation_ambiguous(
+            "child leader is absent but its exact process group is not proven absent after grace",
+        ),
+    }
 }
 
+/// After SIGKILL, an absent leader whose group is still present or ambiguous
+/// is the same draining window as a leaderless group. Poll only until the
+/// deadline already computed here. Absence is still ESRCH from `kill(-pgid, 0)`.
 fn prove_killed_group_absent(
     runtime: &dyn ReconciliationRuntime,
     child: ProcessIdentity,
@@ -764,16 +820,46 @@ fn prove_killed_group_absent(
             (ProcessObservation::Matching { process_group }, ProcessGroupObservation::Present)
                 if process_group == child.pid() =>
             {
-                let now = runtime.monotonic_now();
-                let Some(remaining) = deadline
-                    .checked_sub(now)
-                    .filter(|remaining| !remaining.is_zero())
-                else {
+                if !sleep_until_group_deadline(runtime, deadline) {
                     return Err(reconciliation_ambiguous(
                         "targeted child leader and process group remained live at the KILL proof deadline",
                     ));
-                };
-                runtime.sleep(POLL_INTERVAL.min(remaining));
+                }
+            }
+            // SIGKILL marks the leader exiting before proc_pidinfo stops
+            // describing it, and kill(-pgid, 0) already answers EPERM.
+            (
+                ProcessObservation::Matching { process_group },
+                ProcessGroupObservation::Ambiguous,
+            ) if process_group == child.pid() => {
+                if !sleep_until_group_deadline(runtime, deadline) {
+                    return Err(reconciliation_ambiguous(
+                        "targeted child leader and process group were not both proven absent",
+                    ));
+                }
+            }
+            (ProcessObservation::Absent, ProcessGroupObservation::Ambiguous) => {
+                match poll_while_group_ambiguous(runtime, child.pid(), deadline, libc::SIGKILL)? {
+                    ResolvedLeaderlessGroup::Absent => return Ok(()),
+                    ResolvedLeaderlessGroup::Present => {
+                        if !sleep_until_group_deadline(runtime, deadline) {
+                            return Err(reconciliation_ambiguous(
+                                "targeted child leader and process group were not both proven absent",
+                            ));
+                        }
+                    }
+                }
+            }
+            (ProcessObservation::Absent, ProcessGroupObservation::Present) => {
+                // A fork racing the first SIGKILL can survive it. Re-send on
+                // every poll inside the existing deadline. EPERM/ESRCH stay
+                // draining answers and are not absence.
+                let _ = signal_group_while_draining(runtime, child.pid(), libc::SIGKILL)?;
+                if !sleep_until_group_deadline(runtime, deadline) {
+                    return Err(reconciliation_ambiguous(
+                        "targeted child leader and process group were not both proven absent",
+                    ));
+                }
             }
             _ => {
                 return Err(reconciliation_ambiguous(
@@ -839,8 +925,10 @@ unsafe extern "C" {
 }
 
 #[cfg(target_os = "macos")]
+const PROC_PIDTBSDINFO: c_int = 3;
+
+#[cfg(target_os = "macos")]
 fn inspect_process(pid: u32) -> Result<Option<(ProcessIdentity, u32)>, ()> {
-    const PROC_PIDTBSDINFO: c_int = 3;
     let mut info = std::mem::MaybeUninit::<ProcBsdInfo>::zeroed();
     let size = size_of::<ProcBsdInfo>();
     let result = unsafe {
@@ -892,11 +980,50 @@ fn inspect_group_members(leader: u32) -> ProcessGroupMembership {
         return ProcessGroupMembership::Ambiguous;
     }
     for pid in pids.into_iter().take(returned as usize) {
-        if pid > 0 && pid as u32 != leader {
+        if pid > 0 && pid as u32 != leader && group_pid_is_live(pid as u32) {
             return ProcessGroupMembership::OtherMembers;
         }
     }
     ProcessGroupMembership::LeaderOnly
+}
+
+/// Live means a process `proc_pidinfo` can still describe and that is not a
+/// zombie. macOS answers ESRCH for zombies, while `kill(-pgid, 0)` keeps
+/// returning EPERM until the zombie is reaped. Counting that pid as another
+/// member holds the leader unreaped for the whole TERM grace.
+#[cfg(target_os = "macos")]
+fn group_pid_is_live(pid: u32) -> bool {
+    const SZOMB: u32 = 5;
+    let Ok(pid) = c_int::try_from(pid) else {
+        return true;
+    };
+    let mut info = std::mem::MaybeUninit::<ProcBsdInfo>::zeroed();
+    let size = size_of::<ProcBsdInfo>();
+    let Ok(size) = c_int::try_from(size) else {
+        return true;
+    };
+    let result = unsafe { proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), size) };
+    if result == 0 {
+        return io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+    }
+    if result != size {
+        return true;
+    }
+    let info = unsafe { info.assume_init() };
+    info.pid != pid as u32 || info.status != SZOMB
+}
+
+/// `kill(-pgid, 0)` classifies the group. Only ESRCH is absence. Any other
+/// errno, including the EPERM macOS returns while only zombies or exiting
+/// members remain, stays ambiguous.
+fn classify_group_probe(process_group: i32) -> ProcessGroupObservation {
+    if unsafe { libc::kill(-process_group, 0) } == 0 {
+        return ProcessGroupObservation::Present;
+    }
+    match io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => ProcessGroupObservation::Absent,
+        _ => ProcessGroupObservation::Ambiguous,
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -939,13 +1066,7 @@ impl ProcessInspector for SystemProcessInspector {
         let Ok(process_group) = i32::try_from(process_group) else {
             return ProcessGroupObservation::Ambiguous;
         };
-        if unsafe { libc::kill(-process_group, 0) } == 0 {
-            return ProcessGroupObservation::Present;
-        }
-        match io::Error::last_os_error().raw_os_error() {
-            Some(libc::ESRCH) => ProcessGroupObservation::Absent,
-            _ => ProcessGroupObservation::Ambiguous,
-        }
+        classify_group_probe(process_group)
     }
 
     fn observe_group_members(&self, leader: u32) -> ProcessGroupMembership {
@@ -6939,6 +7060,8 @@ commands = ["PATH=/bin:/usr/bin /bin/sleep 8; printf done > setup.done"]
     struct ScriptedReconciliationRuntime {
         process: Mutex<VecDeque<ProcessObservation>>,
         groups: Mutex<VecDeque<ProcessGroupObservation>>,
+        members: Mutex<VecDeque<ProcessGroupMembership>>,
+        signal_errnos: Mutex<VecDeque<Option<i32>>>,
         signals: Mutex<Vec<(u32, i32)>>,
         sleeps: Mutex<Vec<Duration>>,
         now: Mutex<Duration>,
@@ -6953,6 +7076,8 @@ commands = ["PATH=/bin:/usr/bin /bin/sleep 8; printf done > setup.done"]
             Self {
                 process: Mutex::new(process.into_iter().collect()),
                 groups: Mutex::new(groups.into_iter().collect()),
+                members: Mutex::new(VecDeque::new()),
+                signal_errnos: Mutex::new(VecDeque::new()),
                 signals: Mutex::new(Vec::new()),
                 sleeps: Mutex::new(Vec::new()),
                 now: Mutex::new(Duration::ZERO),
@@ -6962,6 +7087,23 @@ commands = ["PATH=/bin:/usr/bin /bin/sleep 8; printf done > setup.done"]
 
         fn with_clock(self, clock: impl IntoIterator<Item = Duration>) -> Self {
             *self.clock.lock().unwrap() = Some(clock.into_iter().collect());
+            self
+        }
+
+        fn with_members(self, members: impl IntoIterator<Item = ProcessGroupMembership>) -> Self {
+            *self.members.lock().unwrap() = members.into_iter().collect();
+            self
+        }
+
+        /// Errnos returned by the next `signal_process_group` calls. An empty
+        /// queue means every signal succeeds.
+        fn with_signal_errnos(self, errnos: impl IntoIterator<Item = i32>) -> Self {
+            self.with_signal_outcomes(errnos.into_iter().map(Some))
+        }
+
+        /// `None` is a successful signal. `Some(errno)` fails that call.
+        fn with_signal_outcomes(self, outcomes: impl IntoIterator<Item = Option<i32>>) -> Self {
+            *self.signal_errnos.lock().unwrap() = outcomes.into_iter().collect();
             self
         }
 
@@ -7000,13 +7142,18 @@ commands = ["PATH=/bin:/usr/bin /bin/sleep 8; printf done > setup.done"]
         }
 
         fn observe_group_members(&self, _leader: u32) -> ProcessGroupMembership {
-            panic!("recorded-group termination must not use parent wait anchors")
+            self.members.lock().unwrap().pop_front().unwrap_or_else(|| {
+                panic!("recorded-group termination must not use parent wait anchors")
+            })
         }
     }
 
     impl ReconciliationRuntime for ScriptedReconciliationRuntime {
         fn signal_process_group(&self, process_group: u32, signal: i32) -> Result<(), WorkerError> {
             self.signals.lock().unwrap().push((process_group, signal));
+            if let Some(Some(errno)) = self.signal_errnos.lock().unwrap().pop_front() {
+                return Err(WorkerError::Io(io::Error::from_raw_os_error(errno)));
+            }
             Ok(())
         }
 
@@ -7146,6 +7293,419 @@ commands = ["PATH=/bin:/usr/bin /bin/sleep 8; printf done > setup.done"]
     }
 
     #[test]
+    fn eperm_from_group_kill_keeps_probing_until_esrch() {
+        let child = recorded_child();
+        let runtime = ScriptedReconciliationRuntime::new(
+            [ProcessObservation::Absent],
+            [
+                ProcessGroupObservation::Present,
+                ProcessGroupObservation::Absent,
+            ],
+        )
+        .with_signal_errnos([libc::EPERM]);
+
+        terminate_exact_recorded_group(&runtime, Some(child)).unwrap();
+
+        assert_eq!(runtime.signals(), vec![(child.pid(), libc::SIGTERM)]);
+        assert_eq!(runtime.sleeps(), Vec::<Duration>::new());
+    }
+
+    #[test]
+    fn non_draining_group_kill_errno_still_fails_without_another_probe() {
+        let child = recorded_child();
+        let runtime = ScriptedReconciliationRuntime::new(
+            [ProcessObservation::Absent],
+            [ProcessGroupObservation::Present],
+        )
+        .with_signal_errnos([libc::EINVAL]);
+
+        let error = terminate_exact_recorded_group(&runtime, Some(child)).unwrap_err();
+
+        match error {
+            WorkerError::Io(source) => assert_eq!(source.raw_os_error(), Some(libc::EINVAL)),
+            other => panic!("expected the injected errno, got {other}"),
+        }
+        assert_eq!(runtime.signals(), vec![(child.pid(), libc::SIGTERM)]);
+        assert_eq!(runtime.sleeps(), Vec::<Duration>::new());
+    }
+
+    #[test]
+    fn draining_errno_on_live_leader_term_keeps_the_existing_grace() {
+        for errno in [libc::EPERM, libc::ESRCH] {
+            let child = recorded_child();
+            let runtime = ScriptedReconciliationRuntime::new(
+                [
+                    ProcessObservation::Matching {
+                        process_group: child.pid(),
+                    },
+                    ProcessObservation::Absent,
+                ],
+                [ProcessGroupObservation::Absent],
+            )
+            .with_signal_errnos([errno]);
+
+            terminate_exact_recorded_group(&runtime, Some(child)).unwrap();
+
+            assert_eq!(runtime.signals(), vec![(child.pid(), libc::SIGTERM)]);
+            assert_eq!(runtime.sleeps(), vec![TERM_GRACE]);
+        }
+    }
+
+    #[test]
+    fn draining_errno_on_kill_still_proves_absence_within_budget() {
+        for errno in [libc::EPERM, libc::ESRCH] {
+            let child = recorded_child();
+            let runtime = ScriptedReconciliationRuntime::new(
+                [
+                    ProcessObservation::Matching {
+                        process_group: child.pid(),
+                    },
+                    ProcessObservation::Matching {
+                        process_group: child.pid(),
+                    },
+                    ProcessObservation::Absent,
+                ],
+                [ProcessGroupObservation::Absent],
+            )
+            .with_signal_outcomes([None, Some(errno)]);
+
+            terminate_exact_recorded_group(&runtime, Some(child)).unwrap();
+
+            assert_eq!(
+                runtime.signals(),
+                vec![(child.pid(), libc::SIGTERM), (child.pid(), libc::SIGKILL)]
+            );
+            assert_eq!(runtime.sleeps(), vec![TERM_GRACE]);
+            assert!(runtime.simulated_wait() <= TERM_GRACE + TERM_GRACE);
+        }
+    }
+
+    #[test]
+    fn non_draining_errno_on_live_leader_term_fails_without_waiting() {
+        let child = recorded_child();
+        let runtime = ScriptedReconciliationRuntime::new(
+            [ProcessObservation::Matching {
+                process_group: child.pid(),
+            }],
+            [],
+        )
+        .with_signal_errnos([libc::EINVAL]);
+
+        let error = terminate_exact_recorded_group(&runtime, Some(child)).unwrap_err();
+
+        match error {
+            WorkerError::Io(source) => assert_eq!(source.raw_os_error(), Some(libc::EINVAL)),
+            other => panic!("expected the injected errno, got {other}"),
+        }
+        assert_eq!(runtime.signals(), vec![(child.pid(), libc::SIGTERM)]);
+        assert_eq!(runtime.sleeps(), Vec::<Duration>::new());
+    }
+
+    #[test]
+    fn killed_leader_absent_with_ambiguous_group_polls_until_esrch() {
+        let child = recorded_child();
+        let runtime = ScriptedReconciliationRuntime::new(
+            [
+                ProcessObservation::Matching {
+                    process_group: child.pid(),
+                },
+                ProcessObservation::Matching {
+                    process_group: child.pid(),
+                },
+                ProcessObservation::Absent,
+            ],
+            [
+                ProcessGroupObservation::Ambiguous,
+                ProcessGroupObservation::Absent,
+            ],
+        );
+
+        terminate_exact_recorded_group(&runtime, Some(child)).unwrap();
+
+        assert_eq!(
+            runtime.signals(),
+            vec![(child.pid(), libc::SIGTERM), (child.pid(), libc::SIGKILL)]
+        );
+        assert_eq!(runtime.sleeps(), vec![TERM_GRACE, POLL_INTERVAL]);
+        assert!(runtime.simulated_wait() <= TERM_GRACE + TERM_GRACE);
+    }
+
+    #[test]
+    fn killed_leader_absent_with_present_group_polls_until_esrch() {
+        let child = recorded_child();
+        let runtime = ScriptedReconciliationRuntime::new(
+            [
+                ProcessObservation::Matching {
+                    process_group: child.pid(),
+                },
+                ProcessObservation::Matching {
+                    process_group: child.pid(),
+                },
+                ProcessObservation::Absent,
+                ProcessObservation::Absent,
+            ],
+            [
+                ProcessGroupObservation::Present,
+                ProcessGroupObservation::Absent,
+            ],
+        );
+
+        terminate_exact_recorded_group(&runtime, Some(child)).unwrap();
+
+        assert_eq!(
+            runtime.signals(),
+            vec![
+                (child.pid(), libc::SIGTERM),
+                (child.pid(), libc::SIGKILL),
+                (child.pid(), libc::SIGKILL),
+            ]
+        );
+        assert_eq!(runtime.sleeps(), vec![TERM_GRACE, POLL_INTERVAL]);
+        assert!(runtime.simulated_wait() <= TERM_GRACE + TERM_GRACE);
+    }
+
+    #[test]
+    fn killed_leader_absent_with_present_group_resignals_kill_on_each_poll() {
+        let child = recorded_child();
+        let runtime = ScriptedReconciliationRuntime::new(
+            [
+                ProcessObservation::Matching {
+                    process_group: child.pid(),
+                },
+                ProcessObservation::Matching {
+                    process_group: child.pid(),
+                },
+                ProcessObservation::Absent,
+                ProcessObservation::Absent,
+                ProcessObservation::Absent,
+            ],
+            [
+                ProcessGroupObservation::Present,
+                ProcessGroupObservation::Present,
+                ProcessGroupObservation::Absent,
+            ],
+        );
+
+        terminate_exact_recorded_group(&runtime, Some(child)).unwrap();
+
+        assert_eq!(
+            runtime.signals(),
+            vec![
+                (child.pid(), libc::SIGTERM),
+                (child.pid(), libc::SIGKILL),
+                (child.pid(), libc::SIGKILL),
+                (child.pid(), libc::SIGKILL),
+            ]
+        );
+        assert_eq!(
+            runtime.sleeps(),
+            vec![TERM_GRACE, POLL_INTERVAL, POLL_INTERVAL]
+        );
+        assert!(runtime.simulated_wait() <= TERM_GRACE + TERM_GRACE);
+    }
+
+    #[test]
+    fn killed_group_still_present_at_kill_proof_deadline_stays_ambiguous() {
+        let child = recorded_child();
+        let runtime = ScriptedReconciliationRuntime::new(
+            [
+                ProcessObservation::Matching {
+                    process_group: child.pid(),
+                },
+                ProcessObservation::Matching {
+                    process_group: child.pid(),
+                },
+                ProcessObservation::Absent,
+                ProcessObservation::Absent,
+            ],
+            [
+                ProcessGroupObservation::Present,
+                ProcessGroupObservation::Present,
+            ],
+        )
+        .with_clock([
+            Duration::ZERO,
+            TERM_GRACE,
+            TERM_GRACE,
+            TERM_GRACE + POLL_INTERVAL,
+            TERM_GRACE + TERM_GRACE,
+        ]);
+
+        let error = terminate_exact_recorded_group(&runtime, Some(child)).unwrap_err();
+
+        assert!(
+            error.to_string().contains("RECONCILIATION_AMBIGUOUS"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("targeted child leader and process group were not both proven absent"),
+            "{error}"
+        );
+        assert_eq!(
+            runtime.signals(),
+            vec![
+                (child.pid(), libc::SIGTERM),
+                (child.pid(), libc::SIGKILL),
+                (child.pid(), libc::SIGKILL),
+                (child.pid(), libc::SIGKILL),
+            ]
+        );
+        assert_eq!(runtime.sleeps(), vec![POLL_INTERVAL]);
+        assert!(runtime.simulated_wait() <= TERM_GRACE);
+    }
+
+    #[test]
+    fn killed_group_stays_ambiguous_until_deadline_keeps_the_kill_budget() {
+        let child = recorded_child();
+        let runtime = ScriptedReconciliationRuntime::new(
+            [
+                ProcessObservation::Matching {
+                    process_group: child.pid(),
+                },
+                ProcessObservation::Matching {
+                    process_group: child.pid(),
+                },
+                ProcessObservation::Absent,
+            ],
+            [
+                ProcessGroupObservation::Ambiguous,
+                ProcessGroupObservation::Ambiguous,
+            ],
+        )
+        .with_members([ProcessGroupMembership::OtherMembers])
+        .with_signal_outcomes([None, None, Some(libc::EPERM)])
+        .with_clock([
+            Duration::ZERO,
+            TERM_GRACE,
+            TERM_GRACE,
+            TERM_GRACE + POLL_INTERVAL,
+            TERM_GRACE + TERM_GRACE,
+        ]);
+
+        let error = terminate_exact_recorded_group(&runtime, Some(child)).unwrap_err();
+
+        assert!(
+            error.to_string().contains("RECONCILIATION_AMBIGUOUS"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("last group signal errno {}", libc::EPERM)),
+            "{error}"
+        );
+        assert_eq!(
+            runtime.signals(),
+            vec![
+                (child.pid(), libc::SIGTERM),
+                (child.pid(), libc::SIGKILL),
+                (child.pid(), libc::SIGKILL),
+            ]
+        );
+        assert_eq!(runtime.sleeps(), vec![POLL_INTERVAL]);
+        assert!(runtime.simulated_wait() <= TERM_GRACE);
+    }
+
+    #[test]
+    fn killed_leader_still_described_with_ambiguous_group_polls_until_absent() {
+        let child = recorded_child();
+        let runtime = ScriptedReconciliationRuntime::new(
+            [
+                ProcessObservation::Matching {
+                    process_group: child.pid(),
+                },
+                ProcessObservation::Matching {
+                    process_group: child.pid(),
+                },
+                ProcessObservation::Matching {
+                    process_group: child.pid(),
+                },
+                ProcessObservation::Absent,
+            ],
+            [
+                ProcessGroupObservation::Ambiguous,
+                ProcessGroupObservation::Absent,
+            ],
+        );
+
+        terminate_exact_recorded_group(&runtime, Some(child)).unwrap();
+
+        assert_eq!(
+            runtime.signals(),
+            vec![(child.pid(), libc::SIGTERM), (child.pid(), libc::SIGKILL)]
+        );
+        assert_eq!(runtime.sleeps(), vec![TERM_GRACE, POLL_INTERVAL]);
+        assert!(runtime.simulated_wait() <= TERM_GRACE + TERM_GRACE);
+    }
+
+    #[test]
+    fn killed_leader_still_described_with_ambiguous_group_fails_at_the_kill_deadline() {
+        let child = recorded_child();
+        let runtime = ScriptedReconciliationRuntime::new(
+            [
+                ProcessObservation::Matching {
+                    process_group: child.pid(),
+                },
+                ProcessObservation::Matching {
+                    process_group: child.pid(),
+                },
+                ProcessObservation::Matching {
+                    process_group: child.pid(),
+                },
+                ProcessObservation::Matching {
+                    process_group: child.pid(),
+                },
+            ],
+            [
+                ProcessGroupObservation::Ambiguous,
+                ProcessGroupObservation::Ambiguous,
+            ],
+        )
+        .with_clock([
+            Duration::ZERO,
+            TERM_GRACE,
+            TERM_GRACE,
+            TERM_GRACE + POLL_INTERVAL,
+            TERM_GRACE + TERM_GRACE,
+        ]);
+
+        let error = terminate_exact_recorded_group(&runtime, Some(child)).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("targeted child leader and process group were not both proven absent"),
+            "{error}"
+        );
+        assert_eq!(
+            runtime.signals(),
+            vec![(child.pid(), libc::SIGTERM), (child.pid(), libc::SIGKILL)]
+        );
+        assert_eq!(runtime.sleeps(), vec![POLL_INTERVAL]);
+    }
+
+    #[test]
+    fn leaderless_ambiguous_group_with_a_live_member_is_resignalled() {
+        let child = recorded_child();
+        let runtime = ScriptedReconciliationRuntime::new(
+            [ProcessObservation::Absent],
+            [
+                ProcessGroupObservation::Ambiguous,
+                ProcessGroupObservation::Ambiguous,
+                ProcessGroupObservation::Absent,
+            ],
+        )
+        .with_members([ProcessGroupMembership::OtherMembers]);
+
+        terminate_exact_recorded_group(&runtime, Some(child)).unwrap();
+
+        assert_eq!(runtime.signals(), vec![(child.pid(), libc::SIGTERM)]);
+        assert_eq!(runtime.sleeps(), vec![POLL_INTERVAL, POLL_INTERVAL]);
+    }
+
+    #[test]
     fn leaderless_ambiguous_group_becomes_absent_after_two_polls() {
         let child = recorded_child();
         let runtime = ScriptedReconciliationRuntime::new(
@@ -7155,7 +7715,8 @@ commands = ["PATH=/bin:/usr/bin /bin/sleep 8; printf done > setup.done"]
                 ProcessGroupObservation::Ambiguous,
                 ProcessGroupObservation::Absent,
             ],
-        );
+        )
+        .with_members([ProcessGroupMembership::LeaderOnly]);
 
         terminate_exact_recorded_group(&runtime, Some(child)).unwrap();
 
@@ -7187,6 +7748,54 @@ commands = ["PATH=/bin:/usr/bin /bin/sleep 8; printf done > setup.done"]
         assert!(!error.to_string().contains("TERM/KILL"), "{error}");
         assert_eq!(runtime.signals(), Vec::<(u32, i32)>::new());
         assert_eq!(runtime.sleeps(), Vec::<Duration>::new());
+    }
+
+    #[test]
+    fn ambiguous_group_with_live_members_and_eperm_stays_ambiguous_after_grace() {
+        let child = recorded_child();
+        let runtime = ScriptedReconciliationRuntime::new(
+            [ProcessObservation::Absent],
+            [
+                ProcessGroupObservation::Ambiguous,
+                ProcessGroupObservation::Ambiguous,
+                ProcessGroupObservation::Ambiguous,
+            ],
+        )
+        .with_members([
+            ProcessGroupMembership::OtherMembers,
+            ProcessGroupMembership::OtherMembers,
+        ])
+        .with_signal_errnos([libc::EPERM, libc::EPERM])
+        .with_clock([
+            Duration::ZERO,
+            POLL_INTERVAL,
+            POLL_INTERVAL + POLL_INTERVAL,
+            TERM_GRACE,
+        ]);
+
+        let error = terminate_exact_recorded_group(&runtime, Some(child)).unwrap_err();
+
+        assert!(
+            error.to_string().contains("RECONCILIATION_AMBIGUOUS"),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains(
+                "child leader is absent but its exact process group is not proven absent after grace"
+            ),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("last group signal errno {}", libc::EPERM)),
+            "{error}"
+        );
+        assert_eq!(
+            runtime.signals(),
+            vec![(child.pid(), libc::SIGTERM), (child.pid(), libc::SIGTERM)]
+        );
+        assert_eq!(runtime.sleeps(), vec![POLL_INTERVAL, POLL_INTERVAL]);
     }
 
     #[test]
@@ -7223,6 +7832,341 @@ commands = ["PATH=/bin:/usr/bin /bin/sleep 8; printf done > setup.done"]
 
         assert_eq!(runtime.signals(), vec![(child.pid(), libc::SIGTERM)]);
         assert_eq!(runtime.sleeps(), vec![POLL_INTERVAL]);
+    }
+
+    /// A waitable leader whose only other group member is an unreaped zombie
+    /// must still be collected. The zombie keeps the member listed in the
+    /// group and makes `kill(-pgid, SIGTERM)` return EPERM.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn waitable_leader_with_only_a_zombie_member_is_collected() {
+        run_isolated_raw_fork_scenario(
+            "supervisor::tests::waitable_leader_with_only_a_zombie_member_is_collected",
+            || {
+                let (mut cleanup, release) = spawn_blocked_group_leader(7);
+                let leader = cleanup.leader();
+                let identity = wait_for_group_identity(leader);
+                let (member_exclusion, member) = fork_without_exec();
+                assert!(member >= 0, "fork failed: {}", io::Error::last_os_error());
+                if member == 0 {
+                    unsafe {
+                        if libc::setpgid(0, leader) != 0 {
+                            libc::_exit(70);
+                        }
+                        libc::_exit(0);
+                    }
+                }
+                let _member_exclusion = member_exclusion;
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !child_is_waitable(member).unwrap() {
+                    assert!(Instant::now() < deadline, "member did not exit");
+                    std::thread::yield_now();
+                }
+                let mut listed = [0 as c_int; 16];
+                let returned = unsafe {
+                    proc_listpgrppids(
+                        leader,
+                        listed.as_mut_ptr().cast(),
+                        size_of_val(&listed) as c_int,
+                    )
+                };
+                assert!(
+                    listed
+                        .iter()
+                        .take(usize::try_from(returned.max(0)).unwrap_or(0))
+                        .any(|pid| *pid == member),
+                    "zombie member {member} is not listed in group {leader} (returned={returned})"
+                );
+                drop(release);
+                while !child_is_waitable(leader).unwrap() {
+                    assert!(Instant::now() < deadline, "leader did not exit");
+                    std::thread::yield_now();
+                }
+                assert_eq!(unsafe { libc::kill(-leader, libc::SIGTERM) }, -1);
+                assert_eq!(
+                    io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EPERM),
+                    "zombie-only group signal was not EPERM"
+                );
+                let reaper = std::thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while unsafe { libc::kill(leader, 0) } == 0 && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    let mut status = 0;
+                    unsafe { libc::waitpid(member, &raw mut status, 0) }
+                });
+                let result = complete_waitable_child(
+                    identity,
+                    &SystemProcessInspector,
+                    SupervisorTimings::default(),
+                );
+                assert_eq!(reaper.join().unwrap(), member);
+                cleanup.finish().unwrap();
+                assert_eq!(result.unwrap(), ChildOutcome::Exited(7));
+            },
+        );
+    }
+
+    /// A group probe from this process must not consume the leader's exit
+    /// status before the supervisor collects it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn group_probe_does_not_steal_the_leader_exit_status() {
+        run_isolated_raw_fork_scenario(
+            "supervisor::tests::group_probe_does_not_steal_the_leader_exit_status",
+            || {
+                let (mut cleanup, release) = spawn_blocked_group_leader(0);
+                let leader = cleanup.leader();
+                let identity = wait_for_group_identity(leader);
+                drop(release);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !child_is_waitable(leader).unwrap() {
+                    assert!(Instant::now() < deadline, "leader did not exit");
+                    std::thread::yield_now();
+                }
+                let probe = SystemProcessInspector.observe_group(identity.pid());
+                let outcome = wait_for_child(
+                    identity,
+                    1_000,
+                    &SystemProcessInspector,
+                    SupervisorTimings::default(),
+                );
+                let _ = cleanup.finish();
+                assert_eq!(
+                    outcome.unwrap(),
+                    ChildOutcome::Exited(0),
+                    "supervisor recorded a different outcome than the child's real exit (probe={probe:?})"
+                );
+            },
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn zombie_grandchild_is_not_a_live_group_member() {
+        run_isolated_raw_fork_scenario(
+            "supervisor::tests::zombie_grandchild_is_not_a_live_group_member",
+            || {
+                let mut descriptors = [-1; 2];
+                assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+                let (fork_exclusion, leader) = fork_without_exec();
+                assert!(leader >= 0, "fork failed: {}", io::Error::last_os_error());
+                if leader == 0 {
+                    unsafe {
+                        retain_descriptors_after_close_from(&[descriptors[1]]);
+                        libc::close(descriptors[0]);
+                        if libc::setpgid(0, 0) != 0 {
+                            libc::_exit(70);
+                        }
+                        let grand = libc::fork();
+                        if grand <= 0 {
+                            libc::_exit(if grand == 0 { 0 } else { 71 });
+                        }
+                        loop {
+                            let mut info = std::mem::MaybeUninit::<ProcBsdInfo>::zeroed();
+                            let size = size_of::<ProcBsdInfo>() as c_int;
+                            let described = proc_pidinfo(
+                                grand,
+                                PROC_PIDTBSDINFO,
+                                0,
+                                info.as_mut_ptr().cast(),
+                                size,
+                            );
+                            let kill_result = libc::kill(grand, 0);
+                            if described == 0 && kill_result == 0 {
+                                let bytes = (grand as u32).to_ne_bytes();
+                                libc::write(descriptors[1], bytes.as_ptr().cast(), bytes.len());
+                                loop {
+                                    libc::pause();
+                                }
+                            }
+                            if kill_result != 0
+                                && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                            {
+                                libc::_exit(72);
+                            }
+                        }
+                    }
+                }
+                let _leader_guard =
+                    RawChildGuard::new(leader, fork_exclusion.expect("parent keeps HeldFork"));
+                let grouped = unsafe { libc::setpgid(leader, leader) };
+                if grouped != 0 {
+                    let errno = io::Error::last_os_error().raw_os_error();
+                    assert_eq!(
+                        errno,
+                        Some(libc::EACCES),
+                        "parent setpgid failed: {errno:?}"
+                    );
+                }
+                unsafe { libc::close(descriptors[1]) };
+                let mut bytes = [0_u8; 4];
+                let read =
+                    unsafe { libc::read(descriptors[0], bytes.as_mut_ptr().cast(), bytes.len()) };
+                assert_eq!(read, 4, "grandchild zombie was not reported");
+                let grand = u32::from_ne_bytes(bytes);
+                let mut listed = [0 as c_int; 16];
+                let returned = unsafe {
+                    proc_listpgrppids(
+                        leader,
+                        listed.as_mut_ptr().cast(),
+                        size_of_val(&listed) as c_int,
+                    )
+                };
+                let listed_grand = listed
+                    .into_iter()
+                    .take(usize::try_from(returned.max(0)).unwrap_or(0))
+                    .any(|pid| pid == grand as c_int);
+                assert!(
+                    listed_grand,
+                    "zombie grandchild {grand} was not in the leader group (listpgrp={returned})"
+                );
+                assert_eq!(
+                    SystemProcessInspector.observe_group_members(leader as u32),
+                    ProcessGroupMembership::LeaderOnly,
+                    "a zombie grandchild must not hold the leader's TERM grace"
+                );
+                unsafe { libc::close(descriptors[0]) };
+            },
+        );
+    }
+
+    /// Real probes and signals with a compressed clock: real sleeps are capped
+    /// at one poll interval so the TERM grace passes fast. The trace names the
+    /// observation sequence in a failure.
+    struct CompressedClockRuntime {
+        now: Mutex<Duration>,
+        trace: Mutex<Vec<String>>,
+    }
+
+    impl CompressedClockRuntime {
+        fn new() -> Self {
+            Self {
+                now: Mutex::new(Duration::ZERO),
+                trace: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ProcessInspector for CompressedClockRuntime {
+        fn identity_for_pid(&self, pid: u32) -> Result<ProcessIdentity, WorkerError> {
+            SystemProcessInspector.identity_for_pid(pid)
+        }
+
+        fn observe(&self, expected: ProcessIdentity) -> ProcessObservation {
+            let observed = SystemProcessInspector.observe(expected);
+            self.trace.lock().unwrap().push(format!("o:{observed:?}"));
+            observed
+        }
+
+        fn observe_group(&self, process_group: u32) -> ProcessGroupObservation {
+            let observed = SystemProcessInspector.observe_group(process_group);
+            self.trace.lock().unwrap().push(format!("g:{observed:?}"));
+            observed
+        }
+
+        fn observe_group_members(&self, leader: u32) -> ProcessGroupMembership {
+            let observed = SystemProcessInspector.observe_group_members(leader);
+            self.trace.lock().unwrap().push(format!("m:{observed:?}"));
+            observed
+        }
+    }
+
+    impl ReconciliationRuntime for CompressedClockRuntime {
+        fn signal_process_group(&self, process_group: u32, signal: i32) -> Result<(), WorkerError> {
+            let result =
+                SystemReconciliationRuntime::new().signal_process_group(process_group, signal);
+            self.trace.lock().unwrap().push(format!(
+                "s:{signal}:{:?}",
+                result.as_ref().err().map(|e| e.to_string())
+            ));
+            result
+        }
+
+        fn monotonic_now(&self) -> Duration {
+            *self.now.lock().unwrap()
+        }
+
+        fn sleep(&self, duration: Duration) {
+            std::thread::sleep(duration.min(POLL_INTERVAL));
+            let mut now = self.now.lock().unwrap();
+            *now = now.saturating_add(duration);
+        }
+    }
+
+    /// Reconciliation SIGKILLs a TERM-ignoring leader while
+    /// another thread is its parent-side reaper (the supervisor's role in
+    /// production). `reap_delay` keeps the killed leader an unreaped zombie
+    /// for that long, which is the (Absent, Ambiguous) window.
+    #[cfg(target_os = "macos")]
+    fn kill_proof_with_external_reaper(reap_delay: Duration) {
+        let (mut cleanup, release) = spawn_term_ignoring_group_leader(9);
+        let leader = cleanup.leader();
+        let identity = wait_for_group_identity(leader);
+        let reaper = std::thread::spawn(move || {
+            loop {
+                let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+                let result = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        leader as libc::id_t,
+                        info.as_mut_ptr(),
+                        libc::WEXITED | libc::WNOWAIT,
+                    )
+                };
+                if result == 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                    break;
+                }
+            }
+            std::thread::sleep(reap_delay);
+            let mut status = 0;
+            loop {
+                let reaped = unsafe { libc::waitpid(leader, &raw mut status, 0) };
+                if reaped == -1 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return (reaped, status);
+            }
+        });
+        let runtime = CompressedClockRuntime::new();
+        let started = Instant::now();
+        let result = terminate_exact_recorded_group(&runtime, Some(identity));
+        let elapsed = started.elapsed();
+        if result.is_err() {
+            unsafe { libc::kill(leader, libc::SIGKILL) };
+        }
+        let (reaped, status) = reaper.join().unwrap();
+        drop(release);
+        let _ = cleanup.finish();
+        let trace = runtime.trace.lock().unwrap().clone();
+        assert!(
+            result.is_ok(),
+            "kill proof failed after {elapsed:?}: {result:?}; trace={trace:?}"
+        );
+        assert_eq!(reaped, leader);
+        assert!(
+            libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL,
+            "status={status:#x}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn killed_term_ignoring_leader_is_proven_absent_with_a_prompt_reaper() {
+        run_isolated_raw_fork_scenario(
+            "supervisor::tests::killed_term_ignoring_leader_is_proven_absent_with_a_prompt_reaper",
+            || kill_proof_with_external_reaper(Duration::ZERO),
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn killed_term_ignoring_leader_is_proven_absent_with_a_slow_reaper() {
+        run_isolated_raw_fork_scenario(
+            "supervisor::tests::killed_term_ignoring_leader_is_proven_absent_with_a_slow_reaper",
+            || kill_proof_with_external_reaper(Duration::from_millis(40)),
+        );
     }
 
     #[test]
