@@ -1,6 +1,6 @@
 # Testing
 
-The suite has about 3,600 tests: the library's unit tests and nine integration test binaries grouped by product
+The suite has about 4,500 tests: the library's unit tests and nine integration test binaries grouped by product
 area. Most of its cost is filesystem sync and real processes, not CPU.
 
 Cargo discovers each `tests/<area>/main.rs` as an integration target: `agents`, `cli`, `controller`, `dashboard`,
@@ -32,11 +32,11 @@ Implementation modules remain private in both modes. Ordinary callers use the na
 boundary: `Cli`, the process runner and its signature types, `run_with_stdio`, and the prepare-turn
 helper entries. The CLI fields and runtime fixture entries are accessible through the facade only.
 
-All-target Clippy enables the self dev-dependency's support feature. Check the ordinary production
-graph separately, without dev targets, and build the release without that feature:
+All-target Clippy enables the self dev-dependency's support feature, so the production Clippy under
+[Commands](#commands) is the only lint of the ordinary production graph. Build the release without that
+feature too:
 
 ```sh
-CARGO_BUILD_JOBS=4 cargo clippy --locked --release --no-default-features --lib --bin worker -- -D warnings
 CARGO_BUILD_JOBS=4 cargo build --locked --release --no-default-features
 ```
 
@@ -46,14 +46,23 @@ exempt unrelated helpers from the lint.
 
 ## Commands
 
+Pass `--locked` to every Cargo command that accepts it.
+
 ```sh
 cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
+CARGO_BUILD_JOBS=4 cargo clippy --locked --release --no-default-features --lib --bin worker -- -D warnings
 scripts/test-gate.sh                       # the whole suite, before landing
 ```
 
+**Toolchain.** CI lints with the Rust 1.98.1 that `rust-toolchain.toml` pins, and only rustup honours that file.
+Homebrew's cargo (1.99) ignores it, so local Clippy reports errors in code you did not touch, such as the
+`deprecated` warning on `fetch_update`. Fix only what your change introduces, and keep `fetch_update`: its suggested
+replacement, `try_update`, breaks the build on 1.98.1.
+
 `scripts/test-gate.sh` runs `cargo nextest run --locked --all-targets` with `TMPDIR` on a temporary RAM disk and
 passes any extra arguments through. It needs cargo-nextest (`brew install cargo-nextest`).
+Recorded full runs took 11 to 26 minutes, so run it once per change rather than after every edit.
 
 - `MAC_WORKER_GATE_RAMDISK_MB` sets the RAM disk size in MB (default 4096).
 - `0` keeps the normal `TMPDIR`.
@@ -111,10 +120,6 @@ The accepted run selected one test, passed one, and emitted 18 observation rows 
 and 200 paired samples per class. Its local fake SSH/mux timings are observations, not a latency
 threshold or a substitute for live acceptance.
 
-When a fixture re-executes its test binary, pass `support::libtest_name(module_path!(), "test_name")` to
-`--exact` or `support::agent_launch_fixture::assert_subprocess_success`. The helper drops the crate component
-and preserves all module components, including nested fixture modules.
-
 ## Why nextest and a RAM disk
 
 - **Isolation.** nextest runs every test in its own process. A test that changes the working directory, `HOME` or
@@ -137,6 +142,9 @@ and preserves all module components, including nested fixture modules.
   test, and the envelope-pruning unit test are killed after 360 s instead.
 - **`ci`** is the same with one retry and a JUnit report.
 
+Give a legitimately slow test its own override, with its measured timings in the override's comment, and keep the
+global timeout as it is.
+
 Two test groups limit how many tests run at once:
 
 - **`stress`**: one at a time, for the `_stress` tests.
@@ -158,6 +166,18 @@ concurrent clients, and the real 10 s supervisor TERM grace.
 
 ## Writing tests
 
+- **Name a test with a sentence that states the behaviour**, for example
+  `close_lost_response_after_remote_success_retries_to_closed`.
+- **Drive ssh and git callers with `RecordingRunner`** (`tests/support/recording_runner.rs`), which returns scripted
+  `ProcessRunner` results.
+- **Give a test that needs its own process environment (`HOME`, environment variables) a subprocess wrapper.** Mark
+  the body `#[ignore = "subprocess body: run by its *_wrapper test with the fixture environment"]` and return early
+  when `skip_unless_subtest()` is true. A `<name>_wrapper` test runs it in a child process with
+  `agent_launch_fixture::assert_subprocess_success(&support::libtest_name(module_path!(), "<name>"), env, env_clear)`.
+  `libtest_name` drops the crate component and keeps every module component, so pass it to `--exact` too when a
+  fixture re-executes its test binary.
+- **Warm a new fixture script before a time-limited probe uses it.** macOS checks every new executable on its first
+  run, which can take seconds under load, so run it once first (a `--warm` argument that exits 0).
 - **Do not sleep and do not measure wall-clock time to prove ordering.** Wait for an event instead: a channel, a
   concurrency hook, or a public status.
 - **Lower bounds are fine** (for example, the TERM grace elapsed). **Upper bounds on elapsed time fail on a loaded

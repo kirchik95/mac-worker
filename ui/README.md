@@ -3,6 +3,9 @@
 React + Tailwind + shadcn/ui front end for the dashboard API, developed against
 the Rust loopback server rather than embedded in it.
 
+Before changing how the dashboard looks or reads, read [`PRODUCT.md`](../PRODUCT.md)
+and [`DESIGN.md`](../DESIGN.md).
+
 ## Running
 
 Start the API in one shell, from the repository root:
@@ -74,7 +77,7 @@ The diff is the whole tree, not only JS and CSS. `npm run build` passes
 
 ## Layout
 
-- `src/lib/api.ts` — types mirroring the Rust snapshot projection, and fetch helpers
+- `src/lib/api.ts` — types mirroring the Rust snapshot projection in `../src/dashboard/model.rs` (change both together), and fetch helpers
 - `src/hooks/useSnapshot.ts` — event-driven snapshot refreshes, a 15-second healthy anti-entropy poll, and two-second fallback polling
 - `src/views/` — one file per view
 - `src/components/ui/` — shadcn components, owned by this repository
