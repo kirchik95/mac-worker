@@ -1,6 +1,6 @@
 # Testing
 
-The suite has about 3,600 tests: the library's unit tests and nine integration test binaries grouped by product
+The suite has about 4,500 tests: the library's unit tests and nine integration test binaries grouped by product
 area. Most of its cost is filesystem sync and real processes, not CPU.
 
 Cargo discovers each `tests/<area>/main.rs` as an integration target: `agents`, `cli`, `controller`, `dashboard`,
@@ -54,6 +54,7 @@ scripts/test-gate.sh                       # the whole suite, before landing
 
 `scripts/test-gate.sh` runs `cargo nextest run --locked --all-targets` with `TMPDIR` on a temporary RAM disk and
 passes any extra arguments through. It needs cargo-nextest (`brew install cargo-nextest`).
+Recorded full runs took 11 to 26 minutes, so run it once per change rather than after every edit.
 
 - `MAC_WORKER_GATE_RAMDISK_MB` sets the RAM disk size in MB (default 4096).
 - `0` keeps the normal `TMPDIR`.
