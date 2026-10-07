@@ -3200,7 +3200,10 @@ fn cancelling_setup_during_recipe_hands_off_without_agent_or_receipt() {
             error
         )
     });
-    let _ = submit_result;
+    assert!(
+        submit_result.is_ok(),
+        "turn runner failed: {submit_result:?}"
+    );
     assert_eq!(
         cancelled.status().last_outcome(),
         Some(&TaskOutcome::Cancelled)
