@@ -1670,9 +1670,12 @@ journal_role_cases!(run_role_case, Retirement, {
 });
 
 #[test]
-#[ignore = "200 deterministic role-matrix iterations; explicit stress gate only"]
+#[ignore = "20 deterministic role-matrix iterations; explicit stress gate only"]
 fn public_journal_fault_matrix_stress() {
-    for _ in 0..200 {
+    // One pass is 28 fsync-heavy cases: ~32 s on a laptop, ~12 s on the hosted
+    // runner. 200 passes outran the 1200 s stress kill; the fs-level stress
+    // test keeps the 200-pass repetition of the same matrix.
+    for _ in 0..20 {
         for role in [
             JournalRole::Pending,
             JournalRole::Manifest,
