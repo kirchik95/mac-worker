@@ -35,7 +35,8 @@ jobs:
 
   build-draft:
     needs: ui
-    runs-on: macos-15
+    # The workers' /usr/bin/git, as in the CI rust jobs.
+    runs-on: macos-26
     timeout-minutes: 45
     env:
       CARGO_BUILD_JOBS: "4"
@@ -54,6 +55,7 @@ jobs:
 
       - name: Verify source and installer
         run: |
+          /usr/bin/git --version
           cargo fmt --all --check
           cargo clippy --locked --all-targets -- -D warnings
           CARGO_BUILD_JOBS=4 cargo clippy --locked --release --no-default-features --lib --bin worker -- -D warnings
