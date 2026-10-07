@@ -3181,6 +3181,16 @@ fn stop_while_owner_status_lags_host_done(operation: &str) {
     assert!(f.worker(&["controller", "drain", "--off"]).status.success());
     assert!(f.worker(&["--json", "task", "reconcile"]).status.success());
     assert_eq!(target(), before, "push after acknowledged {operation}");
+    // reconcile schedules pushes through a detached integration-runner. A
+    // revoked, acknowledged cycle must not get one at all.
+    let driver_scheduled = paths
+        .state
+        .join(format!("integrations/tasks/{task}/driver.json"))
+        .exists();
+    assert!(
+        !driver_scheduled,
+        "integration-runner scheduled after acknowledged {operation}"
+    );
     assert!(host.calls().is_empty());
     let stored = ClientStateStore::open(&paths.state)
         .unwrap()
@@ -3304,6 +3314,16 @@ fn lag_with_recorded_runner_is_busy_then_stops(operation: &str) {
     assert!(f.worker(&["controller", "drain", "--off"]).status.success());
     assert!(f.worker(&["--json", "task", "reconcile"]).status.success());
     assert_eq!(target(), before, "push after acknowledged {operation}");
+    // reconcile schedules pushes through a detached integration-runner. A
+    // revoked, acknowledged cycle must not get one at all.
+    let driver_scheduled = paths
+        .state
+        .join(format!("integrations/tasks/{task}/driver.json"))
+        .exists();
+    assert!(
+        !driver_scheduled,
+        "integration-runner scheduled after acknowledged {operation}"
+    );
     assert!(host.calls().is_empty());
 }
 
