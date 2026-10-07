@@ -15,6 +15,7 @@ https://github.com/user-attachments/assets/42c5a94c-e1ba-4ecb-a30b-c94fe3417efa
 - Two Apple Silicon Macs with Git: your laptop and at least one worker.
 - SSH key access to the worker, with Remote Login enabled. Keep the worker awake while tasks run.
 - One coding agent installed and signed in on the worker. The examples use Codex.
+- Automatic integration needs Apple's `/usr/bin/git` 2.43 or newer on each worker, which means macOS 26 or Xcode/Command Line Tools 26. macOS 15 with Xcode 16 tools ships Git 2.39.5, where integration blocks. Ordinary tasks work without it. The product calls `/usr/bin/git` by absolute path, so Homebrew Git does not count.
 
 [Worker preparation](docs/setup-macos-worker.md) covers SSH, agents and project tools. Run trusted tasks: agents have the worker account's access to files and credentials.
 
@@ -67,7 +68,9 @@ worker task diff <task-id> --stat
 worker task fetch <task-id>
 ```
 
-`result` prints the outcome and summary. `diff --stat` compares the task's base commit with its published result. With integration disabled here, a successful turn uses the default close policy and removes the worker workspace; `diff` still works from the base and result commits kept in that worker's project mirror. If collection has already dropped those commits, `diff` fails with `RESULT_NOT_RETAINED` and the message `task workspace is closed and its result is no longer retained`. `fetch` prints the Git ref to review. Your current working tree stays unchanged. In this manual flow, you decide what to merge. Tasks start from `HEAD` by default; sending uncommitted edits requires [`--wip`](docs/getting-started.md#manual-cli).
+`result` prints the outcome and summary. `diff --stat` compares the task's base commit with its published result. With integration disabled here, a successful `done` turn uses the default `--close-on done` and removes the worker workspace; `diff` still works from the base and result commits kept in that worker's project mirror. If collection has already dropped those commits, `diff` fails with `RESULT_NOT_RETAINED` and the message `task workspace is closed and its result is no longer retained`. `fetch` prints the Git ref to review. Your current working tree stays unchanged. In this manual flow, you decide what to merge. Tasks start from `HEAD` by default; sending uncommitted edits requires [`--wip`](docs/getting-started.md#manual-cli).
+
+Continue a laptop Codex or Claude Code session with `worker task submit --from-session codex[:<uuid>] --prompt "…"` (`claude[:<uuid>]` is the same form). A dirty checkout also needs `--wip`. [Continue a laptop session in the pool](docs/usage.md#continue-a-laptop-session-in-the-pool).
 
 ## Automatic integration
 
@@ -79,17 +82,17 @@ integrate = "main"
 verify_merge = "never"
 ```
 
-Submit a task or batch normally. Each completed eligible task integrates automatically with no accept step. A new merge commit has the previous target tip first and the task result second; an already reachable result needs no new merge. An individual integration notice is titled `Integrated`; its body contains the task ID and, when available, the redacted task title. With `--no-titles`, the body contains only the ID. Conflicts resume the same agent on the same worker and session. If recovery blocks, inspect `worker task status <id>`, repair the cause, then run `worker task integrate <id>`.
+Submit a task or batch normally. Each completed eligible task integrates automatically with no accept step. A new merge commit has the previous target tip first and the task result second; an already reachable result needs no new merge. Conflicts resume the same agent on the same worker and session. If recovery blocks, inspect `worker task status <id>`, repair the cause, then run `worker task integrate <id>`.
 
 Task overrides take precedence over batch defaults, then project settings. Submit `--no-integrate` disables inherited integration. Verification defaults to `never`; resolve and verify turns share the task's `max_followups` allowance. Integration requires a committed base already reachable from the target; `--wip` cannot integrate.
 
-Use `worker controller drain` to pause ordinary handoffs, new integration phases and auxiliary admissions; an admitted step or running turn finishes before parking. `worker controller drain --off` resumes both ordinary handoffs and integration. Controller disable pauses integration only; after re-enable, integration stays paused until `drain --off`. A controller restart creates no pause. Helper rollback also parks integration; restore compatible support before resuming retained Open tasks.
+`worker controller drain` pauses ordinary handoffs, new integration phases and auxiliary admissions; an admitted step or a running turn finishes before parking. `worker controller drain --off` resumes both ordinary handoffs and integration. Controller disable pauses integration only; after re-enable, integration stays paused until `drain --off`. A controller restart creates no pause.
 
-> **Rollback warning:** rolling the helper back below `task.integration` for more than 7 days can lose the repair workspace of parked or blocked integrations.
+> **Rollback warning:** rolling the helper back below `task.integration` for more than 7 days can lose parked or blocked repair workspaces.
 
-GC counts seven idle days from the last host-status update, so an already-idle task can expire sooner after rollback. Retention close keeps result refs. Compatible restore imports a reachable retained merge, or settles a reachable source as already integrated; if neither is reachable, it blocks with `INTEGRATION_WORKSPACE_MISSING`. Failed observation remains uncertain and retries with bounded backoff. Observation-only settlement remains available during drain or disable, with the same target reservation and four-driver Git limit. The task stays Closed, with no new push, workspace recreation or repair turn; `task integrate` refuses it.
+Helper rollback also parks integration; settings, checks, safety limits, idle garbage collection and observation-only settlement are described in [Automatic integration](docs/usage.md#automatic-integration).
 
-When integration is disabled, blocked, or given up, you can still inspect and fetch the retained result for manual review. Manual `task close` keeps the result and gives up unfinished integration; it never authorizes a merge. [Integration settings, checks, safety limits and recovery](docs/usage.md#automatic-integration).
+When integration is disabled, blocked, or given up, you can still inspect and fetch the retained result for manual review. Manual `task close` keeps the result and gives up unfinished integration; it never authorizes a merge.
 
 ## Daily use
 
