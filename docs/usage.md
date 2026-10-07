@@ -78,16 +78,19 @@ The diagram shows the disabled integration flow. Configured tasks use [Automatic
 worker task submit   --agent <a> (--prompt TEXT | --prompt-file PATH) [--wait] [--model M] [--effort E] [--close-on done|never]
 worker task batch    FILE [--name NAME] [--max-parallel N] [--wait | --preview]
 worker task list     [--run ID|NAME] [--state open] [--outcome needs-input]
-worker task status   <id> [--full]     worker task logs <id> [-f]     worker task diff <id> --stat
+worker task status   <id> [--full]     worker task logs <id> [-f] [--turn N] [--raw]     worker task diff <id> [--stat]
 worker task wait     --task-id <id> | --run <ID|NAME> [--timeout 30m]
 worker task say      <id> (--message TEXT | --message-file PATH) [--interrupt] [--wait]
 worker task result   <id>          worker task fetch <id>
 worker task cancel   <id>          worker task close <id> [--discard]
+worker task integrate <id>        worker task publish-retry <id>
 worker task reconcile              # re-own dead runners, re-queue orphaned turns; may launch already-frozen eligible DAG children
 worker gc [--apply]                # preview, then reclaim old tasks, branches, mirrors on the workers
 ```
 
 Confirm the installed grammar with `worker task --help`. There is no `worker task accept` verb.
+
+`worker task submit` also takes `--title` (at most 120 bytes and no control characters; when omitted, the stored title is the redacted first non-empty prompt line), `--project` (default: the current directory), `--base` (default `HEAD`), `--timeout` (`1s` to `24h`; when omitted, the project `[task] timeout`, whose default is `45m`), `--max-followups` (when omitted, the project `[task] max_followups`, whose default is 10, and at most 100), `--max-turns` (at least 1), and `--max-budget` (US cents, at most 100000, so `100000` is `$1000.00`). Claude is the only agent that receives those caps, as `--max-turns` and `--max-budget-usd`. Codex, Cursor, and OpenCode keep the values on the task and do not pass them. `--env-profile` selects a worker profile, and `--worker` pins one inventory name. `--source local|origin`, repeatable `--publish fetch|push`, and `--publish-branch` override the project settings for this submit. `--publish-branch` requires `push`. A source other than `local` or `origin`, a publish value other than `fetch` or `push`, or a repeated publish mode is `TASK_CONFIG_INVALID`. `worker task wait` requires exactly one of `--task-id` or `--run`; both or neither is `TASK_CONFIG_INVALID`. `worker task logs --turn N` prints one turn. `worker task diff` prints the patch; `--stat` prints a diffstat. `worker task list --full` and `worker task status --full` are accepted and print the same record as without the flag.
 
 Integration is opt-in and disabled by default. With it disabled, the lifecycle below keeps its manual review and close behavior. Configured tasks instead follow [Automatic integration](#automatic-integration), including `worker task integrate <id>` for explicit recovery.
 
@@ -237,6 +240,8 @@ lockfiles = ["Cargo.lock"]
 Integration is opt-in and disabled by default. Configure `[task] integrate = "main"` in the project's `.worker.toml`, then submit tasks or batches normally. The setting names a branch on this project's own canonical origin; there is no implicit `main`, origin-HEAD discovery, other-remote target, or laptop-wide enabling default. Settings are frozen before submission effects, so later agent edits to `.worker.toml` cannot change a task's policy.
 
 After the final eligible ordinary Done result is imported and its runner retires, automatic integration adds one merge commit to the target without an accept action. Conflicts resume the same worker, agent and session. An individual integration notice is titled `Integrated`; its body contains the task ID and, when available, the redacted task title. With `--no-titles`, the body contains only the ID. Blocked and dependency-failure notices are titled `Integration blocked` and `Dependency not integrated`. Requested `--close-on done` closes only after the integration receipt and accepted result are imported; `--close-on never` retains the Open workspace and session for later `say`.
+
+The worker that integrates must have Apple `/usr/bin/git` 2.43 or newer. That is the Git shipped with macOS 26, or with Xcode or the Command Line Tools 26. Candidate preparation, on both the host Fetch step and the host Prepare step, runs `git --attr-source=<commit> merge-tree`. Git older than 2.41 rejects `--attr-source` as an unknown option. Git 2.41 and 2.42 accept the option and then crash inside `merge-tree`. Either failure blocks that task with `INTEGRATION_STATE_INVALID` and does not update the target. Ordinary tasks do not run this command and are unaffected.
 
 ### Configuration and admission
 
@@ -499,7 +504,7 @@ publish = ["fetch", "push"]
 
 The base commit must already be on the remote. The worker account needs its own Git access to that remote; SSH agent forwarding from the laptop is disabled.
 
-Writing good briefs is its own skill. Two Claude Code skills ship with the repository and work from any project: [`pool-task-authoring`](../.claude/skills/pool-task-authoring/SKILL.md) turns an objective into one-turn, headless-safe tasks, and [`pool-dispatch`](../.claude/skills/pool-dispatch/SKILL.md) is the mechanical submit / wait / answer / fetch loop. Say "send it to the pool" and Claude Code uses them.
+Writing good briefs is its own skill. Two Claude Code skills ship with the repository and work from any project: [`pool-task-authoring`](../.claude/skills/pool-task-authoring/SKILL.md) turns an objective into one-turn, headless-safe tasks, and [`pool-dispatch`](../.claude/skills/pool-dispatch/SKILL.md) is the mechanical submit / wait / answer / fetch loop. Say "send it to the pool" and Claude Code uses them. `worker skills list` prints those two names. `worker skills get <name>` prints the copy embedded in this binary, including a Grammar section generated from the live CLI; `--grammar-only` prints only that section.
 
 ### Worker helper setup failures
 
@@ -626,6 +631,8 @@ If you run [herdr](https://herdr.dev) on the workers and on your laptop, the poo
 Sidebar tokens `task`, `turn`, `mw_title`, `mw_agent`, and `mw_outcome` are published with every row for custom herdr row layouts. The design and its budgets are in [the herdr reporter design](superpowers/specs/2026-09-08-herdr-reporter-design.md).
 
 ## Configuration
+
+Every command accepts global `--config <PATH>` (default `~/.config/mac-worker/config.toml`), `--json` (machine-readable JSON on stdout), and `-V` / `--version` (the build id, shaped `<version>+<sha>[.dirty]-debug` or `-release`). `worker init <ssh> --name <inventory>` sets the inventory name; omitted, it is the hostname, and a retry keeps an existing name. `worker setup` refuses a debug build unless you pass `--allow-debug`. `worker doctor --include PATTERN` repeats and adds a snapshot include, the same way `task submit --include` does.
 
 `~/.config/mac-worker/config.toml` is written by `worker init` and holds one `[[workers]]` block per Mac in the default laptop-owned mode. A controller-only laptop config may omit `[[workers]]` (see [Remote controller](#remote-controller)). Two optional keys concern herdr, the terminal workspace manager the pool can report into:
 
@@ -910,7 +917,7 @@ warnings as local task results.
 
 ### Submit, disconnect, reconnect
 
-Task commands use the same public grammar in both modes (`worker task --help`): `submit`, `batch`, `list`, `status`, `logs` (`-f` / `--raw` / `--turn`), `diff`, `say`, `cancel`, `result`, `fetch`, `close`, `integrate`, `wait`, `reconcile`. Confirm the installed form with `worker skills get pool-dispatch --grammar-only` rather than copying flags from a skill file.
+Task commands use the same public grammar in both modes (`worker task --help`): `submit`, `batch`, `list`, `status`, `logs` (`-f` / `--raw` / `--turn`), `diff`, `say`, `cancel`, `result`, `fetch`, `close`, `integrate`, `publish-retry`, `wait`, `reconcile`. Confirm the installed form with `worker skills get pool-dispatch --grammar-only` rather than copying flags from a skill file.
 
 On submit the laptop freezes the prompt, project identity, settings, and base (`HEAD`, `--base`, or `--wip` / `--include`) and transfers that snapshot before the controller accepts the request. A retry of the **same original envelope** keeps that freeze; it does not recapture a later HEAD or `.worker.toml`. After accept you can close the laptop CLI. That ACK means the request is persisted on the controller store; it does **not** mean a runner or the agent has started — enabled submit can stay queued until `worker controller run` advances it. Reconnect with `status`, `logs`, `wait`, `list`, and the dashboard.
 
