@@ -211,3 +211,6 @@ concurrent clients, and the real 10 s supervisor TERM grace.
 - **The full suite** runs nightly and on manual dispatch, through `scripts/test-gate.sh --profile ci` without a RAM
   disk, followed by the stress tests.
 - Both CI tiers and release verification check the production graph separately from support-enabled targets.
+- **macOS jobs run on `macos-26`, the workers' macOS.** Product code and tests run `/usr/bin/git`, which follows the
+  selected Xcode, never the Homebrew Git on `PATH`. Integration needs Git 2.43 or newer; the `macos-15` image's
+  default Xcode 16.4 ships Git 2.39.5.

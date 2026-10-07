@@ -9,10 +9,12 @@ On the **worker**, use your existing macOS account or a dedicated standard accou
 Open Terminal on the worker and check Git:
 
 ```bash
-git --version
+/usr/bin/git --version
 ```
 
 If macOS asks to install Command Line Tools, complete the installation. You can also start it with `xcode-select --install`.
+
+mac-worker's own Git commands run `/usr/bin/git`, not a Git found on `PATH`. Automatic integration needs Git 2.43 or newer there. Command Line Tools 26.2 include Apple Git 2.50.1; the tools for macOS 15 include Git 2.39.5, which is too old.
 
 Keep the Mac powered and awake while jobs run. On a desktop Mac, enable the setting to prevent automatic sleep when the display is off. Check the power settings again after rebooting. The worker needs outbound access to its agent provider; mac-worker needs only SSH inbound.
 
