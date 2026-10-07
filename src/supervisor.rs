@@ -851,6 +851,10 @@ fn prove_killed_group_absent(
                 }
             }
             (ProcessObservation::Absent, ProcessGroupObservation::Present) => {
+                // A fork racing the first SIGKILL can survive it. Re-send on
+                // every poll inside the existing deadline. EPERM/ESRCH stay
+                // draining answers and are not absence.
+                let _ = signal_group_while_draining(runtime, child.pid(), libc::SIGKILL)?;
                 if !sleep_until_group_deadline(runtime, deadline) {
                     return Err(reconciliation_ambiguous(
                         "targeted child leader and process group were not both proven absent",
@@ -7450,9 +7454,53 @@ commands = ["PATH=/bin:/usr/bin /bin/sleep 8; printf done > setup.done"]
 
         assert_eq!(
             runtime.signals(),
-            vec![(child.pid(), libc::SIGTERM), (child.pid(), libc::SIGKILL)]
+            vec![
+                (child.pid(), libc::SIGTERM),
+                (child.pid(), libc::SIGKILL),
+                (child.pid(), libc::SIGKILL),
+            ]
         );
         assert_eq!(runtime.sleeps(), vec![TERM_GRACE, POLL_INTERVAL]);
+        assert!(runtime.simulated_wait() <= TERM_GRACE + TERM_GRACE);
+    }
+
+    #[test]
+    fn killed_leader_absent_with_present_group_resignals_kill_on_each_poll() {
+        let child = recorded_child();
+        let runtime = ScriptedReconciliationRuntime::new(
+            [
+                ProcessObservation::Matching {
+                    process_group: child.pid(),
+                },
+                ProcessObservation::Matching {
+                    process_group: child.pid(),
+                },
+                ProcessObservation::Absent,
+                ProcessObservation::Absent,
+                ProcessObservation::Absent,
+            ],
+            [
+                ProcessGroupObservation::Present,
+                ProcessGroupObservation::Present,
+                ProcessGroupObservation::Absent,
+            ],
+        );
+
+        terminate_exact_recorded_group(&runtime, Some(child)).unwrap();
+
+        assert_eq!(
+            runtime.signals(),
+            vec![
+                (child.pid(), libc::SIGTERM),
+                (child.pid(), libc::SIGKILL),
+                (child.pid(), libc::SIGKILL),
+                (child.pid(), libc::SIGKILL),
+            ]
+        );
+        assert_eq!(
+            runtime.sleeps(),
+            vec![TERM_GRACE, POLL_INTERVAL, POLL_INTERVAL]
+        );
         assert!(runtime.simulated_wait() <= TERM_GRACE + TERM_GRACE);
     }
 
@@ -7497,7 +7545,12 @@ commands = ["PATH=/bin:/usr/bin /bin/sleep 8; printf done > setup.done"]
         );
         assert_eq!(
             runtime.signals(),
-            vec![(child.pid(), libc::SIGTERM), (child.pid(), libc::SIGKILL)]
+            vec![
+                (child.pid(), libc::SIGTERM),
+                (child.pid(), libc::SIGKILL),
+                (child.pid(), libc::SIGKILL),
+                (child.pid(), libc::SIGKILL),
+            ]
         );
         assert_eq!(runtime.sleeps(), vec![POLL_INTERVAL]);
         assert!(runtime.simulated_wait() <= TERM_GRACE);
