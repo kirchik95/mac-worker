@@ -3321,3 +3321,175 @@ fn owner_status_lagging_host_done(record: &LocalTaskRecord) -> LocalTaskRecord {
     turn["ended_at_millis"] = Value::Null;
     serde_json::from_value(wire).unwrap()
 }
+
+/// The live 2026-10-07 controller sequence: the controller's owner record is
+/// still Active while the host turn is Done (the operator saw open|None from
+/// the read-only host projection). A durable task.cancel frozen on that
+/// Active record must not ack success; its replays must reach an
+/// acknowledged revoke through the real host before any push.
+#[test]
+fn controller_cancel_frozen_during_owner_lag_replays_to_an_acknowledged_stop() {
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        controller::{
+            ControllerFault, ControllerStore, RequestPhase, TaskSubmitHandler, parse_request,
+        },
+        core::config::Config,
+        host::process::SystemProcessRunner,
+    };
+    use std::sync::{Arc, Mutex, mpsc};
+
+    let (f, task) = parked_source_fixture();
+    // In-process controller handler: same SSH shim and Git isolation as f.worker.
+    unsafe {
+        std::env::set_var("MAC_WORKER_TEST_SSH", &f.ssh);
+        std::env::set_var("GIT_CONFIG_GLOBAL", "/dev/null");
+        std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+        std::env::set_var("HOME", &f.laptop);
+    }
+    let paths = owner_paths(&f);
+    let state = RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+        .unwrap();
+    let parked = state.load(task).unwrap().unwrap();
+    std::fs::remove_file(
+        paths
+            .state
+            .join(format!("integrations/tasks/{task}/record.json")),
+    )
+    .unwrap();
+    let client = ClientStateStore::open(&paths.state).unwrap();
+    let ordinary = client.load_task(task).unwrap();
+    let observer = FakeIntegrationObserver::default();
+    observer.insert(IntegrationTaskFacts {
+        cycle_base: parked.cycle_base,
+        ordinary,
+        result_imported: true,
+        session_import_complete: true,
+        continuation_pending: false,
+        runner_present: false,
+        stop_requested: false,
+        close_pending: false,
+        submission_pending: false,
+        auxiliary_purpose: None,
+    });
+    let host = FakeIntegrationHost::default();
+    let turns = FakeIntegrationTurns::default();
+    let (ready, reached) = mpsc::channel();
+    let (release, resume) = mpsc::channel();
+    let runtime = FirstIntentBarrier {
+        clock: ManualIntegrationRuntime::default(),
+        ready,
+        release: Mutex::new(resume),
+    };
+    let coordinator = IntegrationCoordinator::new(&state, &host, &turns, &runtime, &observer);
+    let origin = f.laptop.parent().unwrap().join("origin.git");
+    let target = || {
+        f.project
+            .git(&["--git-dir", origin.to_str().unwrap(), "rev-parse", "main"])
+            .stdout
+    };
+    let before = target();
+    let config = Config::load(&f.config).unwrap();
+    let handler = TaskSubmitHandler::new(&SystemProcessRunner, &config, &paths, &client);
+    let store = ControllerStore::open(&paths.controller_state_root()).unwrap();
+    let request = parse_request(
+        &serde_json::to_vec(&json!({"protocol_version": 7,
+            "request_id": "000000000000000000000000000000c1", "command": "task.cancel",
+            "body": {"task_id": task.to_string()}}))
+        .unwrap(),
+    )
+    .unwrap();
+    let (busy, after_busy, settled) = std::thread::scope(|scope| {
+        let publisher =
+            scope.spawn(|| coordinator.on_terminal(task, parked.snapshot.source_turn_id));
+        reached
+            .recv_timeout(crate::support::HANDSHAKE_TIMEOUT)
+            .unwrap();
+        let current = client.load_task(task).unwrap();
+        let lagged = owner_status_lagging_host_done(&current);
+        assert!(client.update_task_if_current(&current, lagged).unwrap());
+        let runner =
+            ProcessIdentity::new(crate::support::fixture_pid(2_000_000_041), 9_999_999).unwrap();
+        client
+            .record_runner(task, Some(RunnerIdentity::new(runner)))
+            .unwrap();
+        // Freeze while the controller still holds the Active record.
+        store
+            .handle_with(&request, &handler, ControllerFault::StopAfterPublish)
+            .unwrap();
+        // First execution: the host already finished Done. Not an OK ack.
+        let busy = store
+            .handle_with(&request, &handler, ControllerFault::None)
+            .map(|_| "OK".to_owned())
+            .unwrap_or_else(|e| format!("{}:{}", e.public_code(), e.public_message()));
+        let after_busy = (
+            store.load(request.request_id()).unwrap().unwrap().phase(),
+            client.load_task(task).unwrap().status().state(),
+            state.load(task).unwrap(),
+        );
+        // The runner retires; the client/leader replays the same durable row.
+        client.record_runner(task, None).unwrap();
+        let settled = store
+            .handle_with(&request, &handler, ControllerFault::None)
+            .map(|_| "OK".to_owned())
+            .unwrap_or_else(|e| format!("{}:{}", e.public_code(), e.public_message()));
+        release.send(()).unwrap();
+        publisher.join().unwrap().unwrap();
+        (busy, after_busy, settled)
+    });
+    let (phase, owner_state, cycle) = after_busy;
+    let settled_phase = store.load(request.request_id()).unwrap().unwrap().phase();
+    let record = state.load(task).unwrap();
+    let stop = record.as_ref().map(|r| {
+        (
+            r.snapshot.state,
+            r.tombstone.as_ref().map(|t| t.acknowledged),
+        )
+    });
+    let before_reconcile = target() == before;
+    assert!(f.worker(&["controller", "drain", "--off"]).status.success());
+    assert!(f.worker(&["--json", "task", "reconcile"]).status.success());
+    // reconcile schedules pushes through a detached integration-runner. A
+    // revoked, acknowledged cycle must not get one at all.
+    let driver_scheduled = paths
+        .state
+        .join(format!("integrations/tasks/{task}/driver.json"))
+        .exists();
+    let after_reconcile = target() == before;
+    assert_eq!(
+        (
+            busy.as_str(),
+            phase,
+            owner_state,
+            cycle.is_none(),
+            settled.as_str(),
+            settled_phase,
+            stop,
+            before_reconcile,
+            after_reconcile,
+            driver_scheduled,
+        ),
+        (
+            "TASK_BUSY:INTEGRATION_IN_PROGRESS",
+            RequestPhase::Published,
+            TaskState::Open,
+            true,
+            "OK",
+            RequestPhase::Acked,
+            Some((IntegrationStatus::Revoked, Some(true))),
+            true,
+            true,
+            false,
+        ),
+        "(first ack, its phase, owner state, no cycle yet, replay ack, phase, stop, \
+         target unchanged before reconcile, target unchanged after drain off + reconcile, \
+         integration-runner scheduled)"
+    );
+    assert!(host.calls().is_empty());
+    // A later replay returns the saved result without executing again.
+    assert!(
+        store
+            .handle_with(&request, &handler, ControllerFault::None)
+            .is_ok()
+    );
+}

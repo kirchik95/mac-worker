@@ -2053,3 +2053,161 @@ fn unbound_revoked_cycle_with_retained_receipt_settles() {
         RequestPhase::Acked
     );
 }
+
+/// Owner change applied to the frozen record before the replay.
+type FrozenChange = Box<
+    dyn Fn(
+        &mac_worker::test_support::task::model::LocalTaskRecord,
+    ) -> mac_worker::test_support::task::model::LocalTaskRecord,
+>;
+
+#[test]
+fn unbound_refresh_past_an_older_cycle_keeps_real_changes_final() {
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        controller::{ControllerFault, ControllerStore, RequestPhase, TaskSubmitHandler},
+        task::model::{LocalTaskRecord, TaskOutcome},
+    };
+    let older_cycle =
+        |state: &RootedIntegrationState,
+         accepted: mac_worker::test_support::task::model::BaseOid| {
+            let mut older = sample_record(fixture_task(), fixture_source(), "main");
+            older.snapshot.state = IntegrationStatus::Integrated;
+            older.snapshot.disposition = Some(IntegrationDisposition::AlreadyIntegrated);
+            older.snapshot.observed_target_oid = Some(accepted.clone());
+            older.receipt = Some(IntegrationReceipt {
+                integration_id: older.snapshot.integration_id,
+                epoch: 0,
+                source_turn_id: fixture_source(),
+                source_head: fixture_head(),
+                target_head: accepted,
+                merge_oid: None,
+                disposition: IntegrationDisposition::AlreadyIntegrated,
+                imported: true,
+                recorded_at_millis: 1001,
+            });
+            state
+                .replace(fixture_task(), IntegrationRevision(0), &older)
+                .unwrap();
+        };
+    let with_new_turn = |done: &LocalTaskRecord| -> LocalTaskRecord {
+        let mut wire = serde_json::to_value(done).unwrap();
+        wire["status"]["state"] = json!("active");
+        wire["status"]["last_outcome"] = serde_json::Value::Null;
+        let mut next = wire["status"]["turns"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        next["turn_number"] = json!(3);
+        next["agent_committed"] = serde_json::Value::Null;
+        next["turn_id"] = json!("00000000000000000000000000000009");
+        next["terminal"] = serde_json::Value::Null;
+        next["outcome"] = serde_json::Value::Null;
+        next["ended_at_millis"] = serde_json::Value::Null;
+        wire["status"]["turns"].as_array_mut().unwrap().push(next);
+        serde_json::from_value(wire).unwrap()
+    };
+    let cases: Vec<(&str, bool, FrozenChange)> = vec![
+        (
+            "needs_input",
+            true,
+            Box::new(|_| {
+                sample_ordinary_followup(
+                    fixture_task(),
+                    fixture_source(),
+                    Some(TaskOutcome::NeedsInput),
+                )
+            }),
+        ),
+        (
+            "failed",
+            true,
+            Box::new(|_| {
+                sample_ordinary_followup(
+                    fixture_task(),
+                    fixture_source(),
+                    Some(TaskOutcome::failed("FIXTURE")),
+                )
+            }),
+        ),
+        (
+            "cancelled",
+            true,
+            Box::new(|_| {
+                sample_ordinary_followup(
+                    fixture_task(),
+                    fixture_source(),
+                    Some(TaskOutcome::Cancelled),
+                )
+            }),
+        ),
+        (
+            "new_turn",
+            true,
+            Box::new(move |_| {
+                with_new_turn(&sample_ordinary_followup(
+                    fixture_task(),
+                    fixture_source(),
+                    Some(TaskOutcome::Done),
+                ))
+            }),
+        ),
+        (
+            "non_active_freeze",
+            false,
+            Box::new(|frozen: &LocalTaskRecord| {
+                let mut wire = serde_json::to_value(frozen).unwrap();
+                wire["status"]["updated_at_millis"] = json!(1009);
+                serde_json::from_value(wire).unwrap()
+            }),
+        ),
+    ];
+    for (index, (name, active_freeze, next)) in cases.into_iter().enumerate() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = isolated_paths(&temp.path().canonicalize().unwrap());
+        let config = fixture_config(&paths);
+        let tasks = ClientStateStore::open(&paths.state).unwrap();
+        let frozen = if active_freeze {
+            sample_ordinary_followup(fixture_task(), fixture_source(), None)
+        } else {
+            sample_ordinary_followup(fixture_task(), fixture_source(), Some(TaskOutcome::Done))
+        };
+        tasks.create_task(frozen.clone()).unwrap();
+        let state = RootedIntegrationState::open(
+            &paths,
+            std::sync::Arc::new(ManualIntegrationRuntime::default()),
+        )
+        .unwrap();
+        state
+            .publish_policy(fixture_task(), &sample_policy("main"))
+            .unwrap();
+        older_cycle(&state, frozen.status().head_oid().unwrap().clone());
+        let handler = TaskSubmitHandler::new(&NoProcesses, &config, &paths, &tasks);
+        let store = ControllerStore::open(&paths.controller_state_root()).unwrap();
+        let request = freeze_published(
+            &store,
+            &handler,
+            "task.cancel",
+            &format!("0000000000000000000000000000b{index:03}"),
+        );
+        let changed = next(&frozen);
+        assert!(
+            tasks.update_task_if_current(&frozen, changed).unwrap(),
+            "{name}"
+        );
+        let answer = store
+            .handle_with(&request, &handler, ControllerFault::None)
+            .map(|_| "OK".to_owned())
+            .unwrap_or_else(|error| error.public_code());
+        assert_eq!(
+            (
+                answer.as_str(),
+                store.load(request.request_id()).unwrap().unwrap().phase()
+            ),
+            ("TASK_REVISION_CONFLICT", RequestPhase::Acked),
+            "{name}"
+        );
+    }
+}
