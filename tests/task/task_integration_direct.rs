@@ -282,7 +282,7 @@ fn terminal_child_imports_and_acknowledges_the_merge_before_done_close() {
         "--task-id",
         &task.to_string(),
         "--timeout",
-        "120s",
+        INTEGRATION_WAIT_TIMEOUT,
     ]);
     assert!(
         wait.status.success(),
@@ -920,7 +920,7 @@ fn native_attribute_resolution_case(tamper: bool) {
             "--task-id",
             &task.to_string(),
             "--timeout",
-            "120s",
+            INTEGRATION_WAIT_TIMEOUT,
         ]);
         assert!(
             !wait.status.success(),
@@ -1536,7 +1536,7 @@ fn failed_source_checks_block_native_integration(herdr: bool) {
         "--task-id",
         &task.to_string(),
         "--timeout",
-        "120s",
+        INTEGRATION_WAIT_TIMEOUT,
     ]);
     assert_eq!(
         wait.status.code(),
@@ -1659,7 +1659,7 @@ printf '%s\n' '{"type":"thread.started","thread_id":"00000000-0000-0000-0000-000
         "--run",
         &run.to_string(),
         "--timeout",
-        "120s",
+        INTEGRATION_WAIT_TIMEOUT,
     ]);
     assert!(
         wait.status.success(),
@@ -2449,7 +2449,7 @@ fn cancelling_a_live_auxiliary_retains_stop_until_the_host_and_runner_retire() {
         "--task-id",
         &task.to_string(),
         "--timeout",
-        "60s",
+        INTEGRATION_WAIT_TIMEOUT,
     ]);
     assert!(
         !String::from_utf8_lossy(&wait.stdout).contains("WAIT_TIMEOUT"),
