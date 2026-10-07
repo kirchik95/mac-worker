@@ -3074,3 +3074,186 @@ fn stop_in_done_before_first_intent(operation: &str, retired: bool) {
         );
     }
 }
+
+/// A stop can meet a push that already won while a queue row for this cycle's
+/// resolve turn still exists. Marking that row cancel-requested is the stop
+/// itself, not a newer owner turn: cancel must not report a finished stop, and
+/// the won merge is imported once the row retires.
+#[test]
+fn native_cancel_after_a_won_push_with_an_auxiliary_row_never_reports_a_stop() {
+    use mac_worker::test_support::{
+        client_state::{ClientStateStore, scheduler::WorkerPreference},
+        host::job::{CommandSummary, QueueEntry, QueueEntryKind},
+        session::SessionAgent,
+        task::turn_runner::{InlineRunnerExecutor, RunnerExecutor},
+    };
+    use std::io::BufRead;
+    let f = integration_fixture(true);
+    f.capture_fixture(SessionAgent::Codex);
+    f.install_agent(SessionAgent::Codex);
+    let outside = f.laptop.parent().unwrap().join("outside");
+    let origin = f.laptop.parent().unwrap().join("origin.git");
+    f.project
+        .git(&["clone", origin.to_str().unwrap(), outside.to_str().unwrap()]);
+    for (key, value) in [
+        ("user.email", "fixture@example.test"),
+        ("user.name", "Fixture"),
+    ] {
+        f.project
+            .git(&["-C", outside.to_str().unwrap(), "config", key, value]);
+    }
+    let agent = f.host.join("bin/codex");
+    let work = format!(
+        r#"count=0; [ ! -f "$HOME/turn-count" ] || count=$(cat "$HOME/turn-count")
+count=$((count + 1)); printf '%s' "$count" > "$HOME/turn-count"
+if [ "$count" = 1 ]; then
+  printf 'ordinary\n' > README
+  (cd '{}' && printf 'outside\n' > README && /usr/bin/git add README && /usr/bin/git commit -m outside && /usr/bin/git push origin main) >/dev/null 2>&1 || exit 95
+else
+  printf 'resolved\n' > README
+fi
+printf '%s\n' "$@" > "$HOME/argv""#,
+        outside.display()
+    );
+    let script = std::fs::read_to_string(&agent)
+        .unwrap()
+        .replace("printf '%s\\n' \"$@\" > \"$HOME/argv\"", &work);
+    std::fs::write(agent, script).unwrap();
+    // The host completes the push; its reply is held, then lost.
+    let ready = f.laptop.parent().unwrap().join("push-ready");
+    let release = f.laptop.parent().unwrap().join("push-release");
+    fixture_fifo(&ready);
+    fixture_fifo(&release);
+    let release_on_drop = ReleaseFixtureFifo(release.clone());
+    let interception = format!(
+        r#"if command.endswith(' host task-integration'):
+    data = sys.stdin.buffer.read()
+    action = json.loads(data)['action']
+    result = subprocess.run(['/bin/sh','-c',command], input=data, capture_output=True)
+    if action.get('step') == 'push' and result.returncode == 0:
+        with open({ready:?}, 'w') as f: f.write('published\n')
+        with open({release:?}, 'r') as f: f.readline()
+        sys.exit(255)
+    sys.stdout.buffer.write(result.stdout)
+    sys.stderr.buffer.write(result.stderr)
+    sys.exit(result.returncode)
+os.execv('/bin/sh', ['/bin/sh', '-c', command])"#,
+        ready = ready.to_str().unwrap(),
+        release = release.to_str().unwrap()
+    );
+    let ssh = std::fs::read_to_string(&f.ssh).unwrap().replace(
+        "os.execv('/bin/sh', ['/bin/sh', '-c', command])",
+        &interception,
+    );
+    std::fs::write(&f.ssh, ssh).unwrap();
+    super::session_import_e2e::warm_executable(&f.ssh);
+    let task = submitted_task(&f.worker(&[
+        "--json",
+        "task",
+        "submit",
+        "--from-session",
+        "codex",
+        "--prompt",
+        "produce conflict",
+        "--integrate",
+        "main",
+        "--close-on",
+        "never",
+        "--worker",
+        "fixture",
+        "--no-wait",
+        "--wait",
+    ]));
+    // The resolve turn finishes in the background; this wait drives the
+    // cycle to its push, which the host completes and the reply is held.
+    std::thread::scope(|scope| {
+        let driver = scope.spawn(|| {
+            f.worker(&[
+                "--json",
+                "task",
+                "wait",
+                "--task-id",
+                &task.to_string(),
+                "--timeout",
+                "150s",
+            ])
+        });
+        let mut signal = String::new();
+        std::io::BufReader::new(std::fs::File::open(&ready).unwrap())
+            .read_line(&mut signal)
+            .unwrap();
+        assert_eq!(signal, "published\n");
+        let tasks = ClientStateStore::open(&owner_paths(&f).state).unwrap();
+        let state = RootedIntegrationState::open(
+            &owner_paths(&f),
+            std::sync::Arc::new(ManualIntegrationRuntime::default()),
+        )
+        .unwrap();
+        let pushing = state.load(task).unwrap().unwrap();
+        assert_eq!(pushing.snapshot.state, IntegrationStatus::Pushing);
+        let resolve = pushing.auxiliaries.last().unwrap().turn_id;
+        let local = tasks.load_task(task).unwrap();
+        assert_eq!(local.status().turns().last().unwrap().turn_id(), resolve);
+        assert!(tasks.queue_entry_for_task_turn(task).unwrap().is_none());
+        // A resolve row whose runner has not retired yet. It is owned by this
+        // live test process, so the background wait never adopts or runs it.
+        let row_owner = InlineRunnerExecutor
+            .start(&owner_paths(&f), task, resolve)
+            .unwrap()
+            .process_identity();
+        tasks
+            .enqueue(
+                QueueEntry::new(
+                    resolve,
+                    tasks.client_id(),
+                    local.meta().project_id().to_owned(),
+                    local.meta().worktree_id().to_owned(),
+                    CommandSummary::argv(1).unwrap(),
+                    Vec::new(),
+                    WorkerPreference::Automatic,
+                    QueueEntryKind::TaskTurn,
+                    None,
+                    row_owner,
+                    1_700_000_000_000,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let cancel = f.worker(&["--json", "task", "cancel", &task.to_string()]);
+        let stopped = state.load(task).unwrap().unwrap();
+        // Release before asserting so a regression cannot strand the driver.
+        drop(release_on_drop);
+        tasks
+            .remove_task_turn_after_terminal(resolve, row_owner)
+            .unwrap();
+        assert!(
+            !cancel.status.success(),
+            "stop reported over a won push: {} {:?}",
+            String::from_utf8_lossy(&cancel.stdout),
+            stopped.snapshot
+        );
+        assert_ne!(stopped.snapshot.state, IntegrationStatus::Revoked);
+        assert!(stopped.receipt.is_some());
+        driver.join().unwrap();
+    });
+    let committed = wait_integrated(&f, task);
+    let receipt = committed.receipt.unwrap();
+    assert!(receipt.imported);
+    assert_eq!(receipt.disposition, IntegrationDisposition::Merged);
+    assert_eq!(
+        String::from_utf8(
+            f.project
+                .git(&["--git-dir", origin.to_str().unwrap(), "rev-parse", "main"])
+                .stdout
+        )
+        .unwrap()
+        .trim(),
+        receipt.merge_oid.unwrap().as_str()
+    );
+    let again = f.worker(&["--json", "task", "cancel", &task.to_string()]);
+    assert!(
+        String::from_utf8_lossy(&again.stdout).contains("INTEGRATION_ALREADY_COMMITTED"),
+        "{}",
+        String::from_utf8_lossy(&again.stdout)
+    );
+}
