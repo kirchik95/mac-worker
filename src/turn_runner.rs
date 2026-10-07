@@ -3693,6 +3693,31 @@ mod session_pin_cleanup_tests {
 
     #[test]
     fn accepted_imported_handoff_and_cancel_keep_pins_and_records() {
+        // `cargo test --lib` runs this beside other tests in one process.
+        // `Command::pre_exec` forks without taking `HeldFork`, so that child
+        // can inherit this journal's flock fd until exec. `LogWriter::open`
+        // then fails `LOCK_EX | LOCK_NB` and `cancel_before_acceptance`
+        // reports IO before it can see that the turn was accepted. The body
+        // runs in its own process, where no neighbour can hold that fd.
+        const MARKER: &str = "MAC_WORKER_ACCEPTED_PIN_BODY";
+        if std::env::var_os(MARKER).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .env(MARKER, "1")
+                .args([
+                    "--exact",
+                    "turn_runner::session_pin_cleanup_tests::accepted_imported_handoff_and_cancel_keep_pins_and_records",
+                    "--test-threads=1",
+                ])
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "isolated pin body failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            return;
+        }
         let fixture = Fixture::new(true, true);
         let before = serde_json::to_vec(&fixture.store.load_task(fixture.task).unwrap()).unwrap();
         let row = fixture.store.queue_entry(fixture.turn).unwrap();
