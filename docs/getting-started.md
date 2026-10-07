@@ -25,6 +25,7 @@ For the short version, see [English](../README.md) or [Русский](../README
 
 - **Your laptop:** an Apple Silicon Mac, Git and SSH. For the primary path, a local coding agent (Claude Code, Codex, Cursor, or OpenCode) that can run `worker` from the project. CLI-only use does not need one.
 - **One worker:** another Apple Silicon Mac with Remote Login enabled and Git installed. It needs network access to the agent provider and must stay awake while working.
+- **Automatic integration** needs Apple's `/usr/bin/git` 2.43 or newer on each worker, which means macOS 26 or Xcode/Command Line Tools 26. macOS 15 with Xcode 16 tools ships Git 2.39.5, where integration blocks. Ordinary tasks work without it. The product calls `/usr/bin/git` by absolute path, so Homebrew Git does not count.
 - **One coding agent on the worker**, signed in as the account you connect to. Codex is the default; the setup guide covers its installation and login.
 
 You own SDKs, language tools, agent logins, and secrets on each Mac. mac-worker does not install toolchains or copy credential profiles. Optional `[setup]` in `.worker.toml` can warm a project workspace; it never infers packages.
@@ -51,7 +52,7 @@ worker --version
 
 Add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zprofile` to make it available in new macOS terminal sessions. To choose a different location, pass `--bin-dir /your/bin` to the installer. The installer copies the `worker` binary only; laptop skills are a separate local install in [Get your first branch](#3-get-your-first-branch).
 
-The latest published release is [v0.1.0](https://github.com/kirchik95/mac-worker/releases) from 2026-09-13. It predates most of what these docs describe: automatic integration, the supervised controller commands (everything under `worker controller` except `run`), `worker events`, `worker notify`, `--questions`, `say --interrupt`, `setup --allow-debug`, and the batch retirement. For the current behavior, use [Build from source](#build-from-source) below. There is no public Homebrew tap; the repository only generates the formula.
+The latest published release is [v0.1.0](https://github.com/kirchik95/mac-worker/releases) from 2026-09-13. It predates most of what these docs describe: automatic integration, continuing a laptop Codex or Claude Code session (`worker task submit --from-session`), OpenCode 2.x, the supervised controller commands (everything under `worker controller` except `run`), `worker events`, `worker notify`, `--questions`, `say --interrupt`, `setup --allow-debug`, and the batch retirement. For the current behavior, use [Build from source](#build-from-source) below. There is no public Homebrew tap; the repository only generates the formula.
 
 ### 2. Connect one Mac
 
@@ -142,6 +143,8 @@ worker task submit --agent codex --no-integrate --wip --wait \
 ```
 
 `--wip` is opt-in and needs a local source with fetch-only publication; origin source and push need a committed base. It cannot be combined with integration (`INTEGRATION_WIP_BASE`); use `--no-integrate` for a dirty session or commit its intended base before submitting with integration. Name new files with `--include` or `snapshot.include_untracked`; unmatched non-ignored untracked files cause `UNTRACKED_INPUT`. `--include` can select ignored files, but sensitive paths still need an exact `snapshot.allow_sensitive` entry.
+
+Continue a laptop Codex or Claude Code session with `worker task submit --from-session codex[:<uuid>] --prompt "…"` (`claude[:<uuid>]` is the same form). A dirty checkout also needs `--wip`. [Continue a laptop session in the pool](usage.md#continue-a-laptop-session-in-the-pool).
 
 For real coding tasks, install your project's language tools and dependencies on the worker yourself. Optional `[setup]` in `.worker.toml` can run an operator-written recipe in the task workspace; `check` only proves **this** workspace. `worker task batch FILE --preview` validates a batch without opening client state or dispatching. Preview also supports a controller-only laptop configuration: it preserves worker pins for the controller to validate at submit time. With integration disabled, named `depends_on` / `base = "from:<id>"` edges execute when each parent is Closed and Done; batches without those fields stay independent. Configured parents instead need successful integration and result import, including with `close_on = "never"`. Start with this small file task to check the connection and agent before running a build.
 

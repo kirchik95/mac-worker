@@ -46,12 +46,15 @@ jobs:
     # integration suite runs nightly, on demand and in the release workflow;
     # run it locally before landing larger changes.
     if: github.event_name == 'push' || github.event_name == 'pull_request'
-    runs-on: macos-15
+    # Product code runs /usr/bin/git, which follows the image's Xcode, not PATH.
+    # Integration needs Git 2.43 or newer; macos-15's default Xcode 16.4 ships 2.39.5.
+    runs-on: macos-26
     timeout-minutes: 30
     env:
       CARGO_TARGET_DIR: /private/tmp/mac-worker-dashboard-stage4-target
     steps:
       - uses: actions/checkout@v7
+      - run: /usr/bin/git --version
       - run: rustup component add rustfmt clippy
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --all-targets -- -D warnings
@@ -61,7 +64,8 @@ jobs:
 
   rust-full:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: macos-15
+    # The workers' /usr/bin/git; see the rust job.
+    runs-on: macos-26
     timeout-minutes: 60
     env:
       CARGO_TARGET_DIR: /private/tmp/mac-worker-dashboard-stage4-target
@@ -69,6 +73,7 @@ jobs:
       MAC_WORKER_GATE_RAMDISK_MB: "0"
     steps:
       - uses: actions/checkout@v7
+      - run: /usr/bin/git --version
       - run: rustup component add rustfmt clippy
       - name: Install cargo-nextest
         run: curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"

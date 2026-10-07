@@ -760,16 +760,57 @@ fn write_viewer_heartbeat_lost(stderr: &mut dyn Write) {
     let _ = stderr.flush();
 }
 
+/// Clock and poll gate for the viewer watchdog.
+///
+/// Production always reports the real monotonic clock and polls. Tests park
+/// in `before_poll` so they can advance time and deliver the next byte
+/// without sleeping: a wall-clock sleep shorter than the timeout still loses
+/// when the runner is paused across that timeout.
+trait ViewerStdinPace {
+    fn now(&self) -> std::time::Instant;
+    /// `true` polls stdin. `false` rechecks the deadline without polling.
+    fn before_poll(&self) -> bool;
+}
+
+struct LiveViewerClock;
+
+impl ViewerStdinPace for LiveViewerClock {
+    fn now(&self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
+
+    fn before_poll(&self) -> bool {
+        true
+    }
+}
+
 /// Watch the viewer stdin. No bytes means an older laptop: block until EOF, as
 /// before. The first byte arms heartbeat mode; silence longer than `timeout`
 /// is a lost laptop.
 fn watch_viewer_stdin(fd: i32, heartbeat_timeout: std::time::Duration) -> ViewerStdinEvent {
+    watch_viewer_stdin_with(fd, heartbeat_timeout, &LiveViewerClock)
+}
+
+fn watch_viewer_stdin_with(
+    fd: i32,
+    heartbeat_timeout: std::time::Duration,
+    pace: &dyn ViewerStdinPace,
+) -> ViewerStdinEvent {
     let mut heartbeat = false;
-    let mut last_byte = std::time::Instant::now();
+    let mut last_byte = pace.now();
     let mut buffer = [0u8; 256];
     loop {
+        if heartbeat {
+            let elapsed = pace.now().saturating_duration_since(last_byte);
+            if elapsed >= heartbeat_timeout {
+                return ViewerStdinEvent::HeartbeatLost;
+            }
+        }
+        if !pace.before_poll() {
+            continue;
+        }
         let timeout_ms = if heartbeat {
-            let elapsed = last_byte.elapsed();
+            let elapsed = pace.now().saturating_duration_since(last_byte);
             if elapsed >= heartbeat_timeout {
                 return ViewerStdinEvent::HeartbeatLost;
             }
@@ -812,7 +853,7 @@ fn watch_viewer_stdin(fd: i32, heartbeat_timeout: std::time::Duration) -> Viewer
             return ViewerStdinEvent::Eof;
         }
         heartbeat = true;
-        last_byte = std::time::Instant::now();
+        last_byte = pace.now();
     }
 }
 
@@ -869,10 +910,18 @@ fn viewer_shutdown_signal() -> (
 #[cfg(test)]
 mod viewer_heartbeat_tests {
     use super::{
-        ViewerStdinEvent, viewer_heartbeat_lost_error, watch_viewer_stdin,
-        write_viewer_heartbeat_lost,
+        ViewerStdinEvent, ViewerStdinPace, viewer_heartbeat_lost_error, watch_viewer_stdin,
+        watch_viewer_stdin_with, write_viewer_heartbeat_lost,
     };
-    use std::{sync::mpsc, thread, time::Duration};
+    use std::{
+        sync::{
+            Arc, Condvar, Mutex,
+            atomic::{AtomicU64, Ordering},
+            mpsc,
+        },
+        thread,
+        time::{Duration, Instant},
+    };
 
     struct OwnedFd(i32);
 
@@ -928,19 +977,149 @@ mod viewer_heartbeat_tests {
         );
     }
 
+    struct ManualPace {
+        origin: Instant,
+        offset_ms: AtomicU64,
+        state: Mutex<PaceState>,
+        park: Condvar,
+    }
+
+    struct PaceState {
+        generation: u64,
+        waiting: bool,
+        decision: Option<bool>,
+    }
+
+    impl ManualPace {
+        fn new() -> Self {
+            Self {
+                origin: Instant::now(),
+                offset_ms: AtomicU64::new(0),
+                state: Mutex::new(PaceState {
+                    generation: 0,
+                    waiting: false,
+                    decision: None,
+                }),
+                park: Condvar::new(),
+            }
+        }
+
+        fn advance(&self, by: Duration) {
+            self.offset_ms.fetch_add(
+                u64::try_from(by.as_millis()).expect("pace step fits in u64 millis"),
+                Ordering::SeqCst,
+            );
+        }
+
+        fn wait_parked(&self, after: u64) -> u64 {
+            let mut state = self.state.lock().expect("pace lock");
+            let deadline = Instant::now() + crate::test_support::HANDSHAKE_TIMEOUT;
+            while !(state.waiting && state.generation > after) {
+                let now = Instant::now();
+                assert!(
+                    now < deadline,
+                    "viewer watchdog did not reach its next wait"
+                );
+                let (guard, result) = self
+                    .park
+                    .wait_timeout(state, deadline - now)
+                    .expect("pace lock");
+                state = guard;
+                if result.timed_out() && !(state.waiting && state.generation > after) {
+                    panic!("viewer watchdog did not reach its next wait");
+                }
+            }
+            state.generation
+        }
+
+        fn release(&self, generation: u64, poll: bool) {
+            let mut state = self.state.lock().expect("pace lock");
+            assert_eq!(state.generation, generation);
+            assert!(state.waiting);
+            state.decision = Some(poll);
+            self.park.notify_all();
+        }
+    }
+
+    impl ViewerStdinPace for ManualPace {
+        fn now(&self) -> Instant {
+            self.origin + Duration::from_millis(self.offset_ms.load(Ordering::SeqCst))
+        }
+
+        fn before_poll(&self) -> bool {
+            let mut state = self.state.lock().expect("pace lock");
+            state.generation = state.generation.saturating_add(1);
+            state.waiting = true;
+            state.decision = None;
+            self.park.notify_all();
+            while state.decision.is_none() {
+                state = self.park.wait(state).expect("pace lock");
+            }
+            let poll = state.decision.take().expect("decision is present");
+            state.waiting = false;
+            self.park.notify_all();
+            poll
+        }
+    }
+
+    fn write_byte(write: &OwnedFd) {
+        assert_eq!(unsafe { libc::write(write.0, b"\n".as_ptr().cast(), 1) }, 1);
+    }
+
+    fn watch_paced(
+        mut read: OwnedFd,
+        timeout: Duration,
+        pace: Arc<ManualPace>,
+    ) -> mpsc::Receiver<ViewerStdinEvent> {
+        let (sender, receiver) = mpsc::channel();
+        let fd = read.release();
+        thread::spawn(move || {
+            let event = watch_viewer_stdin_with(fd, timeout, pace.as_ref());
+            unsafe { libc::close(fd) };
+            let _ = sender.send(event);
+        });
+        receiver
+    }
+
     #[test]
     fn bytes_then_silence_past_the_timeout_fires() {
         let (read, write) = pipe();
-        let timeout = Duration::from_millis(200);
-        let receiver = watch(read, timeout);
-        assert_eq!(unsafe { libc::write(write.0, b"\n".as_ptr().cast(), 1) }, 1);
-        thread::sleep(Duration::from_millis(50));
-        assert_eq!(unsafe { libc::write(write.0, b"\n".as_ptr().cast(), 1) }, 1);
-        thread::sleep(Duration::from_millis(50));
+        let timeout = Duration::from_millis(1_000);
+        let pace = Arc::new(ManualPace::new());
+        let receiver = watch_paced(read, timeout, Arc::clone(&pace));
+
+        // Arm on the first byte, then let almost the whole timeout pass and
+        // deliver a second byte before the deadline.
+        let parked = pace.wait_parked(0);
+        assert!(receiver.try_recv().is_err());
+        write_byte(&write);
+        pace.release(parked, true);
+
+        let parked = pace.wait_parked(parked);
+        assert!(receiver.try_recv().is_err());
+        pace.advance(timeout - Duration::from_millis(1));
+        write_byte(&write);
+        pace.release(parked, true);
+
+        // This wait is almost two timeouts after the first byte. Reaching it
+        // means the second byte reset the deadline; otherwise the pre-check
+        // would already have returned HeartbeatLost.
+        let parked = pace.wait_parked(parked);
         assert!(
             receiver.try_recv().is_err(),
             "a fresh byte must postpone the watchdog"
         );
+        pace.advance(timeout - Duration::from_millis(1));
+        pace.release(parked, false);
+
+        let parked = pace.wait_parked(parked);
+        assert!(
+            receiver.try_recv().is_err(),
+            "a fresh byte must postpone the watchdog"
+        );
+        pace.advance(Duration::from_millis(1));
+        pace.release(parked, false);
+
         assert_eq!(
             receiver
                 .recv_timeout(crate::test_support::HANDSHAKE_TIMEOUT)

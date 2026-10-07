@@ -7,8 +7,11 @@ use std::{
     collections::BTreeMap,
     ffi::OsString,
     fs,
-    os::unix::fs::{PermissionsExt, symlink},
+    io::Write as _,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
+    process::Command,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use mac_worker::test_support::{
@@ -82,13 +85,14 @@ impl Isolated {
         fs::write(
             &fake_ssh,
             format!(
-                "#!/bin/sh\n# fake SSH hop: destination is not a live network host.\nexport HOME={home:?}\nexport XDG_CACHE_HOME={xdg_cache:?}\nexport XDG_STATE_HOME={xdg_state:?}\nexport XDG_CONFIG_HOME={xdg_config:?}\nexport XDG_DATA_HOME={xdg_data:?}\nexport XDG_RUNTIME_DIR={runtime:?}\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    -o) shift 2 ;;\n    --) shift; break ;;\n    -*) shift ;;\n    *) break ;;\n  esac\ndone\n[ \"$#\" -gt 0 ] && shift\nif [ \"$#\" -eq 1 ] && [ \"$1\" = '~/.local/bin/worker host probe' ] && [ -f \"$HOME/slot-probe.json\" ]; then exec /bin/cat \"$HOME/slot-probe.json\"; fi\nif [ \"$#\" -eq 1 ]; then exec /bin/sh -c \"$1\"; fi\nexec \"$@\"\n"
+                "#!/bin/sh\n# fake SSH hop: destination is not a live network host.\nexport HOME={home:?}\nexport XDG_CACHE_HOME={xdg_cache:?}\nexport XDG_STATE_HOME={xdg_state:?}\nexport XDG_CONFIG_HOME={xdg_config:?}\nexport XDG_DATA_HOME={xdg_data:?}\nexport XDG_RUNTIME_DIR={runtime:?}\n# First exec of this freshly written script is assessed by macOS. Pay that\n# outside the production 15s SSH probe budget.\n[ \"$1\" = --fixture-warm ] && exit 0\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    -o) shift 2 ;;\n    --) shift; break ;;\n    -*) shift ;;\n    *) break ;;\n  esac\ndone\n[ \"$#\" -gt 0 ] && shift\nif [ \"$#\" -eq 1 ] && [ \"$1\" = '~/.local/bin/worker host probe' ] && [ -f \"$HOME/slot-probe.json\" ]; then exec /bin/cat \"$HOME/slot-probe.json\"; fi\nif [ \"$#\" -eq 1 ]; then exec /bin/sh -c \"$1\"; fi\nexec \"$@\"\n"
             ),
         )
         .unwrap();
         let mut permissions = fs::metadata(&fake_ssh).unwrap().permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(&fake_ssh, permissions).unwrap();
+        warm_executable(&fake_ssh);
         let mut env = BTreeMap::new();
         env.insert(OsString::from("HOME"), home.as_os_str().to_os_string());
         env.insert(OsString::from("XDG_CACHE_HOME"), xdg_cache.into());
@@ -104,6 +108,62 @@ impl Isolated {
             paths,
         }
     }
+}
+
+fn warm_executable(path: &Path) {
+    assert!(
+        Command::new(path)
+            .arg("--fixture-warm")
+            .status()
+            .unwrap()
+            .success(),
+        "warm-up of {} failed",
+        path.display()
+    );
+}
+
+fn warm_worker_binary() {
+    // The debug worker is a large Mach-O. Its first exec is the slow one.
+    // `host controller-receive-pack` runs that binary through the SSH fixture,
+    // and so does `host probe` when the cached snapshot is not ready yet.
+    assert!(
+        Command::new(env!("CARGO_BIN_EXE_worker"))
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("warm the worker binary")
+            .success()
+    );
+}
+
+/// Fill the tool and facts caches so `host probe` does not exec every toolchain
+/// and admission does not follow it with `host refresh-facts`.
+///
+/// The SSH probe deadline stays 15s. These are the caches that probe already
+/// reads; slot counts still come from the real lease store.
+fn seed_fast_host_probe(paths: &PathLayout) {
+    let root = paths.host_state_root();
+    fs::create_dir_all(&root).unwrap();
+    write_private(&root.join("tool-capabilities.json"), br#"{"tools":[]}"#);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let facts = format!(
+        r#"{{"agents":[],"env_profiles":[],"git_identity":false,"collected_at_millis":{now}}}"#
+    );
+    write_private(&root.join("facts.json"), facts.as_bytes());
+}
+
+fn write_private(path: &Path, bytes: &[u8]) {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .unwrap();
+    file.write_all(bytes).unwrap();
 }
 
 fn oid_of(repo: &GitRepo) -> BaseOid {
@@ -818,6 +878,8 @@ fn occupied_slot_no_wait_rejection_survives_freed_capacity_and_replay() {
     let isolated = Isolated::new();
     write_occupied_worker_config(&isolated.paths);
     occupy_single_slot(&isolated.paths);
+    seed_fast_host_probe(&isolated.paths);
+    warm_worker_binary();
 
     // Premise, proven rather than assumed: the real probe reports a reachable
     // worker whose only slot is taken.

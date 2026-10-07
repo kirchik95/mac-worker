@@ -1837,6 +1837,35 @@ mod tests {
             }
         }
     }
+
+    // Integration Git reads H's attributes with `git --attr-source` (Git 2.41), and
+    // `merge-tree` crashed with that option until Git 2.43. Product Git is
+    // /usr/bin/git, so the selected Xcode or Command Line Tools decide, not PATH.
+    #[test]
+    fn product_git_prepares_an_attributed_conflicted_merge() {
+        let mut fixture = testing::GitIntegrationFixture::new();
+        fixture.write("payload.txt", b"base\n");
+        fixture.commit_base();
+        fixture.write("payload.txt", b"ours\n");
+        fixture.commit_task();
+        fixture.advance_target_with("payload.txt", b"theirs\n");
+        let response = fixture
+            .execute(IntegrationStep::Prepare)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "integration needs Git 2.43 or newer at /usr/bin/git, found {}: {error:?}",
+                    testing::git(fixture.workspace(), &["version"])
+                )
+            });
+        assert!(
+            matches!(
+                &response,
+                HostIntegrationResponse::NeedTurn { candidate, .. }
+                    if candidate.conflict_paths == vec!["payload.txt"]
+            ),
+            "{response:?}"
+        );
+    }
 }
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing {
