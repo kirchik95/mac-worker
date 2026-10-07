@@ -1903,3 +1903,153 @@ fn bound_close_replay_after_import_goes_on_to_close() {
             .is_some()
     );
 }
+
+/// An older integrated cycle is still the stored record while a later ordinary
+/// turn runs. Cancel frozen on that Active turn, replayed after the owner
+/// imported its Done, is the same Active → Done progress as the first turn.
+#[test]
+fn unbound_followup_done_import_refreshes_past_an_older_cycle() {
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        controller::{ControllerFault, ControllerStore, RequestPhase, TaskSubmitHandler},
+        task::model::{RunnerIdentity, TaskOutcome, TaskState},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let paths = isolated_paths(&temp.path().canonicalize().unwrap());
+    let config = fixture_config(&paths);
+    let tasks = ClientStateStore::open(&paths.state).unwrap();
+    let active = sample_ordinary_followup(fixture_task(), fixture_source(), None);
+    assert_eq!(active.status().state(), TaskState::Active);
+    tasks.create_task(active.clone()).unwrap();
+    let state = RootedIntegrationState::open(
+        &paths,
+        std::sync::Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    state
+        .publish_policy(fixture_task(), &sample_policy("main"))
+        .unwrap();
+    let accepted = active.status().head_oid().unwrap().clone();
+    let mut older = sample_record(fixture_task(), fixture_source(), "main");
+    older.snapshot.state = IntegrationStatus::Integrated;
+    older.snapshot.disposition = Some(IntegrationDisposition::AlreadyIntegrated);
+    older.snapshot.observed_target_oid = Some(accepted.clone());
+    older.receipt = Some(IntegrationReceipt {
+        integration_id: older.snapshot.integration_id,
+        epoch: 0,
+        source_turn_id: fixture_source(),
+        source_head: fixture_head(),
+        target_head: accepted.clone(),
+        merge_oid: None,
+        disposition: IntegrationDisposition::AlreadyIntegrated,
+        imported: true,
+        recorded_at_millis: 1001,
+    });
+    state
+        .replace(fixture_task(), IntegrationRevision(0), &older)
+        .unwrap();
+    let handler = TaskSubmitHandler::new(&NoProcesses, &config, &paths, &tasks);
+    let store = ControllerStore::open(&paths.controller_state_root()).unwrap();
+    let request = freeze_published(
+        &store,
+        &handler,
+        "task.cancel",
+        "000000000000000000000000000000a1",
+    );
+    let done = sample_ordinary_followup(fixture_task(), fixture_source(), Some(TaskOutcome::Done));
+    assert!(tasks.update_task_if_current(&active, done).unwrap());
+    let runner = ProcessIdentity::new(5_000_041, 9_999_999).unwrap();
+    tasks
+        .record_runner(fixture_task(), Some(RunnerIdentity::new(runner)))
+        .unwrap();
+    let busy = store
+        .handle_with(&request, &handler, ControllerFault::None)
+        .unwrap_err();
+    assert_eq!(
+        (
+            busy.public_code(),
+            store.load(request.request_id()).unwrap().unwrap().phase()
+        ),
+        ("TASK_BUSY".to_owned(), RequestPhase::Published),
+        "follow-up turn freeze was not refreshed"
+    );
+}
+
+/// A cycle that ended Revoked and kept its receipt is terminal. An unbound
+/// replay must settle instead of answering STOP_UNCONFIRMED on every retry.
+#[test]
+fn unbound_revoked_cycle_with_retained_receipt_settles() {
+    use mac_worker::test_support::{
+        client_state::ClientStateStore,
+        controller::{ControllerFault, ControllerStore, RequestPhase, TaskSubmitHandler},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let paths = isolated_paths(&temp.path().canonicalize().unwrap());
+    let config = fixture_config(&paths);
+    let tasks = ClientStateStore::open(&paths.state).unwrap();
+    let done = sample_ordinary(fixture_task(), fixture_source());
+    let active = owner_active_before_done_import(&done);
+    tasks.create_task(active.clone()).unwrap();
+    let state = RootedIntegrationState::open(
+        &paths,
+        std::sync::Arc::new(ManualIntegrationRuntime::default()),
+    )
+    .unwrap();
+    state
+        .publish_policy(fixture_task(), &sample_policy("main"))
+        .unwrap();
+    let handler = TaskSubmitHandler::new(&NoProcesses, &config, &paths, &tasks);
+    let store = ControllerStore::open(&paths.controller_state_root()).unwrap();
+    let request = freeze_published(
+        &store,
+        &handler,
+        "task.cancel",
+        "000000000000000000000000000000a2",
+    );
+    assert!(tasks.update_task_if_current(&active, done).unwrap());
+    let mut cycle = sample_record(fixture_task(), fixture_source(), "main");
+    state
+        .replace(fixture_task(), IntegrationRevision(0), &cycle)
+        .unwrap();
+    let previous = cycle.snapshot.revision;
+    cycle.snapshot.revision = IntegrationRevision(2);
+    cycle.snapshot.state = IntegrationStatus::Revoked;
+    cycle.snapshot.disposition = Some(IntegrationDisposition::AlreadyIntegrated);
+    cycle.snapshot.observed_target_oid = Some(fixture_head());
+    cycle.tombstone = Some(IntegrationTombstone {
+        epoch: 0,
+        revision: IntegrationRevision(2),
+        requested_at_millis: 1002,
+        acknowledged: true,
+    });
+    cycle.receipt = Some(IntegrationReceipt {
+        integration_id: cycle.snapshot.integration_id,
+        epoch: 0,
+        source_turn_id: fixture_source(),
+        source_head: fixture_head(),
+        target_head: fixture_head(),
+        merge_oid: None,
+        disposition: IntegrationDisposition::AlreadyIntegrated,
+        imported: false,
+        recorded_at_millis: 1002,
+    });
+    state.replace(fixture_task(), previous, &cycle).unwrap();
+    let mut answers = Vec::new();
+    for _ in 0..3 {
+        answers.push(
+            store
+                .handle_with(&request, &handler, ControllerFault::None)
+                .map(|_| "OK".to_owned())
+                .unwrap_or_else(|error| error.public_code()),
+        );
+    }
+    assert_eq!(
+        answers,
+        ["OK".to_owned(), "OK".to_owned(), "OK".to_owned()],
+        "terminal Revoked cycle keeps the request resumable"
+    );
+    assert_eq!(
+        store.load(request.request_id()).unwrap().unwrap().phase(),
+        RequestPhase::Acked
+    );
+}
