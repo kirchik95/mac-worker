@@ -354,9 +354,23 @@ impl<'a> IntegrationCoordinator<'a> {
             && !facts.runner_present
             && ordinary.runner().is_none())
     }
+    /// A stop cancel-requests this cycle's live auxiliary before the host
+    /// answers. That flag is the stop itself, not a newer owner turn.
+    fn source_is_current_aside_from_stop(
+        &self,
+        record: &IntegrationRecord,
+        facts: &IntegrationTaskFacts,
+    ) -> Result<bool, WorkerError> {
+        let mut facts = facts.clone();
+        facts.stop_requested = false;
+        self.owner_source_is_current(record, &facts)
+    }
     fn revoke_superseded(&self, record: &mut IntegrationRecord) -> Result<bool, WorkerError> {
         let facts = self.source_observer.facts(record.task_id)?;
-        if self.owner_source_is_current(record, &facts)? {
+        if self.owner_source_is_current(record, &facts)?
+            || (record.receipt.is_some()
+                && self.source_is_current_aside_from_stop(record, &facts)?)
+        {
             return Ok(false);
         }
         self.revoke_for_stop(record.task_id, &record.snapshot)?;
@@ -1749,6 +1763,19 @@ impl<'a> IntegrationCoordinator<'a> {
             return Err(IntegrationCode::IntegrationAlreadyCommitted.error());
         }
         if record.tombstone.as_ref().is_some_and(|t| t.acknowledged) {
+            // A won push can acknowledge its tombstone before the auxiliary
+            // row retires and import finishes. Retry that import; do not
+            // report the stop as complete while the receipt is still open.
+            if record.snapshot.state == IntegrationStatus::Published && record.receipt.is_some() {
+                let facts = self.source_observer.facts(task)?;
+                if self.source_is_current_aside_from_stop(&record, &facts)? {
+                    let settled = self.finish_receipt(record, false)?;
+                    if settled.state == IntegrationStatus::Integrated {
+                        return Err(IntegrationCode::IntegrationAlreadyCommitted.error());
+                    }
+                    return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
+                }
+            }
             return Ok(record.snapshot);
         }
         if record.tombstone.is_none() {
@@ -1845,7 +1872,12 @@ impl<'a> IntegrationCoordinator<'a> {
                 // Origin may already contain this cycle when a newer owner
                 // turn supersedes it. Retain that proof without importing over
                 // the new work or recursively admitting another Repair.
-                if !self.owner_source_is_current(&record, &self.source_observer.facts(task)?)? {
+                // Cancel-requesting this cycle's own auxiliary is not that
+                // supersession, so a push that won still imports.
+                if !self.source_is_current_aside_from_stop(
+                    &record,
+                    &self.source_observer.facts(task)?,
+                )? {
                     record.snapshot.state = IntegrationStatus::Revoked;
                     record.snapshot.resume_state = None;
                     record.snapshot.pause_reason = None;
@@ -3003,6 +3035,124 @@ mod source_fence_tests {
             assert_eq!(snapshot.epoch, 1);
             assert_eq!(snapshot.source_turn_id, fixture_source());
             assert_eq!(turns.enqueue_count(prepared.followup.turn_id()), 0);
+        }
+    }
+
+    /// OwnerPorts cancel-requests a live auxiliary before the host answers.
+    /// `stop_requested` is that mark. A won push must still import.
+    #[test]
+    fn integrated_stop_with_a_cancel_requested_auxiliary_imports_the_won_push() {
+        for purpose in [
+            IntegrationTurnPurpose::Resolve,
+            IntegrationTurnPurpose::Verify,
+        ] {
+            let mut record = phase_record(IntegrationStep::Prepare);
+            if purpose == IntegrationTurnPurpose::Verify {
+                record.policy.verify = VerifyPolicy::MovedTarget;
+                record.snapshot.state = IntegrationStatus::Verifying;
+                record.snapshot.verify_turns = 1;
+            } else {
+                record.snapshot.state = IntegrationStatus::Resolving;
+                record.snapshot.resolve_turns = 1;
+            }
+            record.followups_spent = 1;
+            let prepared = sample_prepared_turn(&record, purpose, 1, 1);
+            prepared.validate_for(&record).unwrap();
+            let mut intent = prepared.intent().unwrap();
+            intent.queue_position = Some(1);
+            intent.accepted = true;
+            record.auxiliaries.push(intent);
+            let candidate = record.candidates.last().unwrap().clone();
+            let receipt = IntegrationReceipt {
+                integration_id: record.snapshot.integration_id,
+                epoch: record.snapshot.epoch,
+                source_turn_id: record.snapshot.source_turn_id,
+                source_head: record.snapshot.source_head.clone(),
+                target_head: candidate.target_head.clone(),
+                merge_oid: candidate.merge_oid.clone(),
+                disposition: IntegrationDisposition::Merged,
+                imported: false,
+                recorded_at_millis: 1002,
+            };
+            let state = MemoryIntegrationState::default();
+            save_initial(&state, &record);
+            state.publish_prepared(record.task_id, &prepared).unwrap();
+            let mut current = facts(sample_ordinary(record.task_id, fixture_source()));
+            let mut wire = serde_json::to_value(current.ordinary.status()).unwrap();
+            wire["state"] = "active".into();
+            wire["turns"].as_array_mut().unwrap().push(
+                serde_json::to_value(crate::task::TurnSummary::new(
+                    2,
+                    prepared.followup.turn_id(),
+                    None,
+                    None,
+                    None,
+                    false,
+                    Some(1002),
+                    None,
+                ))
+                .unwrap(),
+            );
+            current.ordinary = current
+                .ordinary
+                .with_status(serde_json::from_value(wire).unwrap())
+                .unwrap();
+            current.runner_present = true;
+            current.stop_requested = true;
+            current.auxiliary_purpose = Some(purpose);
+            let observer = FakeIntegrationObserver::default();
+            observer.insert(current);
+            struct WonPush(IntegrationReceipt, Mutex<Vec<&'static str>>);
+            impl IntegrationHost for WonPush {
+                fn execute(
+                    &self,
+                    request: &HostIntegrationRequest,
+                ) -> Result<HostIntegrationResponse, WorkerError> {
+                    let kind = match &request.action {
+                        HostIntegrationAction::Revoke { .. } => "revoke",
+                        HostIntegrationAction::Step {
+                            step: IntegrationStep::Repair,
+                            ..
+                        } => "repair",
+                        other => panic!("won push reached an unexpected phase: {other:?}"),
+                    };
+                    self.1.lock().unwrap().push(kind);
+                    Ok(HostIntegrationResponse::Integrated {
+                        identity: IntegrationResponseIdentity::for_request(request),
+                        receipt: self.0.clone(),
+                    })
+                }
+            }
+            let host = WonPush(receipt.clone(), Mutex::new(Vec::new()));
+            let turns = FakeIntegrationTurns::default();
+            let runtime = ManualIntegrationRuntime::default();
+            let owner = IntegrationCoordinator::new(&state, &host, &turns, &runtime, &observer);
+            let error = owner
+                .revoke_for_stop(record.task_id, &record.snapshot)
+                .unwrap_err();
+            assert_eq!(
+                error.public_code(),
+                "INTEGRATION_ALREADY_COMMITTED",
+                "{purpose:?}"
+            );
+            assert_eq!(error.exit_code(), 64, "{purpose:?}");
+            let saved = state.load(record.task_id).unwrap().unwrap();
+            assert_eq!(
+                saved.snapshot.state,
+                IntegrationStatus::Integrated,
+                "{purpose:?}"
+            );
+            assert!(saved.tombstone.unwrap().acknowledged, "{purpose:?}");
+            let imported = saved.receipt.unwrap();
+            assert!(imported.imported, "{purpose:?}");
+            assert_eq!(imported.disposition, IntegrationDisposition::Merged);
+            assert_eq!(imported.merge_oid, receipt.merge_oid);
+            assert_eq!(turns.imports(record.task_id), vec![imported]);
+            assert_eq!(
+                host.1.lock().unwrap().as_slice(),
+                ["revoke", "repair"],
+                "{purpose:?}"
+            );
         }
     }
 }

@@ -919,11 +919,16 @@ enum UpgradeFenceOp {
 }
 
 #[cfg(test)]
+type RootEntryCheckHook = Box<dyn FnMut(&str)>;
+
+#[cfg(test)]
 thread_local! {
     static UPGRADE_FENCE_HOLD: std::cell::RefCell<Option<std::sync::Arc<std::sync::Barrier>>> =
         const { std::cell::RefCell::new(None) };
     static PUBLISHED_LAYOUT_VERSION_OVERRIDE: std::cell::Cell<Option<u32>> =
         const { std::cell::Cell::new(None) };
+    static ROOT_ENTRY_CHECK_HOOK: std::cell::RefCell<Option<RootEntryCheckHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn published_layout_version() -> u32 {
@@ -1031,6 +1036,21 @@ impl HostStore {
         PUBLISHED_LAYOUT_VERSION_OVERRIDE.with(|slot| slot.set(Some(version)));
         let result = op();
         PUBLISHED_LAYOUT_VERSION_OVERRIDE.with(|slot| slot.set(None));
+        result
+    }
+
+    /// Calls `hook` with each non-owned host-root name just before open
+    /// checks it, so a test can remove a writer's staged entry after the
+    /// listing.
+    #[cfg(test)]
+    #[doc(hidden)]
+    pub fn with_root_entry_check_hook<T>(
+        hook: impl FnMut(&str) + 'static,
+        op: impl FnOnce() -> T,
+    ) -> T {
+        ROOT_ENTRY_CHECK_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        let result = op();
+        ROOT_ENTRY_CHECK_HOOK.with(|slot| *slot.borrow_mut() = None);
         result
     }
 
@@ -1394,7 +1414,17 @@ impl HostStore {
                 && name != HOST_LAYOUT_FILE
                 && name != HOST_LAYOUT_REFRESH_NAME
             {
-                rooted.validate_private_entry(name)?;
+                #[cfg(test)]
+                before_root_entry_check(name);
+                // Facts, auth-incident and tool-cache writers stage temps here
+                // without the installation lock. One renamed away after the
+                // listing is gone, not unsafe; a missing root still fails.
+                if let Err(error) = rooted.validate_private_entry(name)
+                    && (error.kind() != std::io::ErrorKind::NotFound
+                        || rooted.entry_exists(name)?)
+                {
+                    return Err(error.into());
+                }
             }
         }
         let store = Self {
@@ -5670,6 +5700,15 @@ fn restore_helper_binary(previous: Option<&Path>, to: &Path) -> Result<(), Worke
     }
 }
 
+#[cfg(test)]
+fn before_root_entry_check(name: &str) {
+    ROOT_ENTRY_CHECK_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(name);
+        }
+    });
+}
+
 fn wait_upgrade_fence_hold() {
     #[cfg(test)]
     {
@@ -6905,6 +6944,62 @@ mod review_regression_tests {
         assert_eq!(
             fs::read(root.join(replace)).unwrap(),
             b"in-flight facts completed"
+        );
+    }
+
+    #[test]
+    fn open_skips_a_host_root_entry_removed_after_the_listing() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        let store = HostStore::open(&root).unwrap();
+        // Facts, auth-incident and tool-cache writers stage write-/replace-
+        // temps in the host root without the installation lock and rename
+        // them away while another process opens the store.
+        let staged = format!("write-{}", uuid::Uuid::from_u128(93).hyphenated());
+        drop(
+            store
+                .inner
+                .root
+                .write_new_private_file(&staged, b"in-flight facts")
+                .unwrap(),
+        );
+        drop(store);
+        let removed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let opened = HostStore::with_root_entry_check_hook(
+            {
+                let path = root.join(&staged);
+                let staged = staged.clone();
+                let removed = std::rc::Rc::clone(&removed);
+                move |name| {
+                    if name == staged {
+                        fs::remove_file(&path).unwrap();
+                        removed.set(true);
+                    }
+                }
+            },
+            || HostStore::open(&root),
+        );
+        assert!(removed.get(), "the staged entry was listed, then removed");
+        opened.unwrap();
+    }
+
+    #[test]
+    fn open_still_refuses_a_host_root_entry_that_is_not_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("host");
+        drop(HostStore::open(&root).unwrap());
+        let stray = root.join("stray");
+        fs::write(&stray, b"stray").unwrap();
+        fs::set_permissions(&stray, fs::Permissions::from_mode(0o644)).unwrap();
+        let error = match HostStore::open(&root) {
+            Ok(_) => panic!("a group-readable host-root entry must be refused"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(&error, WorkerError::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied),
+            "{error:?}"
         );
     }
 

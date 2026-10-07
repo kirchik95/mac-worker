@@ -135,6 +135,22 @@ impl SupervisorLauncher for InlineSupervisorLauncher {
     }
 }
 
+fn warm_worker_binary() {
+    // Pay macOS' first-exec assessment outside the bounded waits. `pre_exec`
+    // forces fork, so a cold exec of this binary otherwise runs inside them.
+    let worker = env!("CARGO_BIN_EXE_worker");
+    assert!(
+        Command::new(worker)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("warm the worker binary")
+            .success(),
+        "worker --version warm-up failed"
+    );
+}
+
 struct WatchChild {
     child: Option<Child>,
     log: PathBuf,
@@ -143,6 +159,7 @@ struct WatchChild {
 impl WatchChild {
     fn spawn(host_root: &Path, home: &Path, data: &Path, tmp: &Path, log: PathBuf) -> Self {
         assert!(host_root.is_absolute());
+        warm_worker_binary();
         fs::create_dir_all(home).unwrap();
         fs::create_dir_all(data).unwrap();
         fs::create_dir_all(tmp).unwrap();
@@ -189,6 +206,38 @@ impl WatchChild {
     fn log_text(&self) -> String {
         fs::read_to_string(&self.log).unwrap_or_default()
     }
+
+    fn poll_exit(&mut self) -> Option<ExitStatus> {
+        self.child
+            .as_mut()
+            .and_then(|child| child.try_wait().expect("inspect watcher exit"))
+    }
+
+    // A delivery that is still pending because this child has exited names that
+    // exit status and the log. A live child stays distinguishable from an exit
+    // so a slow push is not reported as a crash.
+    fn failure_detail(&mut self, delivery: Option<&Path>) -> String {
+        let log = self.log_text();
+        let state = delivery.and_then(delivery_json_state);
+        let stayed_pending =
+            delivery.is_some() && matches!(state.as_deref(), Some("pending") | None);
+        match self.poll_exit() {
+            Some(status) if stayed_pending => {
+                format!("watcher exited ({status}) while delivery stayed pending; log: {log}")
+            }
+            Some(status) if delivery.is_some() => {
+                format!("watcher exited ({status}); delivery {state:?}; log: {log}")
+            }
+            Some(status) => format!("watcher exited ({status}); log: {log}"),
+            None if stayed_pending => {
+                format!("watcher still running and delivery stayed pending; log: {log}")
+            }
+            None if delivery.is_some() => {
+                format!("watcher still running; delivery {state:?}; log: {log}")
+            }
+            None => format!("watcher still running; log: {log}"),
+        }
+    }
 }
 
 impl Drop for WatchChild {
@@ -218,6 +267,7 @@ impl DetachedWatch {
         log: PathBuf,
     ) -> Self {
         assert!(host_root.is_absolute());
+        warm_worker_binary();
         fs::create_dir_all(home).unwrap();
         fs::create_dir_all(data).unwrap();
         fs::create_dir_all(tmp).unwrap();
@@ -734,6 +784,30 @@ fn outbox_worker_pid(host_root: &Path) -> Option<i32> {
         .get("pid")?
         .as_u64()
         .and_then(|pid| i32::try_from(pid).ok())
+}
+
+fn process_alive(pid: i32) -> bool {
+    // SAFETY: signal 0 does not deliver a signal; it only checks that `pid` exists.
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn detached_watch_detail(host_root: &Path, delivery: &Path, log: &Path) -> String {
+    let state = delivery_json_state(delivery);
+    let log_text = fs::read_to_string(log).unwrap_or_default();
+    let process = match outbox_worker_pid(host_root) {
+        Some(pid) if pid > 0 && process_alive(pid) => format!("watcher pid {pid} still running"),
+        Some(pid) => format!("watcher pid {pid} has exited"),
+        None => "watcher has not published a live identity".to_owned(),
+    };
+    if matches!(state.as_deref(), Some("pending") | None) {
+        format!("{process} while delivery stayed pending; log: {log_text}")
+    } else {
+        format!("{process}; delivery {state:?}; log: {log_text}")
+    }
 }
 
 fn delivery_pack_stats(mirror: &Path) -> (usize, u64) {
@@ -2090,25 +2164,29 @@ fn worker_process_watch_retries_after_parent_returns_and_restart_recovers() {
     let tmp = temp.path().join("tmp");
     let delivery = delivery_path(&host_root, PROJECT_ID, task_id(1), turn_id(2));
     let first_log = temp.path().join("watch-1.err");
-    let first = WatchChild::spawn(&host_root, &home, &data, &tmp, first_log);
+    let mut first = WatchChild::spawn(&host_root, &home, &data, &tmp, first_log);
     wait_until(
         5,
         || delivery_json_state(&delivery).as_deref() == Some("retrying"),
         || {
-            let log = first.log_text();
-            panic!("first watch did not retry: {log}");
+            panic!(
+                "first watch did not retry: {}",
+                first.failure_detail(Some(&delivery))
+            )
         },
     );
     drop(first);
     fs::remove_file(origin.join("reject")).unwrap();
     let second_log = temp.path().join("watch-2.err");
-    let second = WatchChild::spawn(&host_root, &home, &data, &tmp, second_log);
+    let mut second = WatchChild::spawn(&host_root, &home, &data, &tmp, second_log);
     wait_until(
         12,
         || delivery_json_state(&delivery).as_deref() == Some("delivered"),
         || {
-            let log = second.log_text();
-            panic!("restarted watch did not deliver: {log}");
+            panic!(
+                "restarted watch did not deliver: {}",
+                second.failure_detail(Some(&delivery))
+            )
         },
     );
     drop(second);
@@ -2325,11 +2403,16 @@ fn wake_restarts_a_live_watcher_with_a_different_binary_identity() {
     let data = temp.path().join("xdg");
     let tmp = temp.path().join("tmp");
     let first_log = temp.path().join("watch-old.err");
-    let first = WatchChild::spawn(&host_root, &home, &data, &tmp, first_log);
+    let mut first = WatchChild::spawn(&host_root, &home, &data, &tmp, first_log);
     wait_until(
         5,
         || outbox_worker_pid(&host_root).is_some(),
-        || panic!("watcher did not publish liveness"),
+        || {
+            panic!(
+                "watcher did not publish liveness: {}",
+                first.failure_detail(None)
+            )
+        },
     );
     let old_pid = outbox_worker_pid(&host_root).expect("old watcher pid");
     tamper_published_binary(&host_root);
@@ -2399,22 +2482,37 @@ fn production_wake_survives_parent_exit() {
     let tmp = temp.path().join("tmp");
     let delivery = delivery_path(&host_root, PROJECT_ID, task_id(1), turn_id(2));
     let log = temp.path().join("wake.err");
-    let watch = DetachedWatch::spawn_via_wake(&host_root, &home, &data, &tmp, log);
+    let watch = DetachedWatch::spawn_via_wake(&host_root, &home, &data, &tmp, log.clone());
     wait_until(
         5,
         || outbox_worker_pid(&host_root).is_some(),
-        || panic!("detached watcher did not publish worker identity"),
+        || {
+            panic!(
+                "detached watcher did not publish worker identity: {}",
+                detached_watch_detail(&host_root, &delivery, &log)
+            )
+        },
     );
     wait_until(
         8,
         || delivery_json_state(&delivery).as_deref() == Some("retrying"),
-        || panic!("detached watcher did not retry after parent exit"),
+        || {
+            panic!(
+                "detached watcher did not retry after parent exit: {}",
+                detached_watch_detail(&host_root, &delivery, &log)
+            )
+        },
     );
     fs::remove_file(origin.join("reject")).unwrap();
     wait_until(
         15,
         || delivery_json_state(&delivery).as_deref() == Some("delivered"),
-        || panic!("detached watcher did not deliver after origin recovery"),
+        || {
+            panic!(
+                "detached watcher did not deliver after origin recovery: {}",
+                detached_watch_detail(&host_root, &delivery, &log)
+            )
+        },
     );
     drop(watch);
 }

@@ -115,6 +115,7 @@ struct ScriptedReconciliation {
 struct ScriptedReconciliationInner {
     process: Mutex<VecDeque<ProcessObservation>>,
     groups: Mutex<VecDeque<ProcessGroupObservation>>,
+    members: Mutex<VecDeque<ProcessGroupMembership>>,
     signals: Mutex<Vec<(u32, i32)>>,
     fail_signal: Mutex<Option<i32>>,
     sleeps: Mutex<Vec<Duration>>,
@@ -137,6 +138,7 @@ impl ScriptedReconciliation {
             inner: Arc::new(ScriptedReconciliationInner {
                 process: Mutex::new(process.into_iter().collect()),
                 groups: Mutex::new(groups.into_iter().collect()),
+                members: Mutex::new(VecDeque::new()),
                 signals: Mutex::new(Vec::new()),
                 fail_signal: Mutex::new(None),
                 sleeps: Mutex::new(Vec::new()),
@@ -149,6 +151,14 @@ impl ScriptedReconciliation {
 
     fn with_clock(self, clock: impl IntoIterator<Item = Duration>) -> Self {
         *self.inner.clock.lock().unwrap() = Some(clock.into_iter().collect());
+        self
+    }
+
+    /// Membership samples for an ambiguous poll. An empty queue panics: a
+    /// parent-independent reconciliation must script every answer it reads.
+    #[allow(dead_code)]
+    fn with_members(self, members: impl IntoIterator<Item = ProcessGroupMembership>) -> Self {
+        *self.inner.members.lock().unwrap() = members.into_iter().collect();
         self
     }
 
@@ -205,7 +215,14 @@ impl ProcessInspector for ScriptedReconciliation {
     }
 
     fn observe_group_members(&self, _leader: u32) -> ProcessGroupMembership {
-        panic!("parent-independent reconciliation must not use parent wait anchors")
+        self.inner
+            .members
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| {
+                panic!("parent-independent reconciliation must not use parent wait anchors")
+            })
     }
 }
 

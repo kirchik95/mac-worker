@@ -15,7 +15,7 @@ use crate::{
     integration::{contracts::*, store::RootedIntegrationState},
     paths::PathLayout,
     prepared_followup::PreparedFollowup,
-    task::{LocalTaskRecord, TaskId, TurnId, TurnSummary},
+    task::{LocalTaskRecord, TaskId, TaskOutcome, TaskState, TurnId, TurnSummary},
     task_client::{TaskClient, TaskReport, task_error},
 };
 
@@ -49,6 +49,92 @@ struct IntegrationMutationBinding {
     integration_id: IntegrationId,
     epoch: u32,
     mutation: PreparedTaskMutation,
+}
+
+fn latest_ordinary_turn(
+    paths: &PathLayout,
+    record: &LocalTaskRecord,
+) -> Result<Option<TurnId>, WorkerError> {
+    for turn in record.status().turns().iter().rev() {
+        if RootedIntegrationState::read_auxiliary(paths, record.meta().task_id(), turn.turn_id())?
+            .is_none()
+        {
+            return Ok(Some(turn.turn_id()));
+        }
+    }
+    Ok(None)
+}
+
+/// Unbound cancel/close has no cycle binding, so decode never refreshed it.
+/// Importing this freeze's own Active turn as terminal Done, with a policy
+/// already published, is the stop's allowed progress. An earlier turn's
+/// stored cycle is not this turn's epoch fence. A new turn, a different
+/// meta, or a later epoch of this turn's cycle stays stale and conflicts.
+fn refresh_unbound_done_import(
+    paths: &PathLayout,
+    store: &ClientStateStore,
+    mutation: &mut PreparedTaskMutation,
+) -> Result<(), WorkerError> {
+    let task = match &*mutation {
+        PreparedTaskMutation::Cancel { expected, .. }
+        | PreparedTaskMutation::Close { expected, .. } => expected.meta().task_id(),
+        PreparedTaskMutation::Say { .. } => return Ok(()),
+    };
+    let current = store.load_task(task)?;
+    let refresh = match &*mutation {
+        PreparedTaskMutation::Cancel { expected, .. }
+        | PreparedTaskMutation::Close { expected, .. } => {
+            let same_identity = current.meta() == expected.meta()
+                && current
+                    .status()
+                    .turns()
+                    .iter()
+                    .map(TurnSummary::turn_id)
+                    .eq(expected.status().turns().iter().map(TurnSummary::turn_id));
+            let imported_done = expected.status().state() == TaskState::Active
+                && expected
+                    .status()
+                    .turns()
+                    .last()
+                    .is_some_and(|turn| turn.terminal().is_none())
+                && current.status().state() == TaskState::Open
+                && current.status().turns().last().is_some_and(|turn| {
+                    turn.terminal().is_some() && turn.outcome() == Some(&TaskOutcome::Done)
+                });
+            if !same_identity || !imported_done {
+                false
+            } else {
+                let (policy, record) = RootedIntegrationState::read_task(paths, task)?;
+                if policy.is_none() {
+                    false
+                } else if let Some(record) = record.as_ref() {
+                    if latest_ordinary_turn(paths, &current)?
+                        == Some(record.snapshot.source_turn_id)
+                    {
+                        record.snapshot.epoch == 0
+                    } else {
+                        // An earlier turn's cycle: this turn has none staged yet.
+                        current
+                            .status()
+                            .turns()
+                            .iter()
+                            .any(|turn| turn.turn_id() == record.snapshot.source_turn_id)
+                    }
+                } else {
+                    true
+                }
+            }
+        }
+        PreparedTaskMutation::Say { .. } => false,
+    };
+    if refresh {
+        match mutation {
+            PreparedTaskMutation::Cancel { expected, .. }
+            | PreparedTaskMutation::Close { expected, .. } => *expected = current,
+            PreparedTaskMutation::Say { .. } => {}
+        }
+    }
+    Ok(())
 }
 
 fn expected_record(mutation: &PreparedTaskMutation) -> &LocalTaskRecord {
@@ -91,8 +177,10 @@ pub(super) fn decode_prepared_mutation(
     value: &Value,
 ) -> Result<PreparedTaskMutation, WorkerError> {
     if value.get("integration_id").is_none() {
-        return serde_json::from_value(value.clone())
-            .map_err(|_| invalid_request("prepared mutation is invalid"));
+        let mut mutation = serde_json::from_value(value.clone())
+            .map_err(|_| invalid_request("prepared mutation is invalid"))?;
+        refresh_unbound_done_import(paths, store, &mut mutation)?;
+        return Ok(mutation);
     }
     let mut bound: IntegrationMutationBinding = serde_json::from_value(value.clone())
         .map_err(|_| IntegrationCode::IntegrationStateInvalid.error())?;
@@ -324,4 +412,95 @@ fn parse_body<T: DeserializeOwned>(body: &Value, command: &str) -> Result<T, Wor
 
 fn invalid_request(message: &str) -> WorkerError {
     WorkerError::Protocol(format!("INVALID_REQUEST: {message}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::{
+        integration::{
+            contracts::{
+                IntegrationDisposition, IntegrationReceipt, IntegrationRevision, IntegrationState,
+                IntegrationStatus,
+            },
+            store::RootedIntegrationState,
+            testing::{
+                ManualIntegrationRuntime, fixture_head, fixture_source, fixture_task,
+                sample_ordinary_followup, sample_policy, sample_record,
+            },
+        },
+        paths::PathLayout,
+    };
+
+    fn layout(root: &std::path::Path) -> PathLayout {
+        PathLayout {
+            config: root.join("config.toml"),
+            state: root.join("state/mac-worker"),
+            cache: root.join("cache/mac-worker"),
+            data: root.join("data/mac-worker"),
+        }
+    }
+
+    /// Close prepare reconciles an Active task and would launch a worker, so
+    /// the controller fixture cannot freeze this blob. Decode it directly.
+    #[test]
+    fn decode_unbound_close_refreshes_done_import_past_an_older_cycle() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = layout(&temp.path().canonicalize().unwrap());
+        let store = ClientStateStore::open(&paths.state).unwrap();
+        let active = sample_ordinary_followup(fixture_task(), fixture_source(), None);
+        assert_eq!(active.status().state(), TaskState::Active);
+        store.create_task(active.clone()).unwrap();
+        let state =
+            RootedIntegrationState::open(&paths, Arc::new(ManualIntegrationRuntime::default()))
+                .unwrap();
+        state
+            .publish_policy(fixture_task(), &sample_policy("main"))
+            .unwrap();
+        let accepted = active.status().head_oid().unwrap().clone();
+        let mut older = sample_record(fixture_task(), fixture_source(), "main");
+        older.snapshot.state = IntegrationStatus::Integrated;
+        older.snapshot.disposition = Some(IntegrationDisposition::AlreadyIntegrated);
+        older.snapshot.observed_target_oid = Some(accepted.clone());
+        older.receipt = Some(IntegrationReceipt {
+            integration_id: older.snapshot.integration_id,
+            epoch: 0,
+            source_turn_id: fixture_source(),
+            source_head: fixture_head(),
+            target_head: accepted,
+            merge_oid: None,
+            disposition: IntegrationDisposition::AlreadyIntegrated,
+            imported: true,
+            recorded_at_millis: 1001,
+        });
+        assert!(
+            state
+                .replace(fixture_task(), IntegrationRevision(0), &older)
+                .unwrap()
+        );
+        let blob = serde_json::to_value(PreparedTaskMutation::Close {
+            expected: active.clone(),
+            discard: false,
+            created_at_millis: 1000,
+        })
+        .unwrap();
+        let done =
+            sample_ordinary_followup(fixture_task(), fixture_source(), Some(TaskOutcome::Done));
+        assert!(store.update_task_if_current(&active, done.clone()).unwrap());
+        let decoded = decode_prepared_mutation(&paths, &store, &blob).unwrap();
+        let PreparedTaskMutation::Close {
+            expected,
+            discard,
+            created_at_millis,
+        } = decoded
+        else {
+            panic!("close blob decoded as another command");
+        };
+        assert!(!discard);
+        assert_eq!(created_at_millis, 1000);
+        assert_eq!(expected.status().state(), TaskState::Open);
+        assert_eq!(expected, done, "close freeze was not refreshed");
+    }
 }

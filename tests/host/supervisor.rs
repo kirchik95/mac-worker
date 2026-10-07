@@ -37,7 +37,10 @@ use mac_worker::test_support::{
         lease::{AdmissionFacts, LeaseService},
         process::SystemProcessRunner,
         store::{HostStore, HostStoreWritePoint, SupervisorGuard},
-        supervisor::{ProcessInspector, Supervisor, SupervisorFaultPoint, SystemProcessInspector},
+        supervisor::{
+            ProcessInspector, ProcessObservation, Supervisor, SupervisorFaultPoint,
+            SystemProcessInspector,
+        },
     },
     task::{
         model::{
@@ -690,6 +693,38 @@ impl Drop for DetachedJobCleanup {
                 let _ = unsafe { libc::kill(identity.pid() as libc::pid_t, libc::SIGKILL) };
             }
         }
+    }
+}
+
+fn wait_for_detached_supervisor(supervisor: ProcessIdentity, job: &Path, host_root: &Path) {
+    // After the child exits the supervisor sleeps a second and drains the
+    // turn logs for up to another, then publishes the terminal status,
+    // removes the execution payload, releases the lease, and exits. Wait for
+    // that identity (pid and start time) to go away. The bound only turns a
+    // supervisor that never exits into a failure that shows its state;
+    // nextest's kill stops this test but not the setsid supervisor.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let observation = SystemProcessInspector.observe(supervisor);
+        if matches!(
+            observation,
+            ProcessObservation::Absent | ProcessObservation::Reused
+        ) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "detached supervisor did not exit: {observation:?}, status={:?}, payload={}, lease={:?}",
+            fs::read(job.join("status.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<JobStatus>(&bytes).ok())
+                .map(|status| status.state()),
+            job.join("execution.json").exists(),
+            HostStore::open(host_root)
+                .and_then(|store| LeaseService::new(&store).load())
+                .map(|lease| lease.is_some()),
+        );
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -2256,7 +2291,8 @@ fn task_turn_detaches_the_same_worker_and_inherited_lock_runs_supervisor() {
         .unwrap();
     drop(store);
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_worker"))
+    let worker = env!("CARGO_BIN_EXE_worker");
+    let mut child = Command::new(worker)
         .env_clear()
         .env("HOME", &home)
         .env("XDG_DATA_HOME", &data)
@@ -2280,44 +2316,27 @@ fn task_turn_detaches_the_same_worker_and_inherited_lock_runs_supervisor() {
         String::from_utf8_lossy(&output.stderr)
     );
     let response: TaskTurnResponse = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(response.submit().status().supervisor_identity().is_some());
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let terminal = loop {
-        let status: JobStatus =
-            serde_json::from_slice(&fs::read(job.join("status.json")).unwrap()).unwrap();
-        if status.state().is_terminal() {
-            break status;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "detached supervisor did not finish"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    };
+    let supervisor = response
+        .submit()
+        .status()
+        .supervisor_identity()
+        .expect("detached task-turn publishes a supervisor identity");
+    let mut detached_cleanup = DetachedJobCleanup::new(job.clone());
+    wait_for_detached_supervisor(supervisor, &job, &host_root);
+    let terminal: JobStatus =
+        serde_json::from_slice(&fs::read(job.join("status.json")).unwrap()).unwrap();
     assert_eq!(terminal.state(), JobState::Succeeded);
-    while job.join("execution.json").exists() {
-        assert!(
-            Instant::now() < deadline,
-            "detached turn publication did not finish"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(!job.join("execution.json").exists());
-    loop {
-        if LeaseService::new(&HostStore::open(&host_root).unwrap())
+    assert!(
+        !job.join("execution.json").exists(),
+        "detached turn publication did not finish"
+    );
+    assert_eq!(
+        LeaseService::new(&HostStore::open(&host_root).unwrap())
             .load()
-            .unwrap()
-            .is_none()
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "detached cleanup did not release lease"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+            .unwrap(),
+        None,
+        "detached cleanup did not release lease"
+    );
 
     let rejected = Command::new(env!("CARGO_BIN_EXE_worker"))
         .env_clear()
@@ -2327,6 +2346,7 @@ fn task_turn_detaches_the_same_worker_and_inherited_lock_runs_supervisor() {
         .output()
         .unwrap();
     assert!(!rejected.status.success());
+    detached_cleanup.disarm();
 }
 
 #[test]
@@ -2448,7 +2468,7 @@ fn task_turn_client_disconnect_after_the_launch_handshake_preserves_supervision_
         "accepted submit client must be reaped with SIGKILL status"
     );
 
-    let reconnect_deadline = Instant::now() + Duration::from_secs(5);
+    let reconnect_deadline = Instant::now() + Duration::from_secs(120);
     let running: StatusResponse = loop {
         match try_host_control::<StatusRequest, StatusResponse>(
             &home,
@@ -2464,11 +2484,23 @@ fn task_turn_client_disconnect_after_the_launch_handshake_preserves_supervision_
                 )
             }
             Ok(_) | Err(_) => {
+                let observation = accepted
+                    .status()
+                    .supervisor_identity()
+                    .map(|identity| SystemProcessInspector.observe(identity));
                 assert!(
                     Instant::now() < reconnect_deadline,
-                    "status reconnect never crossed the detached-supervisor handoff"
+                    "status reconnect never crossed the detached-supervisor handoff: {observation:?}, status={:?}, payload={}, lease={:?}",
+                    fs::read(job.join("status.json"))
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<JobStatus>(&bytes).ok())
+                        .map(|status| status.state()),
+                    job.join("execution.json").exists(),
+                    HostStore::open(&host_root)
+                        .and_then(|store| LeaseService::new(&store).load())
+                        .map(|lease| lease.is_some()),
                 );
-                std::thread::yield_now();
+                std::thread::sleep(Duration::from_millis(10));
             }
         }
     };
@@ -2485,44 +2517,46 @@ fn task_turn_client_disconnect_after_the_launch_handshake_preserves_supervision_
         .write_all(b"X\n")
         .unwrap();
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut last_status_error = String::from("none observed");
+    let supervisor = accepted
+        .status()
+        .supervisor_identity()
+        .expect("accepted turn published a supervisor identity");
+    wait_for_detached_supervisor(supervisor, &job, &host_root);
+
+    let status_deadline = Instant::now() + Duration::from_secs(120);
     let terminal = loop {
-        let response: StatusResponse = match try_host_control(
+        match try_host_control::<StatusRequest, StatusResponse>(
             &home,
             &data,
             "status",
             &StatusRequest::new(lease.job_id()),
         ) {
-            Ok(response) => response,
+            Ok(response) => break response,
             Err(error) => {
-                last_status_error = error;
                 assert!(
-                    Instant::now() < deadline,
-                    "reconnected status polling never recovered a valid response; last control error: {last_status_error}"
+                    Instant::now() < status_deadline,
+                    "reconnected status polling never recovered a valid response; last control error: {error}, status={:?}, payload={}, lease={:?}",
+                    fs::read(job.join("status.json"))
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<JobStatus>(&bytes).ok())
+                        .map(|status| status.state()),
+                    job.join("execution.json").exists(),
+                    HostStore::open(&host_root)
+                        .and_then(|store| LeaseService::new(&store).load())
+                        .map(|lease| lease.is_some()),
                 );
-                std::thread::yield_now();
-                continue;
+                std::thread::sleep(Duration::from_millis(10));
             }
-        };
-        assert_eq!(
-            response.status().supervisor_identity(),
-            accepted.status().supervisor_identity()
-        );
-        if response.status().state().is_terminal() {
-            break response;
         }
-        assert!(
-            Instant::now() < deadline,
-            "reconnected status polling never observed a terminal outcome; last control error: {last_status_error}"
-        );
-        std::thread::yield_now();
     };
-
+    assert_eq!(
+        terminal.status().supervisor_identity(),
+        accepted.status().supervisor_identity()
+    );
     assert_eq!(terminal.status().state(), JobState::Succeeded);
     assert_eq!(terminal.status().exit_code(), Some(0));
     assert_eq!(fs::read(job.join("stdout.log")).unwrap(), b"reconnected");
-    let log_deadline = Instant::now() + Duration::from_secs(5);
+    let log_deadline = Instant::now() + Duration::from_secs(120);
     let reconnected_log: LogChunkResponse = loop {
         match try_host_control(
             &home,
@@ -2534,9 +2568,17 @@ fn task_turn_client_disconnect_after_the_launch_handshake_preserves_supervision_
             Err(error) => {
                 assert!(
                     Instant::now() < log_deadline,
-                    "same-ID log reconnect never recovered a valid response; last control error: {error}"
+                    "same-ID log reconnect never recovered a valid response; last control error: {error}, status={:?}, payload={}, lease={:?}",
+                    fs::read(job.join("status.json"))
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<JobStatus>(&bytes).ok())
+                        .map(|status| status.state()),
+                    job.join("execution.json").exists(),
+                    HostStore::open(&host_root)
+                        .and_then(|store| LeaseService::new(&store).load())
+                        .map(|lease| lease.is_some()),
                 );
-                std::thread::yield_now();
+                std::thread::sleep(Duration::from_millis(10));
             }
         }
     };
@@ -2546,30 +2588,17 @@ fn task_turn_client_disconnect_after_the_launch_handshake_preserves_supervision_
         reconnected_log.chunk().decoded_bytes().unwrap(),
         b"reconnected"
     );
-    while job.join("execution.json").exists() {
-        assert!(
-            Instant::now() < deadline,
-            "disconnected turn publication did not finish"
-        );
-        std::thread::yield_now();
-    }
-    assert!(!job.join("execution.json").exists());
-
-    let release_deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if LeaseService::new(&HostStore::open(&host_root).unwrap())
+    assert!(
+        !job.join("execution.json").exists(),
+        "disconnected turn publication did not finish"
+    );
+    assert_eq!(
+        LeaseService::new(&HostStore::open(&host_root).unwrap())
             .load()
-            .unwrap()
-            .is_none()
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < release_deadline,
-            "detached cleanup did not release the lease after the client disconnect"
-        );
-        std::thread::yield_now();
-    }
+            .unwrap(),
+        None,
+        "detached cleanup did not release the lease after the client disconnect"
+    );
     detached_cleanup.disarm();
 }
 

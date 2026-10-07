@@ -157,14 +157,16 @@ impl IntegrationHost for OwnerPorts<'_> {
         self.require_helper(worker)?;
         let response =
             crate::transfer::RemoteJobClient::new(self.runner).task_integration(worker, request);
-        if revoking
-            && !matches!(response, Ok(HostIntegrationResponse::Integrated { .. }))
-            && !self
+        if revoking {
+            // The push may already have won. Retire the cancel-requested row,
+            // but never hide an Integrated reply behind an unfinished runner.
+            let settled = self
                 .client()
                 .settle_integration_stop(request.task_id)
-                .unwrap_or(false)
-        {
-            return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
+                .unwrap_or(false);
+            if !matches!(response, Ok(HostIntegrationResponse::Integrated { .. })) && !settled {
+                return Err(IntegrationCode::IntegrationStopUnconfirmed.error());
+            }
         }
         response
     }
@@ -304,6 +306,14 @@ impl IntegrationTurns for OwnerPorts<'_> {
             } else {
                 Err(invalid())
             };
+        }
+        if self
+            .client
+            .queue_entry_for_task_turn(task)?
+            .is_some_and(|entry| entry.is_cancel_requested())
+        {
+            // The stop marked this row before the won push was observed.
+            let _settled = self.client().settle_integration_stop(task).unwrap_or(false);
         }
         if self.client.queue_entry_for_task_turn(task)?.is_some() {
             return Err(WorkerError::task(

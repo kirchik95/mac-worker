@@ -212,6 +212,17 @@ pub(crate) fn log_auto_continue_failure(
     Ok(())
 }
 
+/// Host cancel/status already shows this turn finished `done`. The call did
+/// not cancel it; the owner record had simply not imported that status yet.
+fn host_turn_finished_done(status: &TaskStatus, turn_id: TurnId) -> bool {
+    status.state() == TaskState::Open
+        && status.turns().last().is_some_and(|turn| {
+            turn.turn_id() == turn_id
+                && turn.terminal().is_some()
+                && turn.outcome() == Some(&TaskOutcome::Done)
+        })
+}
+
 fn same_close_target(current: &LocalTaskRecord, expected: &LocalTaskRecord) -> bool {
     current.meta().task_id() == expected.meta().task_id()
         && current.status().head_oid() == expected.status().head_oid()
@@ -3286,6 +3297,29 @@ impl<'a> TaskClient<'a> {
             let _ = self.release_task_base(&record);
             return self.report_for(task_id);
         }
+        if self.integration_enabled(task_id)?
+            && record.status().state() == TaskState::Active
+            && let Some(turn_id) = record.status().turns().last().map(TurnSummary::turn_id)
+            && record.status().worker().is_some()
+        {
+            let worker = task_worker(self.config, record.status())?;
+            // A dead transport is the same Active owner the operator already
+            // sees: TASK_BUSY, not an SSH error after the timeout.
+            if let Ok(response) = RemoteJobClient::new(self.runner).task_status(
+                worker,
+                &crate::task_store::TaskStatusRequest::new(record.meta().project_id(), task_id),
+            ) {
+                let observed = response.status().clone();
+                if host_turn_finished_done(&observed, turn_id) {
+                    let stopped = self.commit_observed_terminal_done(
+                        &record,
+                        observed,
+                        IntegrationMutation::Close,
+                    )?;
+                    return self.close_settled(stopped.clone(), &stopped, discard);
+                }
+            }
+        }
         if let Some(reason) = self.operator_busy_reason(task_id, &record)?
             && !(record.close_intent().is_some() && reason == CLOSE_IN_PROGRESS)
             && !self.first_turn_is_waiting(&record)?
@@ -5487,6 +5521,14 @@ impl<'a> TaskClient<'a> {
                 ),
             )?;
             let status = response.status().clone();
+            if enabled && host_turn_finished_done(&status, turn_id) {
+                let stopped = self.commit_observed_terminal_done(
+                    &record,
+                    status,
+                    IntegrationMutation::Cancel,
+                )?;
+                return self.report_fenced_turn(task_id, turn_id, stopped.status().turns().len());
+            }
             let fenced_len = record.status().turns().len();
             if !self
                 .client_state
@@ -5521,6 +5563,28 @@ impl<'a> TaskClient<'a> {
             }
         }
         self.report_fenced_turn(task_id, turn_id, record.status().turns().len())
+    }
+
+    /// Import a host turn that already finished `done`, then apply the same
+    /// integration stop used when the owner record was already Open+Done.
+    /// Success is only the record left after that stop; a fence stays an error.
+    fn commit_observed_terminal_done(
+        &self,
+        record: &LocalTaskRecord,
+        status: TaskStatus,
+        operation: IntegrationMutation,
+    ) -> Result<LocalTaskRecord, WorkerError> {
+        let task_id = record.meta().task_id();
+        let next = record.with_status(status)?;
+        if !self.client_state.update_task_if_current(record, next)? {
+            let message = match operation {
+                IntegrationMutation::Close => "task changed before close",
+                _ => "task changed before cancel",
+            };
+            return Err(task_error("TASK_BUSY", message));
+        }
+        let imported = self.client_state.load_task(task_id)?;
+        self.before_integration_mutation(&imported, operation)
     }
 
     /// Blocks until every selected task is wait-terminal and quiescent.
