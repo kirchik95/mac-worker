@@ -67,8 +67,9 @@ fn latest_ordinary_turn(
 
 /// Unbound cancel/close has no cycle binding, so decode never refreshed it.
 /// Importing this freeze's own Active turn as terminal Done, with a policy
-/// already published, is the stop's allowed progress. A new turn, a different
-/// meta, or a later epoch stays stale and conflicts at execution.
+/// already published, is the stop's allowed progress. An earlier turn's
+/// stored cycle is not this turn's epoch fence. A new turn, a different
+/// meta, or a later epoch of this turn's cycle stays stale and conflicts.
 fn refresh_unbound_done_import(
     paths: &PathLayout,
     store: &ClientStateStore,
@@ -79,10 +80,7 @@ fn refresh_unbound_done_import(
         | PreparedTaskMutation::Close { expected, .. } => expected.meta().task_id(),
         PreparedTaskMutation::Say { .. } => return Ok(()),
     };
-    let current = match store.load_task(task) {
-        Ok(current) => current,
-        Err(_) => return Ok(()),
-    };
+    let current = store.load_task(task)?;
     let refresh = match &*mutation {
         PreparedTaskMutation::Cancel { expected, .. }
         | PreparedTaskMutation::Close { expected, .. } => {
@@ -110,9 +108,18 @@ fn refresh_unbound_done_import(
                 if policy.is_none() {
                     false
                 } else if let Some(record) = record.as_ref() {
-                    record.snapshot.epoch == 0
-                        && latest_ordinary_turn(paths, &current)?
-                            == Some(record.snapshot.source_turn_id)
+                    if latest_ordinary_turn(paths, &current)?
+                        == Some(record.snapshot.source_turn_id)
+                    {
+                        record.snapshot.epoch == 0
+                    } else {
+                        // An earlier turn's cycle: this turn has none staged yet.
+                        current
+                            .status()
+                            .turns()
+                            .iter()
+                            .any(|turn| turn.turn_id() == record.snapshot.source_turn_id)
+                    }
                 } else {
                     true
                 }

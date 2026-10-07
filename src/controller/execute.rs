@@ -387,6 +387,8 @@ impl TaskSubmitHandler<'_> {
 
     /// Receipt recorded for this freeze's cycle, not yet imported and settled.
     /// The replay must stay resumable instead of revoking or saving a conflict.
+    /// A terminal Revoked cycle keeps that receipt as history and must not pin
+    /// the request open. Blocked with a receipt stays resumable.
     fn pending_unimported_receipt(
         &self,
         expected: &crate::task::LocalTaskRecord,
@@ -401,7 +403,8 @@ impl TaskSubmitHandler<'_> {
         if initial_epoch_only && record.snapshot.epoch != 0 {
             return Ok(false);
         }
-        Ok(record.receipt.is_some())
+        Ok(record.receipt.is_some()
+            && record.snapshot.state != crate::integration::contracts::IntegrationStatus::Revoked)
     }
 
     fn prepared_expected(prepared: &PreparedTaskMutation) -> Option<&crate::task::LocalTaskRecord> {
