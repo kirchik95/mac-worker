@@ -2069,6 +2069,9 @@ os.execv('/bin/sh', ['/bin/sh', '-c', command])"#,
     assert_eq!(std::fs::read(source).unwrap(), original_source);
 }
 
+// `task wait` returns as soon as integration settles, so a passing run does not pay for the bound.
+const INTEGRATION_WAIT_TIMEOUT: &str = "300s";
+
 fn wait_integrated(f: &super::session_import_e2e::Fixture, task: TaskId) -> IntegrationRecord {
     let wait = f.worker(&[
         "--json",
@@ -2077,7 +2080,7 @@ fn wait_integrated(f: &super::session_import_e2e::Fixture, task: TaskId) -> Inte
         "--task-id",
         &task.to_string(),
         "--timeout",
-        "120s",
+        INTEGRATION_WAIT_TIMEOUT,
     ]);
     assert!(
         wait.status.success(),
