@@ -46,6 +46,9 @@ filter = '''
   ))
 '''
 test-group = 'native_integration'
+# First matching override that sets a setting wins. `_stress` is earlier and
+# keeps its own slow-timeout. Every test in this class otherwise dies at 360 s.
+slow-timeout = { period = "60s", terminate-after = 6 }
 
 [[profile.default.overrides]]
 # Real git and worker cycles, plus one auxiliary case that must wait out a 60 s
@@ -53,10 +56,18 @@ test-group = 'native_integration'
 # (fresh_operator_reconcile 90 s, never_receipt 106 s, a_running_auxiliary 102 s,
 # a_brief_helper_rollback 85 s, native_union 74 s, native_dag 73 s). The full
 # gate runs native_integration two at a time beside the rest of the suite and
-# killed fresh_operator_reconcile, and two other direct cycles, at 180 s.
-# The host matrices are the same shape: 24 and 28 real task-turn lifecycles,
-# 73 s and 39 s serial at load ~35–50, and both hit the 180 s kill in the gate
-# (idle reference 26 s and 58 s). Six 60 s periods is 360 s, still a hard kill.
+# killed only fresh_operator_reconcile at 180 s. Two other direct cycles
+# finished at 176 s and 172 s and were not killed.
+# The disconnect matrix is 24 real task-turn lifecycles and the slower host
+# matrix: 62–79 s in a normal gate, 73 s serial at load ~35–50, idle reference
+# 58 s. The prelaunch-evidence matrix is 28 lifecycles: 39 s serial at that
+# load, idle reference 26 s. Both hit the 180 s kill in the gate.
+# publication-crash frontiers took 119 s in a loaded gate; envelope pruning
+# took 160.7 s. Six 60 s periods is 360 s, still a hard kill.
+# Direct cycles above are already covered by the native_integration override.
+# Listed again so this block stays the explicit record; the earlier override
+# supplies their slow-timeout. Host matrices and the two tests below are not
+# in that class.
 filter = '''
   (binary(task) & (
     test(/^task_integration_direct::never_receipt_is_idempotent_and_the_next_say_uses_its_accepted_head$/)
@@ -69,7 +80,9 @@ filter = '''
   | (binary(host) & (
     test(/^job_queries::task_turn_ports::task_turn_acceptance_disconnect_matrix_preserves_all_24_boundary_order_classes$/)
     | test(/^job_queries::task_turn_ports::task_turn_status_preserves_unsafe_or_conflicting_prelaunch_evidence$/)
+    | test(/^job_queries::task_turn_ports::task_turn_publication_crash_frontiers_recover_and_execute_exactly_once$/)
   ))
+  | test(/^controller::envelope::tests::pruning_wraps_and_limits_each_call_to_256_envelopes$/)
 '''
 slow-timeout = { period = "60s", terminate-after = 6 }
 

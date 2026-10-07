@@ -133,7 +133,8 @@ and preserves all module components, including nested fixture modules.
 `.config/nextest.toml` has two profiles:
 
 - **`default`** reports a test as slow after 60 s and kills it after 3 minutes. It never retries and does not stop
-  at the first failure.
+  at the first failure. The native-integration group, both host task-turn matrices, the publication-crash frontier
+  test, and the envelope-pruning unit test are killed after 360 s instead.
 - **`ci`** is the same with one retry and a JUnit report.
 
 Two test groups limit how many tests run at once:
